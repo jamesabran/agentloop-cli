@@ -1,6 +1,6 @@
 {
   "name": "agentloop-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A local implement-and-review loop that runs Claude and Codex against one task at a time, and publishes only what an independent audit has approved.",
   "type": "module",
   "license": "MIT",
@@ -10,7 +10,9 @@
   "files": [
     "bin",
     "src",
-    "README.md"
+    "!src/**/*.test.mjs",
+    "README.md",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=20"
@@ -20,7 +22,9 @@
     "agent:dry-run": "node src/dry-run.mjs",
     "agent:self-check": "node bin/agentloop.mjs --self-check",
     "agent:verify-dry-run": "node src/verify-dry-run.mjs",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "node scripts/typecheck.mjs",
+    "build": "node scripts/build.mjs"
   },
   "devDependencies": {
     "vitest": "^4.1.10"

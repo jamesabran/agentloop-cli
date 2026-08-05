@@ -184,10 +184,14 @@ The `npm run agent --` form works from Windows PowerShell too. On PowerShell,
 `npm run <script> -- --flag value` can otherwise lose the flag *names* — a
 native-argument-passing quirk that eats npm's own `--` separator whenever it is
 immediately followed by another `--`-prefixed token, leaving npm to swallow
-`--task`/`--branch` as its own unrecognized config instead of forwarding them.
-The controller recovers `--task` and `--branch` from the npm config values that
-mangling leaves behind (`src/lib/npm-args.mjs`), the same way
-`agent:dry-run` already did.
+the option as its own unrecognized config instead of forwarding it. The
+controller recovers every supported option — `--task`, `--brief`, `--branch`,
+`--dry-run`, `--recover`, `--self-check`, `--verbose`, and `--help` — from the
+npm config values that mangling leaves behind (`recoverCliArgs` in
+`src/lib/npm-args.mjs`), the same single function every entry point
+(`agentloop`, direct `controller.mjs` invocation, and `agent:dry-run`) uses.
+An option already present in argv is always left as-is; recovery only ever
+fills in what npm actually swallowed.
 
 Each invocation starts at most one Claude process. After a valid Claude handoff,
 the controller stops so the next invocation can run checks and the Codex audit;
@@ -248,6 +252,10 @@ human explicitly passes `--recover`. This prevents expensive automatic retries.
 agentloop-cli/
   bin/
     agentloop.mjs        the `agentloop` CLI entry point
+  scripts/                repository-only tooling, never published
+    typecheck.mjs          npm run typecheck: node --check every .mjs file
+    build.mjs               npm run build: bin/import/metadata/pack validation
+    lib/find-mjs-files.mjs  shared recursive .mjs file walker
   src/
     controller.mjs        entry point: decide → act → report
     self-check.mjs        offline demonstration of every transition
@@ -267,7 +275,7 @@ agentloop-cli/
       prompts.mjs            what each agent is told
       process.mjs            Windows-aware process launching
       logger.mjs             console and file logging
-      npm-args.mjs           recovers --task/--branch from npm's Windows arg loss
+      npm-args.mjs           recovers every CLI option from npm's Windows arg loss
 
 <your project>/
   agentloop.config.json  optional — base branch, checks, repo, agent settings
@@ -430,14 +438,34 @@ change-round limit, incremental re-audit ranges, blocking-finding extraction,
 check ordering and short-circuit, untrusted local state, usage-limit detection,
 the read-only audit guard, the tool boundary that keeps Claude off GitHub, a
 verified no-change Claude handoff and its rejection cases (HEAD mismatch,
-dirty tree, failed verification, outstanding blockers), npm argument recovery
-on Windows, project/repository resolution from `agentloop.config.json` and the
-git remote, and dry-run non-mutation. They also cover the
+dirty tree, failed verification, outstanding blockers), full CLI-option
+recovery from npm's Windows PowerShell argument loss — every value and
+boolean option, mixed/partial loss within one invocation, explicit-argv
+precedence, strict boolean parsing, and ordinary direct/POSIX invocation left
+unchanged — project/repository resolution from `agentloop.config.json` and
+the git remote, and dry-run non-mutation. They also cover the
 `AGENTLOOP_CLAUDE_ALLOWED_TOOLS` exact-match boundary directly: `cmd`,
 PowerShell/`pwsh`, `sh -c`/`bash -c`, `env`, nested-shell, and
 executable-path wrapper attempts around `npm`/`node`/`npx` are all refused,
 alongside the git-push/gh/wildcard cases and the one valid safe entry and
 default-configuration cases that must keep working.
+
+Two more scripts validate the package itself rather than the workflow logic —
+there is no compiler for this plain ESM JavaScript CLI, so neither is a
+placeholder:
+
+```powershell
+npm run typecheck   # node --check on every .mjs file under src/, bin/, scripts/
+npm run build       # bin target, runtime imports, package metadata, and a real npm pack --dry-run
+```
+
+`typecheck` fails on any file that does not parse. `build` additionally
+confirms `package.json`'s `bin` target exists and has a shebang, that every
+relative import in a runtime file resolves to a real file, that
+`package.json` and `package-lock.json` agree on the version, and — by
+actually running `npm pack --dry-run --json` and inspecting the result —
+that every runtime file and the bin entry point would be published while no
+test file would be.
 
 ## Known limits of this phase
 

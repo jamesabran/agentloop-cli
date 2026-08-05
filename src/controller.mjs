@@ -46,7 +46,7 @@ import {
   workingTreeStatus,
 } from './lib/git.mjs';
 import { configureLogger, log } from './lib/logger.mjs';
-import { recoverTaskAndBranch } from './lib/npm-args.mjs';
+import { recoverCliArgs } from './lib/npm-args.mjs';
 import { CommandError } from './lib/process.mjs';
 import {
   ACTIONS,
@@ -840,7 +840,7 @@ const invokedDirectly =
 if (invokedDirectly) {
   // `npm run agent -- --task <id> --branch <name>` can lose the flag names on
   // Windows PowerShell; see lib/npm-args.mjs for why and how this recovers them.
-  main(recoverTaskAndBranch(process.argv.slice(2))).then(
+  main(recoverCliArgs(process.argv.slice(2))).then(
     (code) => {
       process.exitCode = code;
     },

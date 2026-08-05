@@ -3,9 +3,10 @@
  *
  * Two audiences: the owner watching the console, who needs to see the current
  * workflow state at a glance, and the owner reading the log afterwards to
- * understand what happened while they were away. Logs land in
- * `automation/.logs/`, which is gitignored — they contain execution detail,
- * not repository content.
+ * understand what happened while they were away. Logs land in the project's
+ * `.agent/logs/` (see `LOG_DIR` in config.mjs, under the project root's
+ * `.agent/`), which is gitignored — they contain execution detail, not
+ * repository content.
  */
 
 import fs from 'node:fs';

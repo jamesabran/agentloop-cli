@@ -2,17 +2,17 @@
 /**
  * `agentloop` CLI entry point.
  *
- * A thin wrapper around the controller: recovers `--task`/`--branch` from
- * npm's Windows argument loss (see lib/npm-args.mjs), then hands off to
+ * A thin wrapper around the controller: recovers every supported CLI option
+ * from npm's Windows argument loss (see lib/npm-args.mjs), then hands off to
  * controller.mjs's `main`.
  */
 
 import process from 'node:process';
 
 import { main } from '../src/controller.mjs';
-import { recoverTaskAndBranch } from '../src/lib/npm-args.mjs';
+import { recoverCliArgs } from '../src/lib/npm-args.mjs';
 
-main(recoverTaskAndBranch(process.argv.slice(2))).then(
+main(recoverCliArgs(process.argv.slice(2))).then(
   (code) => {
     process.exitCode = code;
   },
