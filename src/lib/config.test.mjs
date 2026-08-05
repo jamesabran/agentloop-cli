@@ -33,6 +33,20 @@
  * granted any npm/node/npx command, unconditionally — see the "a configured
  * check cannot add a Claude Bash permission" and "modifying package.json
  * gives Claude no path to run git push or gh" tests below.
+ *
+ * A further gap survived that fix: recognising `git`, `node`, `npm`, or
+ * `npx` as the first word of a `Bash(...)` entry is still a denylist, just a
+ * narrower one, and a wrapper reaches the same command without ever being
+ * the first word — `Bash(cmd /c npm test)`, a PowerShell/`pwsh` wrapper,
+ * `Bash(sh -c ...)`/`Bash(bash -c ...)`, `Bash(env npm test)`, an executable
+ * called by full path, a nested shell, or even a bare `Bash` grant with no
+ * pattern at all. None of these are recognised as dangerous, so they used to
+ * fall through to the allowlist unexamined. `validateAllowedTools` no longer
+ * tries to recognise dangerous shapes at all: every `Bash(...)` entry, in
+ * any casing or shape, is accepted only on an exact match to the fixed safe
+ * command list, and every non-Bash entry only on an exact match to Claude's
+ * explicitly supported tool names — see "a Bash override entry is accepted
+ * only on an exact match to the fixed safe list" below.
  */
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -347,7 +361,7 @@ describe('AGENTLOOP_CLAUDE_ALLOWED_TOOLS cannot grant the publishing tools', () 
     });
     expect(result.status).toBe(1);
     expect(result.stderr).toMatch(/not permitted/);
-    expect(result.stderr).toMatch(/fixed local git commands/);
+    expect(result.stderr).toMatch(/fixed safe Bash commands/);
   });
 
   it('refuses any gh grant, because the loop must not use GitHub to coordinate', () => {
@@ -443,6 +457,208 @@ describe('AGENTLOOP_CLAUDE_ALLOWED_TOOLS cannot grant the publishing tools', () 
     });
     expect(result.status).toBe(1);
     expect(result.stderr).toMatch(/not permitted/);
+  });
+});
+
+describe('a Bash override entry is accepted only on an exact match to the fixed safe list', () => {
+  // Regression: a denylist keyed on recognising `git`/`node`/`npm`/`npx` as
+  // the first word of the wrapped command misses any entry that reaches the
+  // same command through something else first. Each of these wraps `npm
+  // test` (or an equivalent) in something that does not start with one of
+  // those four words, so the old GIT_BASH_ENTRY/NODE_BASH_ENTRY prefix
+  // checks never even looked at them and let them straight into the
+  // allowlist. The fix does not add a fifth, sixth, seventh recognised
+  // wrapper shape — it stops recognising shapes at all, and only ever
+  // accepts an entry that is byte-for-byte one of the fixed safe commands.
+
+  it('refuses a cmd.exe wrapper: Bash(cmd /c npm test)', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: 'Read,Bash(cmd /c npm test)' }),
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/not permitted/);
+    expect(result.stderr).toMatch(/fixed safe Bash commands/);
+  });
+
+  it('refuses a PowerShell wrapper: Bash(powershell -Command "npm test")', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+      cwd: dir,
+      env: baseEnv({
+        AGENTLOOP_CLAUDE_ALLOWED_TOOLS: 'Read,Bash(powershell -Command "npm test")',
+      }),
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/not permitted/);
+    expect(result.stderr).toMatch(/fixed safe Bash commands/);
+  });
+
+  it('refuses a pwsh wrapper: Bash(pwsh -c "npm test")', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: 'Read,Bash(pwsh -c "npm test")' }),
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/not permitted/);
+    expect(result.stderr).toMatch(/fixed safe Bash commands/);
+  });
+
+  it('refuses an sh -c wrapper: Bash(sh -c "npm test")', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: 'Read,Bash(sh -c "npm test")' }),
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/not permitted/);
+    expect(result.stderr).toMatch(/fixed safe Bash commands/);
+  });
+
+  it('refuses a bash -c wrapper: Bash(bash -c "npm test")', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: 'Read,Bash(bash -c "npm test")' }),
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/not permitted/);
+    expect(result.stderr).toMatch(/fixed safe Bash commands/);
+  });
+
+  it('refuses an env wrapper: Bash(env npm test)', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: 'Read,Bash(env npm test)' }),
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/not permitted/);
+    expect(result.stderr).toMatch(/fixed safe Bash commands/);
+  });
+
+  it('refuses a nested shell: Bash(sh -c "bash -c \'npm test\'")', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+      cwd: dir,
+      env: baseEnv({
+        AGENTLOOP_CLAUDE_ALLOWED_TOOLS: `Read,Bash(sh -c "bash -c 'npm test'")`,
+      }),
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/not permitted/);
+    expect(result.stderr).toMatch(/fixed safe Bash commands/);
+  });
+
+  it('refuses npm/node/npx invoked by an absolute executable path', () => {
+    const dir = makeProject();
+    for (const entry of [
+      'Bash(C:\\Program Files\\nodejs\\npm.cmd test)',
+      'Bash(/usr/bin/npm test)',
+      'Bash(/usr/local/bin/node -e "require(\'child_process\').execSync(\'gh pr merge\')")',
+    ]) {
+      const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+        cwd: dir,
+        env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: `Read,${entry}` }),
+      });
+      expect(result.status, entry).toBe(1);
+      expect(result.stderr, entry).toMatch(/not permitted/);
+      expect(result.stderr, entry).toMatch(/fixed safe Bash commands/);
+    }
+  });
+
+  it('refuses a bare Bash grant with no pattern at all', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: 'Read,Bash' }),
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/not permitted/);
+    expect(result.stderr).toMatch(/fixed safe Bash commands/);
+  });
+
+  it('refuses a differently-cased Bash grant that is not itself an exact match', () => {
+    // Detection has to be case-insensitive ("does this say Bash at all") so
+    // nothing slips through by casing alone, but acceptance still has to be
+    // an exact match against the real, correctly-cased tool patterns.
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: 'Read,bash(git status*)' }),
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/not permitted/);
+    expect(result.stderr).toMatch(/fixed safe Bash commands/);
+  });
+
+  it('accepts one valid exact safe Bash entry', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: 'Bash(git status*)' }),
+    });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('Bash(git status*)');
+  });
+
+  it('accepts every fixed safe Bash entry together, exactly as enumerated', () => {
+    const value = [
+      'Read',
+      'Bash(git status*)',
+      'Bash(git diff*)',
+      'Bash(git log*)',
+      'Bash(git show*)',
+      'Bash(git add*)',
+      'Bash(git commit*)',
+      'Bash(git rev-parse*)',
+    ].join(',');
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: value }),
+    });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe(value);
+  });
+
+  it('refuses a non-Bash tool that is not in the explicitly supported set', () => {
+    const dir = makeProject();
+    for (const entry of ['WebFetch', 'Task', 'mcp__filesystem__write_file', 'NotARealTool']) {
+      const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
+        cwd: dir,
+        env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: `Read,${entry}` }),
+      });
+      expect(result.status, entry).toBe(1);
+      expect(result.stderr, entry).toMatch(/not permitted/);
+      expect(result.stderr, entry).toMatch(/supported non-Bash tools/);
+    }
+  });
+
+  it('loads the normal default configuration unaffected: no override at all', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    const value = JSON.parse(result.stdout);
+    expect(value).toBe(
+      [
+        'Read',
+        'Edit',
+        'Write',
+        'Glob',
+        'Grep',
+        'TodoWrite',
+        'Bash(git status*)',
+        'Bash(git diff*)',
+        'Bash(git log*)',
+        'Bash(git show*)',
+        'Bash(git add*)',
+        'Bash(git commit*)',
+        'Bash(git rev-parse*)',
+      ].join(','),
+    );
   });
 });
 

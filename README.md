@@ -311,6 +311,21 @@ the commit, looping forever on a finding — not an agent trying to escape.
   crafted `checks[].script` value in `agentloop.config.json`, cannot grant it
   back — Claude's allowed tools are never derived from the configured checks
   at all.
+- **`AGENTLOOP_CLAUDE_ALLOWED_TOOLS` accepts a `Bash(...)` entry only on an
+  exact match to the fixed safe command list — never by recognising a shape
+  as safe or dangerous.** An override entry is not checked by asking whether
+  it *looks like* `git`, `node`, `npm`, or `npx`; it is checked against a
+  fixed list of exact strings, and anything not on that list is refused,
+  whatever it is. This closes wrapper commands that reach the same
+  destination without ever being the first word of the entry —
+  `Bash(cmd /c npm test)`, a PowerShell or `pwsh` wrapper, `Bash(sh -c ...)`
+  / `Bash(bash -c ...)`, `Bash(env npm test)`, npm/node/npx invoked by its
+  full executable path, a nested shell, or even a bare `Bash` grant with no
+  pattern at all — none of which a check keyed on recognising `git`/`node`/
+  `npm`/`npx` as a prefix ever looks at. Non-Bash tools are held to the same
+  standard: an override entry must exactly match one of Claude's explicitly
+  supported tool names (`Read`, `Edit`, `Write`, `Glob`, `Grep`,
+  `TodoWrite`), not merely avoid looking dangerous.
 - **Claude starts clean and Codex has an exact handoff.** Claude is never
   started over a dirty worktree. Codex starts only when `implementationHead`
   was recorded from a valid Claude handoff and exactly equals the current
@@ -417,7 +432,12 @@ the read-only audit guard, the tool boundary that keeps Claude off GitHub, a
 verified no-change Claude handoff and its rejection cases (HEAD mismatch,
 dirty tree, failed verification, outstanding blockers), npm argument recovery
 on Windows, project/repository resolution from `agentloop.config.json` and the
-git remote, and dry-run non-mutation.
+git remote, and dry-run non-mutation. They also cover the
+`AGENTLOOP_CLAUDE_ALLOWED_TOOLS` exact-match boundary directly: `cmd`,
+PowerShell/`pwsh`, `sh -c`/`bash -c`, `env`, nested-shell, and
+executable-path wrapper attempts around `npm`/`node`/`npx` are all refused,
+alongside the git-push/gh/wildcard cases and the one valid safe entry and
+default-configuration cases that must keep working.
 
 ## Known limits of this phase
 

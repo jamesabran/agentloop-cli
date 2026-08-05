@@ -333,87 +333,78 @@ function splitToolList(value) {
 }
 
 /**
- * Recognises any `Bash(...)` entry that invokes `git`, in whatever form.
- *
- * Deliberately broad — it exists only to find entries the exact-match check
- * below must then approve or refuse, so over-matching costs nothing and
- * under-matching would let a disguised git invocation through unchecked.
+ * Every `Bash(...)` entry an override may grant Claude, and nothing else:
+ * exactly the fixed local git commands above.
  */
-const GIT_BASH_ENTRY = /^bash\(\s*git\b/i;
+const CLAUDE_BASH_ALLOWED_SET = new Set(CLAUDE_GIT_SUBCOMMANDS);
 
-const CLAUDE_GIT_ALLOWED_SET = new Set(CLAUDE_GIT_SUBCOMMANDS);
+/** Claude's non-Bash tools, exactly as granted by {@link CLAUDE_DEFAULT_ALLOWED}. */
+const CLAUDE_NON_BASH_ALLOWED = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'TodoWrite'];
+const CLAUDE_NON_BASH_ALLOWED_SET = new Set(CLAUDE_NON_BASH_ALLOWED);
 
 /**
- * Recognises any `Bash(...)` entry that invokes `node`, `npm`, or `npx`, in
- * whatever form. Unlike {@link GIT_BASH_ENTRY}, there is no safe subset to
- * compare against here — every such entry is refused outright. `npm run
- * <script>` only resolves to a real command by reading `package.json` at run
- * time, and Claude can edit `package.json`; there is no npm invocation that
- * stays safe once the thing that defines what it does is not trusted input.
- * Any of the three can also shell out to `git push` or `gh` through
- * `child_process`, which no `Bash(git push*)` or `Bash(gh *)` disallow entry
- * can see, because the invocation is Node, not git or gh.
+ * Recognises any entry that is trying to grant the Bash tool at all — with
+ * or without a `(...)` pattern, in any casing.
+ *
+ * Deliberately just "does this say Bash", not "does this look like a
+ * dangerous Bash command". The previous version of this check tried to
+ * recognise dangerous shapes — `Bash(git ...)`, `Bash(node|npm|npx ...)` —
+ * and left every other `Bash(...)` entry to pass through unexamined. That is
+ * exactly the gap a wrapper walks through: `Bash(cmd /c npm test)`,
+ * `Bash(powershell -Command "npm test")`, `Bash(pwsh -c "npm test")`,
+ * `Bash(sh -c "npm test")`, `Bash(bash -c "npm test")`, `Bash(env npm
+ * test)`, an npm/node/npx invocation by full executable path, a nested
+ * shell, or a bare `Bash` grant with no pattern at all — none of these start
+ * with `git`, `node`, `npm`, or `npx`, so a check keyed on recognising those
+ * prefixes never even looks at them. There is no bounded set of "dangerous
+ * wrapper" prefixes to enumerate instead; there are only ever more of them.
+ *
+ * So this recognises every attempted Bash grant, unconditionally, and routes
+ * it to the exact-match check below. An allowlist that enumerates only the
+ * safe commands has no such gap, because anything not listed there —
+ * whatever wrapper, casing, or shape it takes — is simply not accepted.
  */
-const NODE_BASH_ENTRY = /^bash\(\s*(?:node|npm|npx)\b/i;
+const BASH_ENTRY = /^bash\b/i;
 
 /**
- * Any env-provided override must still refuse Claude the publishing tools.
- *
- * The previous version of this check rejected specific shapes it recognised
- * as dangerous — a literal `git push`, an unbounded `Bash(git *)`. That is a
- * denylist, and `Bash(git -C . push*)` shows why a denylist over git
- * invocations does not work: it grants push through an option that comes
- * before the subcommand, so it never contains the substring `git push` and
- * never matches a bare `git *` wildcard either, yet it still runs `git push`.
- * There is no bounded set of prefixes that denies every such form.
- *
- * So every override entry that invokes git through `Bash(...)` is now
- * compared against the fixed, safe subcommand list above instead, and must
- * match one of them exactly. Anything else — an option-prefixed push, `git
- * remote`, `git fetch`, or any git command not on that list — is refused,
- * whatever shape it takes, because the check is "is this exactly one of the
- * commands we enumerated" rather than "does this look like the specific
- * dangerous thing we thought of".
- *
- * `git push` and `gh` are also refused as plain substrings, matching the
- * treatment of `AGENTLOOP_REPO` and `AGENTLOOP_BASE_BRANCH`, in case either
- * is granted in a form that is not a clean `Bash(...)` entry.
+ * Every override entry is checked against a fixed, exact allowlist: a
+ * `Bash(...)` entry (in any casing or shape) must exactly match one of
+ * {@link CLAUDE_BASH_ALLOWED_SET}, and every other entry must exactly match
+ * one of {@link CLAUDE_NON_BASH_ALLOWED_SET}. Nothing is approved by
+ * recognising it as safe-looking or refused by recognising it as
+ * dangerous-looking — either it is one of the enumerated commands, exactly,
+ * or it is refused, whatever shape it takes. This is what closes wrapper
+ * bypasses a denylist cannot: a denylist can only ever enumerate the
+ * dangerous shapes someone thought of, and a wrapper is precisely a shape
+ * nobody thought of yet.
  */
 export function validateAllowedTools(value) {
   if (value === undefined || value === '') return CLAUDE_DEFAULT_ALLOWED;
 
-  const normalised = value.toLowerCase().replace(/\s+/g, ' ');
-
-  if (/git\s+push/.test(normalised) || /\bgh\b/.test(normalised)) {
-    throw new Error(
-      `AGENTLOOP_CLAUDE_ALLOWED_TOOLS=${JSON.stringify(value)} is not permitted. ` +
-        'The allowlist may not grant `git push` or the `gh` CLI; the controller is the ' +
-        'only actor that publishes, and only after Codex approves the local HEAD.',
-    );
-  }
-
   for (const entry of splitToolList(value)) {
-    if (GIT_BASH_ENTRY.test(entry) && !CLAUDE_GIT_ALLOWED_SET.has(entry)) {
-      throw new Error(
-        `AGENTLOOP_CLAUDE_ALLOWED_TOOLS=${JSON.stringify(value)} is not permitted: ` +
-          `${JSON.stringify(entry)} is not one of the fixed local git commands Claude may ` +
-          `run (${CLAUDE_GIT_SUBCOMMANDS.join(', ')}). An option-prefixed push, a remote ` +
-          'mutation, or any other git invocation is refused the same way — the entry has to ' +
-          'match one of these exactly, not merely avoid looking like `git push`.',
-      );
+    if (BASH_ENTRY.test(entry)) {
+      if (!CLAUDE_BASH_ALLOWED_SET.has(entry)) {
+        throw new Error(
+          `AGENTLOOP_CLAUDE_ALLOWED_TOOLS=${JSON.stringify(value)} is not permitted: ` +
+            `${JSON.stringify(entry)} is not one of the fixed safe Bash commands Claude may run ` +
+            `(${CLAUDE_GIT_SUBCOMMANDS.join(', ')}). Every Bash grant is checked against this ` +
+            'exact list, not against whether it looks dangerous — a wrapper such as `Bash(cmd /c ' +
+            'npm test)`, `Bash(powershell -Command "npm test")`, `Bash(pwsh -c ...)`, `Bash(sh -c ' +
+            '...)`, `Bash(bash -c ...)`, `Bash(env npm test)`, an npm/node/npx invocation by full ' +
+            'executable path, a nested shell, or a bare `Bash` grant reaches exactly the same ' +
+            'commands a direct `Bash(git push*)` or `Bash(npm ...)` would, and none of them start ' +
+            'with a prefix a denylist could have enumerated. The entry has to match one of the ' +
+            'fixed commands exactly.',
+        );
+      }
+      continue;
     }
 
-    if (NODE_BASH_ENTRY.test(entry)) {
+    if (!CLAUDE_NON_BASH_ALLOWED_SET.has(entry)) {
       throw new Error(
         `AGENTLOOP_CLAUDE_ALLOWED_TOOLS=${JSON.stringify(value)} is not permitted: ` +
-          `${JSON.stringify(entry)} grants a node, npm, or npx command. Claude may not run any ` +
-          'of these, verification commands included: `npm run <script>` only resolves to a real ' +
-          'command by reading `package.json`, which Claude can edit, so no npm invocation stays ' +
-          'restricted once the thing that defines what it does is not trusted input. Any of the ' +
-          'three can also shell out to `git push` or `gh pr merge` through `child_process`, which ' +
-          'no `Bash(git push*)` or `Bash(gh *)` disallow entry can see, because the invocation is ' +
-          'Node, not git or gh. Verification runs only in the controller, through checks.mjs, ' +
-          "after Claude's commit — never as a tool Claude itself can invoke.",
+          `${JSON.stringify(entry)} is not one of Claude's supported non-Bash tools ` +
+          `(${CLAUDE_NON_BASH_ALLOWED.join(', ')}).`,
       );
     }
   }
