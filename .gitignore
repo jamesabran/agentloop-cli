@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Runtime state this controller writes while a task is in flight: task state,
+# audit reports, briefs, logs, and the local report. Never published, never
+# committed — it is execution detail, not repository content.
+.agent/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+
+# Coverage / build output, if this project or a consumer generates any here
+coverage/
+dist/
+*.log
