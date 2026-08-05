@@ -169,6 +169,19 @@ const DEFAULT_CHECKS = Object.freeze([
   Object.freeze({ name: 'build', script: 'build' }),
 ]);
 
+/**
+ * A conservative token shape for a check's `name`/`script`: no spaces,
+ * quotes, commas, parentheses, or other characters a shell or a
+ * comma-separated tool-pattern list could reinterpret.
+ *
+ * This is hygiene for the controller's own `npm run <script>` invocation
+ * (`checks.mjs`, via `process.mjs`'s argv-array spawn — never a shell), not
+ * what makes these values safe to hand to Claude. They never are: Claude's
+ * allowed tools are never derived from this list at all, however it is
+ * shaped. See the comment on {@link CLAUDE_DEFAULT_ALLOWED} below.
+ */
+const CHECK_TOKEN = /^[A-Za-z0-9][A-Za-z0-9:_-]*$/;
+
 function normaliseChecks(value) {
   if (value === undefined) return null;
   if (!Array.isArray(value) || value.length === 0) {
@@ -183,6 +196,12 @@ function normaliseChecks(value) {
           `${CONFIG_FILE}: checks[${index}] must have string "name" and "script" fields.`,
         );
       }
+      if (!CHECK_TOKEN.test(entry.name) || !CHECK_TOKEN.test(entry.script)) {
+        throw new Error(
+          `${CONFIG_FILE}: checks[${index}].name and .script must match ${CHECK_TOKEN} — no ` +
+            'spaces, quotes, commas, or other punctuation.',
+        );
+      }
       return Object.freeze({ name: entry.name, script: entry.script });
     }),
   );
@@ -194,6 +213,9 @@ function normaliseChecks(value) {
  * the default is the common `npm run <script>` set. They run against the
  * committed local HEAD, so a Codex audit never spends a round on something
  * these would have caught.
+ *
+ * Run only by the controller, through `checks.mjs`. Claude is never granted
+ * any command derived from this list — see {@link CLAUDE_DEFAULT_ALLOWED}.
  */
 export const DETERMINISTIC_CHECKS = normaliseChecks(PROJECT_CONFIG.checks) ?? DEFAULT_CHECKS;
 
@@ -215,10 +237,11 @@ const CLAUDE_CONFIG = PROJECT_CONFIG.claude ?? {};
  * Claude tool permissions for unattended runs.
  *
  * `acceptEdits` plus a scoped tool allowlist is the least-privilege default
- * that still lets Claude implement, verify, and commit. Nothing here can reach
- * the network: the local loop must not push, and must not talk to GitHub at
- * all. Publishing is the controller's job, and only after Codex approves the
- * exact local HEAD.
+ * that still lets Claude implement and commit. Verification is not among
+ * Claude's tools — see {@link CLAUDE_DEFAULT_ALLOWED} — and nothing here can
+ * reach the network: the local loop must not push, and must not talk to
+ * GitHub at all. Publishing is the controller's job, and only after Codex
+ * approves the exact local HEAD.
  */
 export const CLAUDE_PERMISSION_MODE =
   process.env.AGENTLOOP_CLAUDE_PERMISSION_MODE ?? CLAUDE_CONFIG.permissionMode ?? 'acceptEdits';
@@ -247,38 +270,37 @@ const CLAUDE_GIT_SUBCOMMANDS = [
 ];
 
 /**
- * The exact verification commands the configured {@link DETERMINISTIC_CHECKS}
- * run, and nothing else.
+ * Claude is never granted `npm run <script>`, `npm test`, or any other
+ * node/npm/npx command — not even the ones {@link DETERMINISTIC_CHECKS}
+ * itself runs.
  *
- * `Bash(npm *)` and `Bash(node *)` used to be granted here. Both are far too
- * wide: `npm *` also admits `npm run agent` (the controller itself, which can
- * push and call `gh`) and arbitrary `npm exec`/install-script execution, and
- * `node *` lets Claude run any script that shells out to `child_process` —
- * including `git push` or `gh pr merge` — which no `Bash(git push*)` or
- * `Bash(gh *)` disallow entry can see, because the invocation never contains
- * those literal strings; it is Node, not git or gh. Enumerating the exact
- * verification commands closes that gap the same way {@link
- * CLAUDE_GIT_SUBCOMMANDS} does for git: nothing not listed here is runnable at
- * all, regardless of what it might do internally.
+ * Two independent reasons, either one sufficient on its own:
+ *
+ *  1. Claude can edit `package.json` (it needs `Edit`/`Write` to implement at
+ *     all), and an npm script name only resolves to a command *at run time*,
+ *     by reading `package.json`. Granting `Bash(npm run test)` while also
+ *     granting `Write` on `package.json` means Claude can redefine what
+ *     "test" runs and then invoke exactly the command it was "restricted"
+ *     to — including a script that shells out to `git push` or `gh`, which
+ *     no `Bash(git push*)` or `Bash(gh *)` disallow entry can see, because
+ *     the invocation is npm, not git or gh.
+ *  2. Deriving the allowlist from the *configured* `checks[].script` values
+ *     (`agentloop.config.json`) turns project configuration into a source of
+ *     Claude's tool permissions. A `script` value is joined into a
+ *     comma-separated `--allowedTools` list; a crafted value containing a
+ *     comma can inject an unrelated `Bash(...)` pattern into that list
+ *     regardless of how the individual token is validated.
+ *
+ * There is no fix that keeps some npm command granted here — the point of
+ * both gaps is that *any* npm invocation Claude can run is a path to
+ * something else once `package.json` (or the check config) is not fully
+ * trusted input. Verification is the controller's job: it runs
+ * {@link DETERMINISTIC_CHECKS} itself, through `checks.mjs`, independently of
+ * whatever Claude did, after Claude hands off.
  */
-const CLAUDE_VERIFICATION_COMMANDS = DETERMINISTIC_CHECKS.flatMap((check) => {
-  const commands = [`Bash(npm run ${check.script})`];
-  // `npm test` is the common shorthand for the test script; grant it
-  // alongside the explicit `npm run test` form so either invocation works.
-  if (check.script === 'test') commands.push('Bash(npm test)');
-  return commands;
-});
-
-const CLAUDE_DEFAULT_ALLOWED = [
-  'Read',
-  'Edit',
-  'Write',
-  'Glob',
-  'Grep',
-  'TodoWrite',
-  ...CLAUDE_GIT_SUBCOMMANDS,
-  ...CLAUDE_VERIFICATION_COMMANDS,
-].join(',');
+const CLAUDE_DEFAULT_ALLOWED = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'TodoWrite', ...CLAUDE_GIT_SUBCOMMANDS].join(
+  ',',
+);
 
 /**
  * Patterns Claude may never run, whatever the allowlist says.
@@ -298,6 +320,8 @@ export const CLAUDE_DISALLOWED_TOOLS = [
   'Bash(gh:*)',
   'Bash(node *)',
   'Bash(node:*)',
+  'Bash(npm *)',
+  'Bash(npm:*)',
   'Bash(npx *)',
   'Bash(npx:*)',
   'WebFetch',
@@ -321,15 +345,16 @@ const CLAUDE_GIT_ALLOWED_SET = new Set(CLAUDE_GIT_SUBCOMMANDS);
 
 /**
  * Recognises any `Bash(...)` entry that invokes `node`, `npm`, or `npx`, in
- * whatever form — the same over-broad-on-purpose match {@link GIT_BASH_ENTRY}
- * uses, for the same reason: a script run through any of these three can call
- * `child_process` and shell out to `git push` or `gh`, so every such entry
- * must be checked against the fixed safe list below, not just the ones that
- * look dangerous.
+ * whatever form. Unlike {@link GIT_BASH_ENTRY}, there is no safe subset to
+ * compare against here — every such entry is refused outright. `npm run
+ * <script>` only resolves to a real command by reading `package.json` at run
+ * time, and Claude can edit `package.json`; there is no npm invocation that
+ * stays safe once the thing that defines what it does is not trusted input.
+ * Any of the three can also shell out to `git push` or `gh` through
+ * `child_process`, which no `Bash(git push*)` or `Bash(gh *)` disallow entry
+ * can see, because the invocation is Node, not git or gh.
  */
 const NODE_BASH_ENTRY = /^bash\(\s*(?:node|npm|npx)\b/i;
-
-const CLAUDE_VERIFICATION_ALLOWED_SET = new Set(CLAUDE_VERIFICATION_COMMANDS);
 
 /**
  * Any env-provided override must still refuse Claude the publishing tools.
@@ -378,16 +403,17 @@ export function validateAllowedTools(value) {
       );
     }
 
-    if (NODE_BASH_ENTRY.test(entry) && !CLAUDE_VERIFICATION_ALLOWED_SET.has(entry)) {
+    if (NODE_BASH_ENTRY.test(entry)) {
       throw new Error(
         `AGENTLOOP_CLAUDE_ALLOWED_TOOLS=${JSON.stringify(value)} is not permitted: ` +
-          `${JSON.stringify(entry)} is not one of the fixed verification commands Claude may ` +
-          `run (${CLAUDE_VERIFICATION_COMMANDS.join(', ')}). A wildcard \`Bash(npm *)\` or ` +
-          '`Bash(node *)` grant would readmit `npm run agent` (the controller itself) and any ' +
-          'Node script that shells out to `git push` or `gh` through `child_process` — neither ' +
-          'of which a `Bash(git push*)` or `Bash(gh *)` disallow entry can see, because the ' +
-          'invocation is Node, not git or gh. `npx` is refused outright: it can fetch and run ' +
-          'an arbitrary package, and no fixed verification command needs it.',
+          `${JSON.stringify(entry)} grants a node, npm, or npx command. Claude may not run any ` +
+          'of these, verification commands included: `npm run <script>` only resolves to a real ' +
+          'command by reading `package.json`, which Claude can edit, so no npm invocation stays ' +
+          'restricted once the thing that defines what it does is not trusted input. Any of the ' +
+          'three can also shell out to `git push` or `gh pr merge` through `child_process`, which ' +
+          'no `Bash(git push*)` or `Bash(gh *)` disallow entry can see, because the invocation is ' +
+          'Node, not git or gh. Verification runs only in the controller, through checks.mjs, ' +
+          "after Claude's commit — never as a tool Claude itself can invoke.",
       );
     }
   }

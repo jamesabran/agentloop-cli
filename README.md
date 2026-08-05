@@ -117,18 +117,48 @@ override any of that:
 
 Every field is optional and defaults to the value shown above (`repo:
 null` means "resolve it from the git remote"). `checks` is the ordered list of
-`npm run <script>` commands the controller runs — and the only ones it grants
-Claude permission to run — before handing a commit to Codex; the default
-matches a typical `typecheck`/`lint`/`test`/`build` project. If your project
-uses different script names, or a different number of checks, list them here.
+`npm run <script>` commands the **controller** runs, through `checks.mjs`,
+before handing a commit to Codex; the default matches a typical
+`typecheck`/`lint`/`test`/`build` project. If your project uses different
+script names, or a different number of checks, list them here.
+
+Claude is never granted any of these commands, or any `npm`/`node`/`npx`
+command at all — see [Verification runs only in the
+controller](#verification-runs-only-in-the-controller) below.
 
 ## `AGENTS.md` is optional
 
 If the project has an `AGENTS.md` at its root, Claude and Codex are both told
 to read it first — it's the natural place for project-specific rules: roles,
-verification commands, commit conventions, scope boundaries. AgentLoop does
-not require one; a project with no `AGENTS.md` still works, just without that
-extra context.
+commit conventions, scope boundaries, and documentation of what the
+verification commands are (informational for Claude; the controller is what
+actually runs them). AgentLoop does not require one; a project with no
+`AGENTS.md` still works, just without that extra context.
+
+## Verification runs only in the controller
+
+Claude implements and commits, but it cannot run the project's build, lint,
+test, or any other npm command — `npm`, `node`, and `npx` are all outside its
+allowed tools, unconditionally, regardless of what `checks` in
+`agentloop.config.json` configures. This is deliberate, not a missing
+feature:
+
+- Claude can edit `package.json` (it needs to, to implement most changes),
+  and an npm script name only resolves to a real command *at run time*, by
+  reading `package.json`. Granting Claude `npm run test` while also letting
+  it edit `package.json` would let it redefine what "test" runs and then
+  invoke exactly the command it was "restricted" to.
+- The configured `checks[].script` values come from project configuration,
+  not from AgentLoop itself. Deriving Claude's allowed tools from them would
+  make a project's own config file a source of Claude's permissions.
+
+So verification is the controller's job, exclusively: it runs the configured
+checks itself, through `checks.mjs`, against Claude's committed HEAD,
+independently of anything Claude reports. Claude's `VERIFICATION: PASS` in
+its handoff means it re-read its own diff and believes the change is
+correct — not that it ran the verification commands, because it cannot. The
+controller's own check run, immediately after handoff and before Codex, is
+the actual gate.
 
 ## First run
 
@@ -272,6 +302,15 @@ the commit, looping forever on a finding — not an agent trying to escape.
   the unconditional disallow list for the implementation turn, and no env var
   can grant them back. "No partial work reaches GitHub" is a property of the
   loop, not a promise in a prompt.
+- **Claude cannot run `npm`, `node`, or `npx`, at all.** Not even the
+  project's own configured verification commands. Claude can edit
+  `package.json`, and an npm script name only resolves to a real command by
+  reading it at run time — granting any `npm run <script>` would let Claude
+  redefine what that script runs and then invoke exactly the command it was
+  "restricted" to. This is unconditional too: an env var override, or a
+  crafted `checks[].script` value in `agentloop.config.json`, cannot grant it
+  back — Claude's allowed tools are never derived from the configured checks
+  at all.
 - **Claude starts clean and Codex has an exact handoff.** Claude is never
   started over a dirty worktree. Codex starts only when `implementationHead`
   was recorded from a valid Claude handoff and exactly equals the current
@@ -287,8 +326,11 @@ the commit, looping forever on a finding — not an agent trying to escape.
 - **Claude failures require an explicit recovery.** Timeout, non-zero exit,
   usage/process-limit exhaustion, or a missing/invalid status writes the local
   report, discards the session, and requires `--recover`; no retry is implicit.
-- **Deterministic checks run before Codex.** A failing check stops the loop
-  with the output; it never costs a review round.
+- **Deterministic checks run before Codex, and only in the controller.** The
+  controller runs the configured checks itself, through `checks.mjs`, against
+  Claude's committed HEAD — independently of anything Claude reports. A
+  failing check stops the loop with the output; it never costs a review
+  round.
 - **Re-audits are incremental.** The second and later audits see
   `lastAuditedHead..HEAD` plus the unresolved findings, so Codex is not asked
   to re-read what it already accepted.

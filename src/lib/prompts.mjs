@@ -37,7 +37,9 @@ ${formatStatusBlock({
   NEXT: 'CODEX_AUDIT',
 })}
 
-Report READY_FOR_AUDIT only after you have committed locally, run the project's verification commands, and confirmed \`git status\` is clean. HEAD must be the full 40-character hash of the commit you just made — \`git rev-parse HEAD\` — not an abbreviation. VERIFICATION must be PASS; if verification fails, fix it rather than reporting.
+Report READY_FOR_AUDIT only after you have committed locally and confirmed \`git status\` is clean. HEAD must be the full 40-character hash of the commit you just made — \`git rev-parse HEAD\` — not an abbreviation.
+
+You do not have access to run the project's build, lint, test, or any other npm command yourself — that is intentional, not an oversight. The controller runs the project's verification commands itself, authoritatively, immediately after your handoff and independently of anything you report; that is the actual gate, not this field. VERIFICATION: PASS means you have carefully re-read your own diff and believe it is correct and complete — not that you ran the verification commands, because you cannot. If you believe your change is incomplete or wrong, keep working or report BLOCKED rather than reporting READY_FOR_AUDIT.
 
 Getting HEAD right matters: Codex's verdict applies to that commit and no other, and only an approved commit that is still HEAD is ever pushed.
 
@@ -66,7 +68,7 @@ export function implementationPrompt({ task, branch, brief, resumed }) {
 
   return `${heading}
 
-If this project has an AGENTS.md file at its root, read it first — it is authoritative for roles, verification commands, and commit rules where it exists. Then review any other project documentation, then the task below.
+If this project has an AGENTS.md file at its root, read it first — it is authoritative for roles and commit rules where it exists. It may also document verification commands; those are informational for you, since you cannot run them yourself (see below) — the controller is what actually executes them. Then review any other project documentation, then the task below.
 
 ## Task ${task}
 
@@ -83,7 +85,8 @@ ${brief || '(no description provided)'}
 1. Inspect the project before changing it.
 2. Implement the task, and only the task.
 3. Add or update the tests the change warrants.
-4. Run the project's verification commands (see AGENTS.md if present), and fix what fails.
+4. Re-read your diff carefully before committing. You cannot run the project's build, lint, or
+   test commands yourself; the controller runs them, authoritatively, right after your handoff.
 5. Make one local checkpoint commit with a focused Conventional Commit message.
 
 ${SAFETY_RULES}
@@ -115,7 +118,8 @@ ${quoteFindings(findings)}
 ## What to do
 
 1. Address each blocking finding, on branch ${branch}.
-2. Re-run the project's verification commands.
+2. Re-read your diff carefully. You cannot run the project's verification commands yourself; the
+   controller re-runs them, authoritatively, right after this handoff.
 3. Make a new local commit. Do not amend ${auditedCommit} and do not rebase — Codex re-audits only the commits you add on top, so the previous checkpoint must stay reachable.
 4. Summarise, per finding, what you changed or why the finding does not hold.
 

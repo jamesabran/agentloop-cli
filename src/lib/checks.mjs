@@ -7,6 +7,12 @@
  * consume a review round: the loop stops and reports instead of asking Codex
  * to notice what `tsc` already knows.
  *
+ * This module is the only place these checks run. The controller calls it
+ * directly from `runAuditStep`, independently of anything Claude did —
+ * Claude has no Bash access to `npm run <script>` at all (see
+ * `CLAUDE_DEFAULT_ALLOWED` in config.mjs), so this is the sole authority on
+ * whether verification passed.
+ *
  * The runner is injected so the ordering, the short-circuit, and the summary
  * are testable without spawning anything.
  */

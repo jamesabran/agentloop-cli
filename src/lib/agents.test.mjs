@@ -261,6 +261,28 @@ describe('buildClaudeArgs', () => {
     expect(value).toMatch(/Bash\(git status\*\)/);
     expect(value).toMatch(/Bash\(git commit\*\)/);
   });
+
+  it('grants no npm, node, or npx command in the default allowlist', () => {
+    // Verification runs only in the controller, through checks.mjs. Claude
+    // can edit package.json, so any `npm run <script>` grant — even the
+    // exact commands the controller's own configured checks run — would let
+    // Claude redefine what that script does and then invoke it.
+    const args = buildClaudeArgs({ sessionId: 'uuid-1', resume: false });
+    const allowIndex = args.indexOf('--allowedTools');
+    const value = args[allowIndex + 1];
+    expect(value).not.toMatch(/bash\(\s*npm/i);
+    expect(value).not.toMatch(/bash\(\s*node/i);
+    expect(value).not.toMatch(/bash\(\s*npx/i);
+  });
+
+  it('unconditionally disallows npm, node, and npx alongside git push and gh', () => {
+    const args = buildClaudeArgs({ sessionId: 'uuid-1', resume: false });
+    const disallowIndex = args.indexOf('--disallowedTools');
+    const value = args[disallowIndex + 1];
+    expect(value).toMatch(/Bash\(npm \*\)/);
+    expect(value).toMatch(/Bash\(node \*\)/);
+    expect(value).toMatch(/Bash\(npx \*\)/);
+  });
 });
 
 describe('Claude stream progress', () => {

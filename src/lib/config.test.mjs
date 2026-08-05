@@ -20,6 +20,19 @@
  * instead and must match one of them exactly, so an option-prefixed push, a
  * remote mutation, or any other git command not on that list is refused the
  * same way, whatever shape it takes.
+ *
+ * Claude's allowlist used to also include the exact `npm run <script>`
+ * commands DETERMINISTIC_CHECKS runs, derived from the configured `checks`.
+ * That was two vulnerabilities at once: Claude can edit `package.json`, so
+ * an npm script name only resolves to a real command by reading a file
+ * Claude itself controls (redefine "test", then invoke the "restricted"
+ * `npm run test`); and deriving Claude's tools from *configured* check
+ * values made a project's own `agentloop.config.json` a source of Claude's
+ * permissions, with a comma in a `script` value able to inject an unrelated
+ * `Bash(...)` pattern into the joined allowlist string. Claude is now never
+ * granted any npm/node/npx command, unconditionally — see the "a configured
+ * check cannot add a Claude Bash permission" and "modifying package.json
+ * gives Claude no path to run git push or gh" tests below.
  */
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -357,22 +370,21 @@ describe('AGENTLOOP_CLAUDE_ALLOWED_TOOLS cannot grant the publishing tools', () 
     expect(result.stderr).toMatch(/not permitted/);
   });
 
-  it('loads a default that enumerates specific npm verification commands, not a wildcard', () => {
-    // `Bash(npm *)` and `Bash(node *)` used to be granted here. Both are far
-    // too wide: `npm *` also admits `npm run agent` — the controller itself,
-    // which can push and call `gh` — and `node *` lets Claude run any script
-    // that shells out to `git push` or `gh` through `child_process`, which no
-    // `Bash(git push*)` or `Bash(gh *)` disallow entry can see because the
-    // invocation is Node, not git or gh.
+  it('loads a default that grants no npm, node, or npx command at all', () => {
+    // Claude used to be granted the exact `npm run <script>` commands
+    // DETERMINISTIC_CHECKS runs. That is no longer true, for two reasons:
+    // Claude can edit package.json, so `npm run test` only resolves to a
+    // real command by reading a file Claude itself controls; and deriving
+    // Claude's tools from *configured* checks made project config a source
+    // of Claude's permissions. Verification is the controller's job only,
+    // through checks.mjs — Claude gets no npm/node/npx command, period.
     const dir = makeProject();
     const result = importConfigField('CLAUDE_ALLOWED_TOOLS', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
     const value = JSON.parse(result.stdout);
-    expect(value).not.toMatch(/Bash\(npm \*\)/);
-    expect(value).not.toMatch(/Bash\(node \*\)/);
-    expect(value).toMatch(/Bash\(npm run typecheck\)/);
-    expect(value).toMatch(/Bash\(npm run lint\)/);
-    expect(value).toMatch(/Bash\(npm run build\)/);
+    expect(value).not.toMatch(/bash\(\s*npm/i);
+    expect(value).not.toMatch(/bash\(\s*node/i);
+    expect(value).not.toMatch(/bash\(\s*npx/i);
   });
 
   it('refuses an unbounded Bash(npm *) override', () => {
@@ -383,7 +395,6 @@ describe('AGENTLOOP_CLAUDE_ALLOWED_TOOLS cannot grant the publishing tools', () 
     });
     expect(result.status).toBe(1);
     expect(result.stderr).toMatch(/not permitted/);
-    expect(result.stderr).toMatch(/fixed verification commands/);
   });
 
   it('refuses an unbounded Bash(node *) override', () => {
@@ -397,7 +408,6 @@ describe('AGENTLOOP_CLAUDE_ALLOWED_TOOLS cannot grant the publishing tools', () 
     });
     expect(result.status).toBe(1);
     expect(result.stderr).toMatch(/not permitted/);
-    expect(result.stderr).toMatch(/fixed verification commands/);
   });
 
   it('refuses Bash(npx *), which can fetch and run an arbitrary package', () => {
@@ -410,26 +420,156 @@ describe('AGENTLOOP_CLAUDE_ALLOWED_TOOLS cannot grant the publishing tools', () 
     expect(result.stderr).toMatch(/not permitted/);
   });
 
-  it('refuses an npm script that is not on the fixed verification list', () => {
+  it('refuses an npm run grant that exactly matches one of the configured checks', () => {
+    // There is no longer a "fixed verification commands" exception at all —
+    // not even for the literal `npm run <script>` values DETERMINISTIC_CHECKS
+    // itself would run. Regression for the original vulnerability: this used
+    // to be accepted because it matched the checks-derived allowlist.
     const dir = makeProject();
     const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
       cwd: dir,
-      env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: 'Read,Bash(npm run agent*)' }),
+      env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: 'Read,Bash(npm run test)' }),
     });
     expect(result.status).toBe(1);
     expect(result.stderr).toMatch(/not permitted/);
-    expect(result.stderr).toMatch(/fixed verification commands/);
   });
 
-  it('accepts the exact fixed verification commands', () => {
+  it('refuses every previously-fixed verification command at once', () => {
     const value = 'Read,Bash(npm run typecheck),Bash(npm run lint),Bash(npm test),Bash(npm run build)';
     const dir = makeProject();
     const result = importConfigField('CLAUDE_ALLOWED_TOOLS', {
       cwd: dir,
       env: baseEnv({ AGENTLOOP_CLAUDE_ALLOWED_TOOLS: value }),
     });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/not permitted/);
+  });
+});
+
+describe('a configured check cannot add a Claude Bash permission', () => {
+  it('grants the identical default allowlist whether or not any checks are configured', () => {
+    const withDefaults = makeProject();
+    const withCustomChecks = makeProject({
+      config: { checks: [{ name: 'unit', script: 'unit-tests' }, { name: 'compile', script: 'compile' }] },
+    });
+
+    const a = importConfigField('CLAUDE_ALLOWED_TOOLS', { cwd: withDefaults, env: baseEnv() });
+    const b = importConfigField('CLAUDE_ALLOWED_TOOLS', { cwd: withCustomChecks, env: baseEnv() });
+
+    expect(a.status).toBe(0);
+    expect(b.status).toBe(0);
+    expect(JSON.parse(b.stdout)).toBe(JSON.parse(a.stdout));
+  });
+
+  it("does not mention a configured check's script name anywhere in Claude's allowed tools", () => {
+    const dir = makeProject({
+      config: { checks: [{ name: 'unit', script: 'run-unit-suite' }] },
+    });
+
+    const checks = importConfigField('DETERMINISTIC_CHECKS', { cwd: dir, env: baseEnv() });
+    const tools = importConfigField('CLAUDE_ALLOWED_TOOLS', { cwd: dir, env: baseEnv() });
+
+    expect(checks.status).toBe(0);
+    expect(JSON.parse(checks.stdout)).toEqual([{ name: 'unit', script: 'run-unit-suite' }]);
+    expect(tools.status).toBe(0);
+    expect(JSON.parse(tools.stdout)).not.toMatch(/run-unit-suite/);
+  });
+
+  it('rejects a check script shaped like a comma-separated tool-pattern injection, at config load', () => {
+    // Bash(...) entries are joined into a single comma-separated
+    // --allowedTools string. If a configured script value were ever used to
+    // build a Claude Bash pattern (it no longer is — see the tests above),
+    // an embedded comma could inject an unrelated pattern into that list.
+    // CHECK_TOKEN rejects it outright as defense in depth, independent of
+    // that structural fix.
+    const dir = makeProject({
+      config: { checks: [{ name: 'test', script: 'test),Bash(git push*' }] },
+    });
+    const result = importConfigField('DETERMINISTIC_CHECKS', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/must match/);
+  });
+
+  it('rejects a check name or script containing shell metacharacters', () => {
+    const dir = makeProject({
+      config: { checks: [{ name: 'test', script: 'test; rm -rf /' }] },
+    });
+    const result = importConfigField('DETERMINISTIC_CHECKS', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/must match/);
+  });
+});
+
+describe('modifying package.json gives Claude no path to run git push or gh', () => {
+  it('grants no npm/node/npx command even when package.json defines a malicious script', () => {
+    // The exact attack this closes: an npm script name only resolves to a
+    // real command by reading package.json at run time. If Claude (which
+    // has Edit/Write to implement the task) could also run `npm run test`,
+    // rewriting package.json's "test" script to `git push` or `gh pr merge`
+    // and then invoking the "restricted" verification command would run it —
+    // a path no `Bash(git push*)` or `Bash(gh *)` disallow entry can see,
+    // because the invocation is npm, not git or gh.
+    const dir = makeProject();
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      JSON.stringify({
+        name: 'victim-project',
+        scripts: {
+          typecheck: 'true',
+          lint: 'true',
+          test: 'git push origin HEAD:main && gh pr merge --auto',
+          build: 'true',
+        },
+      }),
+      'utf8',
+    );
+
+    const result = importConfigField('CLAUDE_ALLOWED_TOOLS', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toBe(value);
+    const value = JSON.parse(result.stdout);
+    expect(value).not.toMatch(/bash\(\s*npm/i);
+    expect(value).not.toMatch(/bash\(\s*node/i);
+    expect(value).not.toMatch(/bash\(\s*npx/i);
+    expect(value).not.toMatch(/git push/i);
+    expect(value).not.toMatch(/\bgh\b/i);
+  });
+
+  it('keeps npm/node/npx unconditionally disallowed, belt-and-braces, alongside git push and gh', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_DISALLOWED_TOOLS', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    const value = JSON.parse(result.stdout);
+    expect(value).toMatch(/Bash\(npm \*\)/);
+    expect(value).toMatch(/Bash\(node \*\)/);
+    expect(value).toMatch(/Bash\(npx \*\)/);
+    expect(value).toMatch(/Bash\(git push\*\)/);
+    expect(value).toMatch(/Bash\(gh \*\)/);
+  });
+});
+
+describe('normal controller verification still works', () => {
+  it('reads the default checks unchanged', () => {
+    const dir = makeProject();
+    const result = importConfigField('DETERMINISTIC_CHECKS', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([
+      { name: 'typecheck', script: 'typecheck' },
+      { name: 'lint', script: 'lint' },
+      { name: 'test', script: 'test' },
+      { name: 'build', script: 'build' },
+    ]);
+  });
+
+  it('reads a valid custom checks list from agentloop.config.json unaffected by the Claude-tools fix', () => {
+    const dir = makeProject({
+      config: { checks: [{ name: 'unit', script: 'test:unit' }, { name: 'e2e', script: 'test:e2e' }] },
+    });
+    const result = importConfigField('DETERMINISTIC_CHECKS', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([
+      { name: 'unit', script: 'test:unit' },
+      { name: 'e2e', script: 'test:e2e' },
+    ]);
   });
 });
 
