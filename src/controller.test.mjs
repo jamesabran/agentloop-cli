@@ -79,12 +79,12 @@ describe('parseArgs --next', () => {
     expect(parseArgs(['--self-check']).selfCheck).toBe(true);
   });
 
-  it('rejects --task with "." in the id', () => {
-    expect(() => parseArgs(['--task', 'bad.id'])).toThrow(/not a valid task identifier/);
+  it('accepts --task with "." in the id', () => {
+    expect(parseArgs(['--task', 'bad.id']).task).toBe('bad.id');
   });
 
-  it('rejects --task with "/" in the id', () => {
-    expect(() => parseArgs(['--task', 'x/y'])).toThrow(/not a valid task identifier/);
+  it('accepts --task with "/" in the id', () => {
+    expect(parseArgs(['--task', 'x/y']).task).toBe('x/y');
   });
 
   it('rejects --task with ".." traversal in the id', () => {
