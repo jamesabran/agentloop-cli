@@ -247,6 +247,32 @@ export const MAX_CHANGE_ROUNDS = Number(
     (Number.isInteger(PROJECT_CONFIG.maxChangeRounds) ? PROJECT_CONFIG.maxChangeRounds : 2),
 );
 
+/**
+ * Publishing behaviour for approved commits.
+ *
+ * `"manual"` (the default) means the controller stops before pushing —
+ * the owner inspects and pushes the approved branch themselves.
+ * `"auto"` means the controller pushes the branch immediately after
+ * Codex approves the commit that is still HEAD.
+ *
+ * Configurable via `publishMode` in `agentloop.config.json` or the
+ * `AGENTLOOP_PUBLISH_MODE` environment variable. An unrecognised value
+ * raises an error at startup rather than silently defaulting.
+ *
+ * @type {'manual' | 'auto'}
+ */
+export const PUBLISH_MODE = validatePublishMode(
+  process.env.AGENTLOOP_PUBLISH_MODE ?? PROJECT_CONFIG.publishMode,
+);
+
+function validatePublishMode(value) {
+  if (value === undefined || value === null) return 'manual';
+  if (value === 'manual' || value === 'auto') return value;
+  throw new Error(
+    `Invalid publish mode ${JSON.stringify(value)}. Valid values are "manual" and "auto".`,
+  );
+}
+
 const CLAUDE_CONFIG = PROJECT_CONFIG.claude ?? {};
 
 /**

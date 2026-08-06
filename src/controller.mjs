@@ -29,6 +29,7 @@ import {
   DETERMINISTIC_CHECKS,
   LIMITS,
   MAX_CHANGE_ROUNDS,
+  PUBLISH_MODE,
   REPO,
   REPORT_FILE,
   REPO_ROOT,
@@ -636,7 +637,7 @@ export function migrateLegacyCache(cache, content, opts) {
   }
 }
 
-/** Push the approved branch. The only network write the loop performs. */
+/** Push the approved branch, or report it ready when publish mode is manual. */
 async function runPublishStep({ context, options }) {
   const { state } = context;
   const head = await headCommit();
@@ -659,8 +660,22 @@ async function runPublishStep({ context, options }) {
   }
 
   if (options.dryRun) {
-    log.info(`[dry-run] would push ${short(head)} to ${state.branch}`);
+    log.info(
+      `[dry-run] ${PUBLISH_MODE === 'auto' ? 'would push' : 'would report ready for manual publishing'} ` +
+        `${short(head)} on ${state.branch}`,
+    );
     return { continue: false, stopReason: 'Dry run: nothing was pushed.' };
+  }
+
+  if (PUBLISH_MODE === 'manual') {
+    context.state = clearFailures({ ...context.state, publishedHead: head });
+    log.info(
+      `Codex approved ${short(head)} on ${state.branch}. ` +
+        'Publish mode is manual — push this branch when you are ready. ' +
+        'Open a pull request for it if you want one merged; ' +
+        'the controller does not open, update, merge, or close one.',
+    );
+    return { continue: true };
   }
 
   await checkAuth();

@@ -809,3 +809,36 @@ describe('Claude timeout is short and bounded', () => {
     expect(limits.claudeTimeoutMaxMs).toBe(15 * 60 * 1000);
   });
 });
+
+describe('PUBLISH_MODE controls whether approved commits are pushed automatically', () => {
+  it('defaults to manual', () => {
+    const dir = makeProject();
+    const result = importConfigField('PUBLISH_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('manual');
+  });
+
+  it('reads publishMode from agentloop.config.json', () => {
+    const dir = makeProject({ config: { publishMode: 'auto' } });
+    const result = importConfigField('PUBLISH_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('auto');
+  });
+
+  it('accepts an AGENTLOOP_PUBLISH_MODE environment override', () => {
+    const dir = makeProject({ config: { publishMode: 'manual' } });
+    const result = importConfigField('PUBLISH_MODE', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_PUBLISH_MODE: 'auto' }),
+    });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('auto');
+  });
+
+  it('rejects an unrecognised value at config load', () => {
+    const dir = makeProject({ config: { publishMode: 'on-approval' } });
+    const result = importConfigField('PUBLISH_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/Invalid publish mode/);
+  });
+});
