@@ -27,7 +27,7 @@
  *
  * This reconstructs every option `controller.mjs`'s `parseArgs` accepts —
  * `--task`, `--brief`, `--branch` (value options), and `--dry-run`,
- * `--recover`, `--self-check`, `--verbose`, `--help` (boolean options).
+ * `--next`, `--recover`, `--self-check`, `--verbose`, `--help` (boolean options).
  * Explicit argv always wins: a flag already present — whether or not
  * anything else nearby was swallowed — is never re-added, overwritten, or
  * treated as available for recovery. A boolean option is only ever
@@ -57,6 +57,7 @@ const VALUE_OPTIONS = [
 /** Options that take no value — bare flags, recovered only from an exact `'true'`. */
 const BOOLEAN_OPTIONS = [
   { flag: '--dry-run', configKey: 'npm_config_dry_run' },
+  { flag: '--next', configKey: 'npm_config_next' },
   { flag: '--recover', configKey: 'npm_config_recover' },
   { flag: '--self-check', configKey: 'npm_config_self_check' },
   { flag: '--verbose', configKey: 'npm_config_verbose' },

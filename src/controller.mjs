@@ -26,10 +26,13 @@ import { pathToFileURL } from 'node:url';
 import {
   AGENT_DIR,
   BASE_BRANCH,
+  DETERMINISTIC_CHECKS,
   LIMITS,
   MAX_CHANGE_ROUNDS,
   REPO,
   REPORT_FILE,
+  REPO_ROOT,
+  TASKS_FILE_RELATIVE,
 } from './lib/config.mjs';
 import { runClaude, streamClaudeProgress } from './lib/claude-agent.mjs';
 import { runCodexAudit } from './lib/codex-agent.mjs';
@@ -68,13 +71,24 @@ import {
   selectTask,
 } from './lib/state.mjs';
 import { readStatus } from './lib/status-block.mjs';
+import {
+  dependencyStatuses,
+  findTask,
+  generateTaskBrief,
+  loadTaskFile,
+  resolveTaskFilePath,
+  selectNextTask,
+  validateTaskFile,
+} from './lib/tasks.mjs';
 
 const USAGE = `AgentLoop workflow controller — local implement-and-review loop
 
   agentloop --task <id> [options]
+  agentloop --next [--dry-run]
 
 Options:
   --task <id>       Task or issue identifier to work on (required the first time)
+  --next            Select the next task from agentloop.tasks.json deterministically
   --brief <file>    Task description to use instead of reading the issue
   --branch <name>   Local working branch (default: agent/task-<id>)
   --dry-run         Report the next local step, change nothing
@@ -82,6 +96,9 @@ Options:
   --self-check      Offline demonstration of the loop; no agents, no network
   --verbose         Include debug logging
   --help            Show this message
+
+Task selection with --next is deterministic and auditable: the controller owns
+the decision; Claude and Codex never choose which task comes next.
 
 Local state, logs, audit reports, and the final report live in .agent/.
 That directory is gitignored and never contains credentials.
@@ -93,6 +110,7 @@ export function parseArgs(argv) {
     brief: null,
     branch: null,
     dryRun: false,
+    next: false,
     selfCheck: false,
     recover: false,
     verbose: false,
@@ -104,6 +122,9 @@ export function parseArgs(argv) {
     switch (arg) {
       case '--dry-run':
         options.dryRun = true;
+        break;
+      case '--next':
+        options.next = true;
         break;
       case '--self-check':
         options.selfCheck = true;
@@ -132,6 +153,16 @@ export function parseArgs(argv) {
         break;
       default:
         throw new Error(`Unknown option: ${arg}`);
+    }
+  }
+
+  // --next conflicts with explicit --task and --brief
+  if (options.next) {
+    if (options.task !== null) {
+      throw new Error('--next and --task are mutually exclusive. Use --next to select the next task deterministically, or --task <id> to work on a specific task.');
+    }
+    if (options.brief !== null) {
+      throw new Error('--next and --brief are mutually exclusive. A custom brief is only valid with an explicitly supplied --task.');
     }
   }
 
@@ -193,7 +224,7 @@ class LoopStopped extends Error {}
  * is the one time the loop touches GitHub before publishing, and it is a read:
  * the issue is never labelled, commented on, or closed.
  */
-async function resolveBrief({ task, options }) {
+async function resolveBrief({ task, options, generatedBrief }) {
   const cache = path.join(AGENT_DIR, `brief-${task}.md`);
 
   // Cached on first resolution so later rounds — which may be separate
@@ -203,6 +234,14 @@ async function resolveBrief({ task, options }) {
     fs.mkdirSync(AGENT_DIR, { recursive: true });
     fs.writeFileSync(cache, brief, 'utf8');
   };
+
+  // A generated brief from --next / the committed task file takes highest
+  // precedence. Cache it for resume, but the committed file is the durable
+  // source of truth.
+  if (generatedBrief !== undefined && generatedBrief !== null) {
+    remember(generatedBrief);
+    return { brief: generatedBrief, source: 'generated from committed task file' };
+  }
 
   if (options.brief) {
     const brief = fs.readFileSync(options.brief, 'utf8');
@@ -618,6 +657,141 @@ function readAuditReport(state) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Next-task resolution                                                *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Resolve the next task from the committed task file when `--next` is used.
+ *
+ * Validates the entire task file before any branch or state mutation, then
+ * either resumes the active runtime task or selects the next one
+ * deterministically from the validated file.
+ *
+ * @param {{ loaded: object, options: object }} input
+ * @returns {{ task: string, generatedBrief: string }}
+ */
+function resolveNextTask({ loaded, options }) {
+  const tasksFilePath = resolveTaskFilePath(TASKS_FILE_RELATIVE, REPO_ROOT);
+
+  if (options.dryRun) {
+    log.info(`Task file: ${tasksFilePath}`);
+  }
+
+  const taskData = loadTaskFile(tasksFilePath);
+  const validated = validateTaskFile(taskData, tasksFilePath);
+  const tasks = validated.tasks;
+  const taskMap = new Map(tasks.map((t) => [t.id, t]));
+
+  // Active-task resume: when valid runtime state already identifies an
+  // active task, resume it through the existing recovery/resume rules.
+  // Do not silently replace it with a newly selected task.
+  const activeTaskId = loaded.task;
+  const activeTask = activeTaskId ? findTask(tasks, activeTaskId) : null;
+
+  if (activeTaskId && activeTask && activeTask.status !== 'completed') {
+    // Verify the active task still exists in the committed task file and
+    // has not been completed.
+    if (options.dryRun) {
+      log.info(
+        `Resuming active task: ${JSON.stringify(activeTaskId)} ("${activeTask.title}") ` +
+          `(status: ${activeTask.status})`,
+      );
+      log.info('  This is a resume, not a new selection — runtime state identifies an active task.');
+    } else {
+      log.info(
+        `Resuming active task ${JSON.stringify(activeTaskId)} ("${activeTask.title}") ` +
+          'from saved runtime state.',
+      );
+    }
+
+    const deps = dependencyStatuses(activeTask, taskMap);
+    const brief = generateTaskBrief(
+      activeTask,
+      deps,
+      DETERMINISTIC_CHECKS,
+      MAX_CHANGE_ROUNDS,
+    );
+
+    if (options.dryRun) {
+      logDryRunNext({
+        task: activeTask,
+        deps,
+        tasksFilePath,
+        branch: options.branch ?? loaded.branch ?? defaultBranch(activeTaskId),
+        isResume: true,
+      });
+    }
+
+    return { task: activeTaskId, generatedBrief: brief };
+  }
+
+  // No resumable active task — select the next task deterministically.
+  const selection = selectNextTask(tasks);
+  const nextTask = selection.task;
+
+  if (options.dryRun) {
+    log.info(
+      `Selecting next task: ${JSON.stringify(nextTask.id)} ("${nextTask.title}")`,
+    );
+    log.info(`  Reason: ${selection.reason}`);
+  } else {
+    log.info(
+      `Selected next task: ${JSON.stringify(nextTask.id)} ("${nextTask.title}")`,
+    );
+    log.info(`  ${selection.reason}`);
+  }
+
+  const deps = dependencyStatuses(nextTask, taskMap);
+  const brief = generateTaskBrief(
+    nextTask,
+    deps,
+    DETERMINISTIC_CHECKS,
+    MAX_CHANGE_ROUNDS,
+  );
+
+  if (options.dryRun) {
+    logDryRunNext({
+      task: nextTask,
+      deps,
+      tasksFilePath,
+      branch: options.branch ?? defaultBranch(nextTask.id),
+      isResume: false,
+    });
+  }
+
+  return { task: nextTask.id, generatedBrief: brief };
+}
+
+/**
+ * Show detailed dry-run information for `--dry-run --next`.
+ *
+ * Dry-run must not create branches, switch branches, write files, create
+ * `.agent/`, modify runtime state, invoke Claude, or invoke Codex.
+ */
+function logDryRunNext({ task, deps, tasksFilePath, branch, isResume }) {
+  log.info(`  Task ID: ${task.id}`);
+  log.info(`  Title: ${task.title}`);
+  log.info(`  Status: ${task.status}`);
+  log.info(`  Goal: ${task.goal}`);
+
+  if (deps.length > 0) {
+    log.info('  Dependencies:');
+    for (const dep of deps) {
+      log.info(`    - ${dep.id}: ${dep.status}`);
+    }
+  } else {
+    log.info('  Dependencies: none');
+  }
+
+  log.info(`  Branch: ${branch}`);
+  log.info(`  Checks: ${DETERMINISTIC_CHECKS.map((c) => c.name).join(', ')}`);
+  log.info(`  Max correction rounds: ${MAX_CHANGE_ROUNDS}`);
+  log.info('  Brief: generated from the committed task file');
+  log.info(`  Selection: ${isResume ? 'resuming active task' : 'new task selected deterministically'}`);
+  log.info(`  Task file: ${tasksFilePath}`);
+}
+
+/* ------------------------------------------------------------------ *
  * Run                                                                 *
  * ------------------------------------------------------------------ */
 
@@ -631,11 +805,21 @@ async function runLoop(options) {
     );
   }
 
-  const task = options.task ?? loaded.task;
+  let task;
+  let generatedBrief = null;
+
+  if (options.next) {
+    const result = resolveNextTask({ loaded, options });
+    task = result.task;
+    generatedBrief = result.generatedBrief;
+  } else {
+    task = options.task ?? loaded.task;
+  }
+
   if (!task) {
     // Nothing has been selected, so there is no state to report against and
     // nothing to resume. This is a usage problem, not a stopped task.
-    log.info('No task selected and none saved in .agent/. Pass --task <id>.');
+    log.info('No task selected and none saved in .agent/. Pass --task <id> or --next.');
     return { stopReason: 'No task selected.', usage: !options.dryRun };
   }
 
@@ -675,7 +859,7 @@ async function runLoop(options) {
   // are what the owner picks the task back up from, so they are written on
   // every path out of the loop.
   try {
-    const resolved = await resolveBrief({ task, options });
+    const resolved = await resolveBrief({ task, options, generatedBrief });
     context.brief = resolved.brief;
     log.debug(`Task brief from ${resolved.source}.`);
 

@@ -162,6 +162,22 @@ export const STATE_FILE = path.join(AGENT_DIR, 'state.json');
 export const LOG_DIR = path.join(AGENT_DIR, 'logs');
 export const REPORT_FILE = path.join(AGENT_DIR, 'report.md');
 
+/**
+ * Committed task-file path, relative to the repository root.
+ *
+ * The file is durable planning data, committed alongside the code. `.agent/`
+ * remains disposable, gitignored runtime state.
+ *
+ * Default: `agentloop.tasks.json`. An `agentloop.config.json` may override it
+ * with a `tasksFile` relative path; absolute paths and paths that traverse
+ * outside the repository are rejected at resolution time (see
+ * `resolveTaskFilePath` in lib/tasks.mjs).
+ */
+export const TASKS_FILE_RELATIVE =
+  typeof PROJECT_CONFIG.tasksFile === 'string' && PROJECT_CONFIG.tasksFile.trim() !== ''
+    ? PROJECT_CONFIG.tasksFile.trim()
+    : 'agentloop.tasks.json';
+
 const DEFAULT_CHECKS = Object.freeze([
   Object.freeze({ name: 'typecheck', script: 'typecheck' }),
   Object.freeze({ name: 'lint', script: 'lint' }),
