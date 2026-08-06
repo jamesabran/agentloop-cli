@@ -28,6 +28,7 @@
     "build": "node scripts/build.mjs"
   },
   "devDependencies": {
+    "acorn": "^8.18.0",
     "vitest": "^4.1.10"
   },
   "repository": {

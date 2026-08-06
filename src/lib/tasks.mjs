@@ -511,10 +511,11 @@ export function dependencyStatuses(task, taskMap) {
 /**
  * Encode a task identifier into a deterministic, path-safe cache key.
  *
- * The input is encoded as the lowercase hexadecimal representation of its
- * UTF-8 bytes. The result is injective — distinct task IDs always produce
- * distinct cache keys, so IDs such as `feature/api` and `feature.api`
- * cannot collide.
+ * Each UTF-16 code unit is encoded as exactly four lowercase hexadecimal
+ * digits. The fixed-width representation is injective — every distinct
+ * string maps to a distinct key, even for inputs whose variable-width
+ * encoding would otherwise collide (e.g. `"⍅"` vs `"ģE"`,
+ * both of which produce the same variable-width output `012345`).
  *
  * The output contains only `[0-9a-f]`, which is safe on every common
  * filesystem (no `/`, `..`, or empty segments).
@@ -526,16 +527,7 @@ export function encodeCacheKey(taskId) {
   var str = String(taskId);
   var hex = '';
   for (var i = 0; i < str.length; i++) {
-    var cp = str.charCodeAt(i);
-    // Handle surrogate pairs for code points above U+FFFF.
-    if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < str.length) {
-      var lo = str.charCodeAt(i + 1);
-      if (lo >= 0xdc00 && lo <= 0xdfff) {
-        cp = ((cp - 0xd800) * 0x400) + (lo - 0xdc00) + 0x10000;
-        i++;
-      }
-    }
-    hex += cp.toString(16).padStart(cp > 0xffff ? 6 : cp > 0xff ? 4 : 2, '0');
+    hex += str.charCodeAt(i).toString(16).padStart(4, '0');
   }
   return hex;
 }

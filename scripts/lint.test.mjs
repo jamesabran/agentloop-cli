@@ -126,15 +126,17 @@ describe('findDebuggerStatements', () => {
   });
 
   it('finds debugger before a multi-line block comment opens', () => {
-    const result = findDebuggerStatements('debugger; /* start of multi-line');
+    // Valid JS: debugger statement on line 1, block comment spans lines 2-3.
+    const result = findDebuggerStatements('debugger;\n/* start of\nmulti-line */');
     expect(result).toEqual([1]);
   });
 
   it('finds debugger after a multi-line block comment closes', () => {
+    // Valid JS: block comment on lines 1-2, debugger on line 3.
     const result = findDebuggerStatements(
-      'ending multi-line */ debugger;',
+      '/* start of\nmulti-line */\ndebugger;',
     );
-    expect(result).toEqual([1]);
+    expect(result).toEqual([3]);
   });
 
   it('handles a mixed file correctly', () => {
@@ -172,9 +174,11 @@ describe('findDebuggerStatements', () => {
   });
 
   it('detects debugger inside template literal interpolation', () => {
-    // The expression inside ${...} is JavaScript code; debugger
-    // statements there must be detected.
-    var result = findDebuggerStatements('const x = `hello ${debugger;}`;');
+    // debugger; is a statement and not a valid expression inside ${...},
+    // but it IS valid inside a function body that is itself an expression.
+    var result = findDebuggerStatements(
+      'const x = `hello ${(() => { debugger; return 1; })()}`;',
+    );
     expect(result).toEqual([1]);
   });
 
@@ -187,7 +191,8 @@ describe('findDebuggerStatements', () => {
 
   it('detects debugger inside nested interpolation', () => {
     // Nested template literals and interpolations must not break scanning.
-    var source = 'const x = `outer ${`inner ${debugger;}`}`;';
+    // Wrap debugger in an IIFE so the expression is valid.
+    var source = 'const x = `outer ${`inner ${(() => { debugger; })()}`}`;';
     var result = findDebuggerStatements(source);
     expect(result).toEqual([1]);
   });
@@ -197,6 +202,41 @@ describe('findDebuggerStatements', () => {
     // not code and must not be flagged.
     var result = findDebuggerStatements('const x = `debugger`;');
     expect(result).toEqual([]);
+  });
+
+  it('does not flag /debugger/ as a regex literal', () => {
+    // A regex literal containing the word "debugger" is not a statement.
+    expect(findDebuggerStatements('const pattern = /debugger/;')).toEqual([]);
+    expect(findDebuggerStatements('const re = /debugger/i;')).toEqual([]);
+    expect(findDebuggerStatements('const re = /debugger/gm;')).toEqual([]);
+  });
+
+  it('does not flag debugger inside regex character classes', () => {
+    // Character classes inside regex literals must be skipped correctly.
+    expect(findDebuggerStatements('const re = /[debugger]/;')).toEqual([]);
+  });
+
+  it('does not flag debugger in regex with braces', () => {
+    // Regex literals can contain { } quantifiers and character classes
+    // with } — these must not be confused with interpolation braces.
+    expect(findDebuggerStatements('const re = /{2,4}/;')).toEqual([]);
+    expect(findDebuggerStatements('const re = /[}]/;')).toEqual([]);
+  });
+
+  it('detects debugger in interpolation alongside a regex', () => {
+    // A debugger statement inside template interpolation must be found
+    // even when the expression also contains a regex with braces.
+    // Wrap in an arrow function so debugger is inside a valid block.
+    var source = 'const x = `text ${(() => { debugger; const re = /}/; return re; })()}`;';
+    var result = findDebuggerStatements(source);
+    expect(result).toEqual([1]);
+  });
+
+  it('detects debugger with regex containing debugger in same file', () => {
+    // The regex /debugger/ must not hide the real debugger statement.
+    var source = 'const re = /debugger/;\ndebugger;';
+    var result = findDebuggerStatements(source);
+    expect(result).toEqual([2]);
   });
 
   it('finds debugger even when a // line appears inside a block comment', () => {

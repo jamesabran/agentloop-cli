@@ -577,26 +577,31 @@ describe('dependencyStatuses', () => {
  * ------------------------------------------------------------------ */
 
 describe('encodeCacheKey', () => {
-  it('produces deterministic hex keys for valid task IDs', () => {
-    // Each character is encoded as its UTF-16 code unit in lowercase hex.
-    expect(encodeCacheKey('3c-1')).toBe('33632d31');
-    expect(encodeCacheKey('setup')).toBe('7365747570');
-    expect(encodeCacheKey('feature-a')).toBe('666561747572652d61');
+  it('produces deterministic fixed-width hex keys', () => {
+    // Each UTF-16 code unit → exactly 4 lowercase hex digits.
+    expect(encodeCacheKey('3c-1')).toBe('00330063002d0031');
+    expect(encodeCacheKey('setup')).toBe('00730065007400750070');
+    expect(encodeCacheKey('feature-a')).toBe('0066006500610074007500720065002d0061');
   });
 
   it('is injective — distinct task IDs produce distinct keys', () => {
-    // Collision regression: the old lossy encoding mapped both
-    // "feature/api" and "feature.api" to "feature-api".
+    // Collision regression: the old variable-width encoding mapped both
+    // "⍅" and "ģE" to "012345".
+    var a = encodeCacheKey('⍅');
+    var b = encodeCacheKey('ģE');
+    expect(a).not.toBe(b);
+    expect(a).toBe('00012345');
+    expect(b).toBe('01230045');
+
+    // Original collision case: feature/api vs feature.api
     var slashKey = encodeCacheKey('feature/api');
     var dotKey = encodeCacheKey('feature.api');
     expect(slashKey).not.toBe(dotKey);
-    // Verify the characters that differ:
-    expect(slashKey).toMatch(/2f/); // '/' is U+002F
-    expect(dotKey).toMatch(/2e/);  // '.' is U+002E
+    expect(slashKey).toMatch(/002f/); // '/' is U+002F
+    expect(dotKey).toMatch(/002e/);  // '.' is U+002E
   });
 
   it('distinguishes other punctuation combinations', () => {
-    // Each pair must produce a different key.
     var pairs = [
       ['task#1', 'task-1'],
       ['a.b', 'a-b'],
@@ -610,15 +615,20 @@ describe('encodeCacheKey', () => {
     }
   });
 
-  it('handles Unicode task IDs', () => {
-    // BMP character (U+00E9 é = 0xe9)
+  it('handles Unicode including surrogate pairs', () => {
+    // BMP character (U+00E9 é = code unit 0x00e9)
     var key = encodeCacheKey('café');
     expect(key).toMatch(/^[0-9a-f]+$/);
-    expect(key).toContain('e9');
+    expect(key).toContain('00e9');
+
     // Supplementary-plane character (U+1F600 😀 = surrogate pair D83D DE00)
     var emoji = encodeCacheKey('\u{1F600}');
     expect(emoji).toMatch(/^[0-9a-f]+$/);
+    expect(emoji).toBe('d83dde00');
     expect(emoji).not.toBe(encodeCacheKey('\u{1F601}')); // different emoji
+
+    // Fixed-width: each code unit is exactly 4 hex digits
+    expect(emoji.length).toBe(8); // 2 code units × 4 digits
   });
 
   it('contains only lowercase hex digits', () => {
@@ -628,8 +638,6 @@ describe('encodeCacheKey', () => {
   });
 
   it('handles traversal-shaped input safely', () => {
-    // Even if a traversal-shaped ID reached this function (defence-in-depth),
-    // the output must be a single flat hex string with no path separators.
     var key = encodeCacheKey('x/../../escaped');
     expect(key).not.toMatch(/\.\./);
     expect(key).not.toMatch(/\//);

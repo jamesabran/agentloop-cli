@@ -16,6 +16,8 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { parse as acornParse } from 'acorn';
+
 import { findMjsFiles } from './lib/find-mjs-files.mjs';
 
 var ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -136,203 +138,54 @@ export function stripStringsAndComments(line) {
 }
 
 /**
- * Check whether the character at `idx` in `source` is the start of a
- * genuine `debugger` statement. A genuine statement is the `debugger`
- * keyword standing alone: not preceded by `.` (member access), not
- * followed by `:` (property name or label), and not part of a longer
- * identifier.
- *
- * @param {string} source
- * @param {number} idx -- where 'd' was found
- * @returns {boolean}
- */
-function isDebuggerStatement(source, idx) {
-  // Check for the exact keyword
-  if (source.slice(idx, idx + 8) !== 'debugger') return false;
-
-  // Must be at a word boundary on the left.
-  if (idx > 0) {
-    var before = source[idx - 1];
-    if (/[A-Za-z0-9_$]/.test(before)) return false;
-    // Reject member/property access: obj.debugger, obj?.debugger
-    if (before === '.') return false;
-  }
-
-  // After 'debugger', skip whitespace (spaces and tabs only, not newlines)
-  var j = idx + 8;
-  while (j < source.length && (source[j] === ' ' || source[j] === '\t')) j++;
-
-  // If followed by ':' (property name / label) or a word character (longer
-  // identifier like `debuggerLines`), it is not a statement.
-  if (j < source.length) {
-    var after = source[j];
-    if (after === ':' || after === '$' || after === '_') return false;
-    if (/[A-Za-z0-9]/.test(after)) return false;
-  }
-
-  return true;
-}
-
-/**
  * Find every line that contains a genuine `debugger` statement in
  * `source`.
  *
- * Uses a character-by-character state-machine scanner that distinguishes
- * code, string literals (double-quoted, single-quoted, template), line
- * comments, and block comments. Multi-line block comments are tracked
- * across lines so that mentions of the word inside a JSDoc or other block
- * comment are never flagged.
- *
- * A context stack tracks nested template literals and interpolation
- * expressions. When the scanner enters `${...}` inside a template literal
- * it switches to code-scanning mode, so genuine `debugger` statements
- * inside interpolation are detected. Nested template literals and
- * interpolation expressions are handled safely through the same stack.
- *
- * The scanner skips `debugger` when it appears as an object property
- * (`{ debugger: false }`), as member access (`object.debugger`,
- * `object?.debugger`), or as part of a longer identifier
- * (`debuggerLines`).
+ * Uses the acorn JavaScript parser to produce a full AST, then walks the
+ * tree to collect line numbers of every `DebuggerStatement` node. The
+ * parser correctly distinguishes regex literals from division operators,
+ * template-literal text from interpolation code, comments, strings, and
+ * all other syntactic constructs — so there is no risk of false positives
+ * from `/debugger/` regexes or false negatives from `debugger;` inside
+ * `${...}` interpolation bodies.
  *
  * @param {string} source - complete file contents
  * @returns {number[]} 1-based line numbers
  */
 export function findDebuggerStatements(source) {
   var debuggerLines = [];
-  var line = 1;
-  var i = 0;
-  // State: code, dq (double-quoted string), sq (single-quoted string),
-  //        tl (template literal), lc (line comment), bc (block comment)
-  var state = 'code';
-  var BT = String.fromCharCode(0x60); // backtick
+  try {
+    var ast = acornParse(source, {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      locations: true,
+      allowHashBang: true,
+      allowReturnOutsideFunction: true,
+    });
+    walk(ast);
+  } catch (_) {
+    // Parse error — the file would not pass `node --check` either.  The
+    // syntax check in main() already catches parse errors before calling
+    // this function, so an empty result here is the safe fallback.
+  }
+  return debuggerLines;
 
-  // Context stack — each entry is the state to return to after the
-  // current nested construct closes (template literal or interpolation).
-  var ctxStack = [];
-  // Interpolation brace-depth stack — one entry per active interpolation
-  // level. The top value tracks how many unclosed `{` are open inside the
-  // current `${...}` body.
-  var interpStack = [];
-
-  while (i < source.length) {
-    var ch = source[i];
-
-    // ---- newlines ----
-    if (ch === '\n') {
-      line++;
-      i++;
-      if (state === 'lc') state = 'code';
-      continue;
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'DebuggerStatement') {
+      debuggerLines.push(node.loc.start.line);
+      return;
     }
-    if (ch === '\r') {
-      line++;
-      i++;
-      if (i < source.length && source[i] === '\n') i++;
-      if (state === 'lc') state = 'code';
-      continue;
-    }
-
-    // ---- code state ----
-    if (state === 'code') {
-      // Brace tracking inside interpolation
-      if (ch === '{' && interpStack.length > 0) {
-        interpStack[interpStack.length - 1]++;
-        i++;
-        continue;
+    var keys = Object.keys(node);
+    for (var ki = 0; ki < keys.length; ki++) {
+      var val = node[keys[ki]];
+      if (Array.isArray(val)) {
+        for (var i = 0; i < val.length; i++) walk(val[i]);
+      } else if (val && typeof val === 'object' && val.type) {
+        walk(val);
       }
-      if (ch === '}' && interpStack.length > 0) {
-        if (interpStack[interpStack.length - 1] === 0) {
-          interpStack.pop();
-          state = ctxStack.pop(); // back to tl
-          i++;
-          continue;
-        }
-        interpStack[interpStack.length - 1]--;
-        i++;
-        continue;
-      }
-
-      // Line comment start
-      if (ch === '/' && i + 1 < source.length && source[i + 1] === '/') {
-        state = 'lc';
-        i += 2;
-        continue;
-      }
-      // Block comment start
-      if (ch === '/' && i + 1 < source.length && source[i + 1] === '*') {
-        state = 'bc';
-        i += 2;
-        continue;
-      }
-      // Double-quoted string
-      if (ch === '"') { state = 'dq'; i++; continue; }
-      // Single-quoted string
-      if (ch === "'") { state = 'sq'; i++; continue; }
-      // Template literal
-      if (ch === BT) { ctxStack.push('code'); state = 'tl'; i++; continue; }
-
-      // debugger keyword
-      if (ch === 'd' && isDebuggerStatement(source, i)) {
-        debuggerLines.push(line);
-        i += 8;
-        continue;
-      }
-
-      i++;
-      continue;
-    }
-
-    // ---- double-quoted string ----
-    if (state === 'dq') {
-      if (ch === '\\') { i += 2; continue; }
-      if (ch === '"') state = 'code';
-      i++;
-      continue;
-    }
-
-    // ---- single-quoted string ----
-    if (state === 'sq') {
-      if (ch === '\\') { i += 2; continue; }
-      if (ch === "'") state = 'code';
-      i++;
-      continue;
-    }
-
-    // ---- template literal ----
-    if (state === 'tl') {
-      if (ch === '\\') { i += 2; continue; }
-      // Template interpolation ${...} — switch to code scanning
-      if (ch === '$' && i + 1 < source.length && source[i + 1] === '{') {
-        ctxStack.push('tl');
-        interpStack.push(0);
-        state = 'code';
-        i += 2;
-        continue;
-      }
-      if (ch === BT) state = ctxStack.pop();
-      i++;
-      continue;
-    }
-
-    // ---- line comment ----
-    if (state === 'lc') {
-      i++;
-      continue;
-    }
-
-    // ---- block comment ----
-    if (state === 'bc') {
-      if (ch === '*' && i + 1 < source.length && source[i + 1] === '/') {
-        state = 'code';
-        i += 2;
-        continue;
-      }
-      i++;
-      continue;
     }
   }
-
-  return debuggerLines;
 }
 
 export function main() {
