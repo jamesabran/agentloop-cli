@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { clearFailures, emptyState, recordImplementation } from './state.mjs';
 import { encodeCacheKey } from './tasks.mjs';
 import { migrateLegacyCache } from '../controller.mjs';
 
@@ -866,5 +867,56 @@ describe('legacy cache migration', () => {
     // The canonical file must contain the expected content.
     var written = fs.readFileSync(canonicalPath, 'utf8');
     expect(written).toBe('custom brief content');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Manual publish mode state-level tests                               *
+ * ------------------------------------------------------------------ */
+
+describe('manual publish mode state transitions', () => {
+  it('recordImplementation clears readyToPublishHead — new commit invalidates prior readiness', () => {
+    var state = {
+      ...emptyState(),
+      task: 'test-task',
+      branch: 'agent/task-test-task',
+      implementationHead: 'a'.repeat(40),
+      lastAuditedHead: 'a'.repeat(40),
+      verdict: 'APPROVED',
+      readyToPublishHead: 'a'.repeat(40),
+    };
+
+    var next = recordImplementation(state, 'b'.repeat(40));
+    expect(next.readyToPublishHead).toBeNull();
+    expect(next.verdict).toBeNull();
+    // publishedHead must remain null — it is only set by auto push.
+    expect(next.publishedHead).toBeNull();
+  });
+
+  it('manual-ready state is distinct from published', () => {
+    var state = {
+      ...emptyState(),
+      verdict: 'APPROVED',
+      readyToPublishHead: 'a'.repeat(40),
+    };
+    // readyToPublishHead is set but publishedHead is null — this is the
+    // truthful manual-ready state.
+    expect(state.readyToPublishHead).toBe('a'.repeat(40));
+    expect(state.publishedHead).toBeNull();
+  });
+
+  it('switching to auto and publishing clears readyToPublishHead', () => {
+    // Simulates the state transition that runPublishStep performs in
+    // auto mode after a successful push.
+    var before = {
+      ...emptyState(),
+      verdict: 'APPROVED',
+      readyToPublishHead: 'a'.repeat(40),
+      publishedHead: null,
+    };
+    // Auto push succeeded — publishedHead recorded, readyToPublishHead cleared.
+    var after = clearFailures({ ...before, publishedHead: 'a'.repeat(40), readyToPublishHead: null });
+    expect(after.publishedHead).toBe('a'.repeat(40));
+    expect(after.readyToPublishHead).toBeNull();
   });
 });

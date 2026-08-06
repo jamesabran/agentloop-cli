@@ -42,6 +42,7 @@ import { classifyAuditOutcome } from './lib/audit.mjs';
 import { failureExcerpt, runChecks, summariseChecks } from './lib/checks.mjs';
 import { checkAuth, getIssue } from './lib/github.mjs';
 import {
+  assertRemoteMatchesRepo,
   commitsIn,
   currentBranch,
   ensureBranch,
@@ -669,6 +670,9 @@ async function runPublishStep({ context, options }) {
   }
 
   if (PUBLISH_MODE === 'manual') {
+    // Re-validate the live remote against the pinned repository before
+    // reporting readiness — the same check auto mode runs before pushing.
+    await assertRemoteMatchesRepo();
     context.state = clearFailures({ ...context.state, readyToPublishHead: head });
     log.info(
       `Commit ${head} on ${state.branch} was approved and passed all publication gates. ` +
@@ -680,7 +684,7 @@ async function runPublishStep({ context, options }) {
     log.info('  Nothing has been pushed.');
     log.info(
       '  Safe manual action:\n' +
-        `    git push ${REMOTE} ${state.branch}`,
+        `    git push ${REMOTE} ${head}:refs/heads/${state.branch}`,
     );
     log.info(
       'Open a pull request for this branch if you want one merged; ' +
@@ -693,7 +697,7 @@ async function runPublishStep({ context, options }) {
   log.info(`Publishing approved commit ${short(head)} to ${state.branch}…`);
   await publishBranch({ branch: state.branch, head });
 
-  context.state = clearFailures({ ...context.state, publishedHead: head });
+  context.state = clearFailures({ ...context.state, publishedHead: head, readyToPublishHead: null });
   log.info(
     `Published. Open a pull request for ${state.branch} when you want it reviewed for merge; ` +
       'the controller does not open, update, merge, or close one.',

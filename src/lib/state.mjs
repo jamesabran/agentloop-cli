@@ -193,6 +193,9 @@ export function recordImplementation(state, head) {
     // is no longer HEAD. `lastAuditedHead` is kept, because it is the start of
     // the range the next audit reviews.
     verdict: null,
+    // A new commit also invalidates any previous manual-readiness — the new
+    // commit has not been audited or approved.
+    readyToPublishHead: null,
   };
 }
 

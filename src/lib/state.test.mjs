@@ -201,6 +201,20 @@ describe('recordImplementation', () => {
     // Kept: it is where the next audit's range starts.
     expect(next.lastAuditedHead).toBe(A);
   });
+
+  it('clears readyToPublishHead — new commit invalidates prior manual readiness', () => {
+    const manualReady = {
+      ...emptyState(),
+      implementationHead: A,
+      lastAuditedHead: A,
+      verdict: 'APPROVED',
+      readyToPublishHead: A,
+    };
+    const next = recordImplementation(manualReady, B);
+    expect(next.readyToPublishHead).toBeNull();
+    expect(next.verdict).toBeNull();
+    expect(next.implementationHead).toBe(B);
+  });
 });
 
 describe('recordAudit', () => {
