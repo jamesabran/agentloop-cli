@@ -323,3 +323,123 @@ describe('invalid task files are rejected before any mutation', () => {
     expect(fs.existsSync(path.join(project, '.agent'))).toBe(false);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * Stale active-state handling                                         *
+ * ------------------------------------------------------------------ */
+
+describe('saved active state referencing a missing task fails clearly', () => {
+  it('fails when .agent/state.json references a task not in the roadmap', () => {
+    const project = makeProject([
+      { ...baseTask('setup'), status: 'completed' },
+      { ...baseTask('feature-a'), status: 'next', dependsOn: ['setup'] },
+    ]);
+
+    // Write a state file referencing a task that does not exist in the roadmap
+    fs.mkdirSync(path.join(project, '.agent'), { recursive: true });
+    fs.writeFileSync(
+      path.join(project, '.agent', 'state.json'),
+      JSON.stringify({
+        version: 4,
+        task: 'removed-task',
+        branch: 'agent/task-removed-task',
+        implementationHead: null,
+        implementationHandoffValid: false,
+        lastAuditedHead: null,
+        round: 0,
+        changeRounds: 0,
+        verdict: null,
+        blockers: [],
+        publishedHead: null,
+        claudeSessionId: null,
+        consecutiveFailures: 0,
+        failingStep: null,
+        usageLimitUntil: null,
+        usageLimitCount: 0,
+        recoveryRequired: false,
+        recoveryReason: null,
+        updatedAt: new Date().toISOString(),
+      }),
+      'utf8',
+    );
+
+    const result = runNext(project);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/not found/);
+    // Must not silently select a different task
+    expect(result.stdout).not.toMatch(/Task ID:/);
+  });
+
+  it('does not discard review/recovery state when the active task is missing', () => {
+    const project = makeProject([
+      { ...baseTask('setup'), status: 'completed' },
+      { ...baseTask('feature-a'), status: 'next', dependsOn: ['setup'] },
+    ]);
+
+    // Write a state file with active review state that references a removed task
+    fs.mkdirSync(path.join(project, '.agent'), { recursive: true });
+    fs.writeFileSync(
+      path.join(project, '.agent', 'state.json'),
+      JSON.stringify({
+        version: 4,
+        task: 'deleted-task',
+        branch: 'agent/task-deleted-task',
+        implementationHead: 'a'.repeat(40),
+        implementationHandoffValid: true,
+        lastAuditedHead: 'a'.repeat(40),
+        round: 1,
+        changeRounds: 1,
+        verdict: 'REQUEST_CHANGES',
+        blockers: ['Needs more tests'],
+        publishedHead: null,
+        claudeSessionId: '11111111-2222-3333-4444-555555555555',
+        consecutiveFailures: 0,
+        failingStep: null,
+        usageLimitUntil: null,
+        usageLimitCount: 0,
+        recoveryRequired: false,
+        recoveryReason: null,
+        updatedAt: new Date().toISOString(),
+      }),
+      'utf8',
+    );
+
+    const result = runNext(project);
+    expect(result.status).not.toBe(0);
+    // Must fail referencing the missing task
+    expect(result.stderr).toMatch(/deleted-task/);
+    expect(result.stderr).toMatch(/not found/);
+    // Must not silently fall through to selectNextTask
+    expect(result.stdout).not.toMatch(/file order/);
+    // .agent/ must not be cleared — the caller must decide
+    expect(fs.existsSync(path.join(project, '.agent', 'state.json'))).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Path-traversal task IDs are rejected before any mutation            *
+ * ------------------------------------------------------------------ */
+
+describe('task IDs with path traversal are rejected', () => {
+  it('rejects "x/../../escaped" before any filesystem mutation', () => {
+    const project = makeProject([
+      { ...baseTask('setup'), status: 'completed' },
+      { ...baseTask('x/../../escaped'), status: 'next', dependsOn: ['setup'] },
+    ]);
+
+    const result = runNext(project);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/not a valid task identifier/);
+    expect(fs.existsSync(path.join(project, '.agent'))).toBe(false);
+  });
+
+  it('rejects a task ID containing "." in the committed file', () => {
+    const project = makeProject([
+      { ...baseTask('bad.id'), status: 'next' },
+    ]);
+
+    const result = runNext(project);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/not a valid task identifier/);
+  });
+});

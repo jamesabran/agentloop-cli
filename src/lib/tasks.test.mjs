@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   dependencyStatuses,
+  encodeCacheKey,
   findTask,
   generateTaskBrief,
   loadTaskFile,
@@ -138,6 +139,21 @@ describe('loadTaskFile', () => {
     fs.writeFileSync(filePath, 'not json {{{', 'utf8');
     expect(() => loadTaskFile(filePath)).toThrow(/not valid JSON/);
   });
+
+  it('parses a UTF-8 BOM-prefixed task file', () => {
+    const repo = makeRepo();
+    const tasks = validTasks();
+    const filePath = path.join(repo, 'agentloop.tasks.json');
+    // Write the file with a leading UTF-8 BOM (U+FEFF)
+    const content = JSON.stringify({ version: 1, tasks }, null, 2);
+    fs.writeFileSync(filePath, '﻿' + content, 'utf8');
+    const data = loadTaskFile(filePath);
+    expect(data.version).toBe(1);
+    expect(data.tasks.length).toBe(3);
+    // Verify validation also passes
+    const validated = validateTaskFile(data, filePath);
+    expect(validated.version).toBe(1);
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -218,6 +234,27 @@ describe('validateTaskFile — task-level validation', () => {
     const tasks = [{ id: '', title: 'T', status: 'planned', dependsOn: [], goal: 'G', requirements: [], exclusions: [] }];
     const filePath = writeTaskFile(repo, { version: 1, tasks });
     expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/"id" must be a non-empty string/);
+  });
+
+  it('rejects a task ID containing "."', () => {
+    const repo = makeRepo();
+    const tasks = [{ id: 'x./bad', title: 'T', status: 'planned', dependsOn: [], goal: 'G', requirements: [], exclusions: [] }];
+    const filePath = writeTaskFile(repo, { version: 1, tasks });
+    expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/not a valid task identifier/);
+  });
+
+  it('rejects a task ID containing ".." traversal', () => {
+    const repo = makeRepo();
+    const tasks = [{ id: 'x/../../escaped', title: 'T', status: 'planned', dependsOn: [], goal: 'G', requirements: [], exclusions: [] }];
+    const filePath = writeTaskFile(repo, { version: 1, tasks });
+    expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/not a valid task identifier/);
+  });
+
+  it('rejects a task ID containing "/"', () => {
+    const repo = makeRepo();
+    const tasks = [{ id: 'x/y', title: 'T', status: 'planned', dependsOn: [], goal: 'G', requirements: [], exclusions: [] }];
+    const filePath = writeTaskFile(repo, { version: 1, tasks });
+    expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/not a valid task identifier/);
   });
 
   it('rejects a missing title', () => {
@@ -314,6 +351,18 @@ describe('validateTaskFile — task-level validation', () => {
     ];
     const filePath = writeTaskFile(repo, { version: 1, tasks });
     expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow();
+  });
+
+  it('validates later tasks fully even when an earlier task has errors', () => {
+    const repo = makeRepo();
+    const tasks = [
+      // First task missing required fields — should not block validation of the second
+      { id: 'bad', title: 'Bad', status: 'planned', dependsOn: [], goal: '', requirements: [], exclusions: [] },
+      // Second task has a non-existent dependency — should still be caught
+      { id: 'good', title: 'Good', status: 'planned', dependsOn: ['nonexistent'], goal: 'G', requirements: [], exclusions: [] },
+    ];
+    const filePath = writeTaskFile(repo, { version: 1, tasks });
+    expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/does not exist/);
   });
 });
 
@@ -477,5 +526,43 @@ describe('dependencyStatuses', () => {
     const task = { ...tasks[1], dependsOn: ['nonexistent'] };
     const statuses = dependencyStatuses(task, taskMap);
     expect(statuses).toEqual([{ id: 'nonexistent', status: 'missing' }]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Cache key encoding                                                  *
+ * ------------------------------------------------------------------ */
+
+describe('encodeCacheKey', () => {
+  it('produces a path-safe key for valid task IDs', () => {
+    expect(encodeCacheKey('3c-1')).toBe('3c-1');
+    expect(encodeCacheKey('setup')).toBe('setup');
+    expect(encodeCacheKey('feature-a')).toBe('feature-a');
+  });
+
+  it('replaces non-alphanumeric characters with hyphens', () => {
+    expect(encodeCacheKey('x/../../escaped')).toBe('x-escaped');
+    expect(encodeCacheKey('a.b.c')).toBe('a-b-c');
+    expect(encodeCacheKey('task#1')).toBe('task-1');
+  });
+
+  it('collapses runs of hyphens', () => {
+    expect(encodeCacheKey('a///b')).toBe('a-b');
+    expect(encodeCacheKey('a..b')).toBe('a-b');
+  });
+
+  it('strips leading and trailing hyphens', () => {
+    expect(encodeCacheKey('/leading')).toBe('leading');
+    expect(encodeCacheKey('trailing/')).toBe('trailing');
+    expect(encodeCacheKey('/both/')).toBe('both');
+  });
+
+  it('never produces an empty key', () => {
+    expect(encodeCacheKey('...')).toBe('');
+  });
+
+  it('contains only [A-Za-z0-9] and hyphens', () => {
+    const key = encodeCacheKey('x/../../escaped!@#$%^&*()');
+    expect(key).toMatch(/^[A-Za-z0-9-]*$/);
   });
 });

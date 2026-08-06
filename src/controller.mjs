@@ -73,6 +73,7 @@ import {
 import { readStatus } from './lib/status-block.mjs';
 import {
   dependencyStatuses,
+  encodeCacheKey,
   findTask,
   generateTaskBrief,
   loadTaskFile,
@@ -166,7 +167,7 @@ export function parseArgs(argv) {
     }
   }
 
-  if (options.task !== null && !/^#?[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/.test(options.task)) {
+  if (options.task !== null && !/^#?[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(options.task)) {
     throw new Error(`--task ${JSON.stringify(options.task)} is not a valid task identifier.`);
   }
   if (options.task) options.task = options.task.replace(/^#/, '');
@@ -225,7 +226,7 @@ class LoopStopped extends Error {}
  * the issue is never labelled, commented on, or closed.
  */
 async function resolveBrief({ task, options, generatedBrief }) {
-  const cache = path.join(AGENT_DIR, `brief-${task}.md`);
+  const cache = path.join(AGENT_DIR, `brief-${encodeCacheKey(task)}.md`);
 
   // Cached on first resolution so later rounds — which may be separate
   // invocations, days apart — need neither the flag nor the network again.
@@ -633,7 +634,7 @@ function afterFailedStep(context, step, reason) {
  * ------------------------------------------------------------------ */
 
 function auditReportPath(state, round) {
-  return path.join(AGENT_DIR, `audit-${state.task}-round-${round}.md`);
+  return path.join(AGENT_DIR, `audit-${encodeCacheKey(state.task)}-round-${round}.md`);
 }
 
 function writeAuditReport(state, round, text) {
@@ -687,6 +688,19 @@ function resolveNextTask({ loaded, options }) {
   // Do not silently replace it with a newly selected task.
   const activeTaskId = loaded.task;
   const activeTask = activeTaskId ? findTask(tasks, activeTaskId) : null;
+
+  // When saved state references a task that no longer exists in the
+  // committed roadmap, fail clearly. Silently selecting a different task
+  // would discard the existing review/recovery state without the owner
+  // ever knowing the active task went missing.
+  if (activeTaskId && !activeTask) {
+    throw new Error(
+      `Saved active task ${JSON.stringify(activeTaskId)} was not found in ${tasksFilePath}. ` +
+        'The task may have been removed, renamed, or the wrong task file is configured. ' +
+        'Review the task file and either restore the missing task or remove .agent/state.json ' +
+        'to start fresh.',
+    );
+  }
 
   if (activeTaskId && activeTask && activeTask.status !== 'completed') {
     // Verify the active task still exists in the committed task file and

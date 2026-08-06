@@ -78,6 +78,18 @@ describe('parseArgs --next', () => {
   it('preserves --self-check', () => {
     expect(parseArgs(['--self-check']).selfCheck).toBe(true);
   });
+
+  it('rejects --task with "." in the id', () => {
+    expect(() => parseArgs(['--task', 'bad.id'])).toThrow(/not a valid task identifier/);
+  });
+
+  it('rejects --task with "/" in the id', () => {
+    expect(() => parseArgs(['--task', 'x/y'])).toThrow(/not a valid task identifier/);
+  });
+
+  it('rejects --task with ".." traversal in the id', () => {
+    expect(() => parseArgs(['--task', 'x/../../escaped'])).toThrow(/not a valid task identifier/);
+  });
 });
 
 describe('Claude process and Codex handoff gates', () => {

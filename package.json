@@ -24,6 +24,7 @@
     "agent:verify-dry-run": "node src/verify-dry-run.mjs",
     "test": "vitest run",
     "typecheck": "node scripts/typecheck.mjs",
+    "lint": "node scripts/lint.mjs",
     "build": "node scripts/build.mjs"
   },
   "devDependencies": {

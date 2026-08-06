@@ -35,7 +35,13 @@ const REQUIRED_TASK_FIELDS = [
   'exclusions',
 ];
 
-const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/;
+/**
+ * Task identifiers are namespace-safe strings used in filesystem paths and git
+ * branch names. Dot segments (`.`, `..`) and forward slashes can cause path
+ * traversal even in `path.join` or `path.resolve` calls, so the regex forbids
+ * them rather than relying on downstream sanitisation alone.
+ */
+const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 /* ------------------------------------------------------------------ *
  * Path resolution                                                     *
@@ -98,6 +104,13 @@ export function loadTaskFile(filePath) {
       throw new Error(`Task file not found at ${filePath}.`);
     }
     throw new Error(`Could not read task file at ${filePath}: ${error.message}`);
+  }
+
+  // Strip a leading UTF-8 BOM (U+FEFF) before parsing. Windows editors
+  // such as Notepad sometimes prepend one to UTF-8 files, and JSON.parse
+  // rejects it as unexpected content before the opening brace.
+  if (raw.length > 0 && raw.charCodeAt(0) === 0xfeff) {
+    raw = raw.slice(1);
   }
 
   let parsed;
@@ -169,13 +182,17 @@ export function validateTaskFile(data, filePath) {
     }
 
     // Required fields
+    const errorsBeforeTask = errors.length;
     for (const field of REQUIRED_TASK_FIELDS) {
       if (!(field in task)) {
         errors.push(`${prefix} is missing required field "${field}".`);
       }
     }
 
-    if (errors.length > 0) continue; // can't validate further without required fields
+    // Skip remaining per-field checks for *this* task only when *this*
+    // task is missing required fields. An earlier task's errors must not
+    // prevent complete field validation of later tasks.
+    if (errors.length > errorsBeforeTask) continue;
 
     // id
     if (typeof task.id !== 'string' || task.id.trim().length === 0) {
@@ -467,6 +484,30 @@ export function dependencyStatuses(task, taskMap) {
 /* ------------------------------------------------------------------ *
  * Brief generation                                                    *
  * ------------------------------------------------------------------ */
+
+/**
+ * Encode a task ID into a path-safe filesystem key.
+ *
+ * The committed task file's `id` field is validated against
+ * {@link TASK_ID_RE} before this function is ever called, but a
+ * defence-in-depth encoding here means even a validator bug or a
+ * hand-edited state file cannot cause writes outside `.agent/`.
+ *
+ * Replaces every character that is not alphanumeric or a hyphen with
+ * a single hyphen, collapses runs of hyphens, and strips leading and
+ * trailing hyphens. The result is guaranteed to contain only
+ * `[A-Za-z0-9]` and `-`, with no `..`, `/`, or empty segments.
+ *
+ * @param {string} taskId
+ * @returns {string} path-safe cache key
+ */
+export function encodeCacheKey(taskId) {
+  return String(taskId)
+    .replace(/[^A-Za-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-/, '')
+    .replace(/-$/, '');
+}
 
 /**
  * Generate a runtime implementation brief from a committed task.
