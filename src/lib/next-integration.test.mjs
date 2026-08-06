@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { encodeCacheKey } from './tasks.mjs';
+import { migrateLegacyCache } from '../controller.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CONTROLLER = path.resolve(HERE, '..', 'controller.mjs');
@@ -674,6 +675,53 @@ describe('legacy cache migration', () => {
     var canonicalPath = path.join(agentDir, 'brief-' + key + '.md');
     expect(fs.existsSync(canonicalPath)).toBe(true);
     expect(fs.readFileSync(canonicalPath, 'utf8')).toBe('exact case match');
+  });
+
+  it('handles EEXIST race during atomic migration deterministically', () => {
+    // This test exercises the production EEXIST handler in
+    // migrateLegacyCache through an injected writeFile mock.
+    // No timing, parallel processes, or host-filesystem dependence.
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-atomic-'));
+    tempDirs.push(project);
+
+    var agentDir = path.join(project, '.agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    var key = encodeCacheKey('3c-1');
+    var cache = path.join(agentDir, 'brief-' + key + '.md');
+
+    // The initial canonical lookup observes NO canonical file.
+    expect(fs.existsSync(cache)).toBe(false);
+
+    var canonicalContent = 'canonical content from other process';
+    var calledWx = false;
+
+    function mockWriteFile(p, data, opts) {
+      if (p === cache && opts && opts.flag === 'wx' && !calledWx) {
+        calledWx = true;
+        // Another process creates the canonical file with distinct content
+        // during the migration race, then the wx write raises EEXIST.
+        fs.writeFileSync(p, canonicalContent, 'utf8');
+        var err = new Error('EEXIST: file already exists');
+        err.code = 'EEXIST';
+        throw err;
+      }
+      // Fall back to real implementation for any other call.
+      fs.writeFileSync(p, data, opts);
+    }
+
+    var result = migrateLegacyCache(cache, 'stale legacy content', {
+      writeFile: mockWriteFile,
+    });
+
+    // The production handler detects EEXIST and returns canonical content.
+    expect(result.migrated).toBe(false);
+    expect(result.canonical).toBe(canonicalContent);
+    expect(calledWx).toBe(true);
+
+    // The canonical file must still hold its content — the legacy content
+    // was never written over it.
+    expect(fs.readFileSync(cache, 'utf8')).toBe(canonicalContent);
   });
 
   it('does not look for legacy cache for unsafe IDs', () => {

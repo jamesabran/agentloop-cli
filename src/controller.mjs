@@ -276,15 +276,9 @@ async function resolveBrief({ task, options, generatedBrief }) {
       var legacyPath = path.join(AGENT_DIR, legacyName);
       var legacyBrief = fs.readFileSync(legacyPath, 'utf8');
       if (!options.dryRun) {
-        try {
-          fs.mkdirSync(AGENT_DIR, { recursive: true });
-          fs.writeFileSync(cache, legacyBrief, { flag: 'wx' });
-        } catch (writeErr) {
-          if (writeErr.code === 'EEXIST') {
-            // Another process created the canonical cache first.
-            return { brief: fs.readFileSync(cache, 'utf8'), source: cache };
-          }
-          throw writeErr;
+        var result = migrateLegacyCache(cache, legacyBrief);
+        if (!result.migrated) {
+          return { brief: result.canonical, source: cache };
         }
       }
       return { brief: legacyBrief, source: legacyPath + ' (migrated to canonical)' };
@@ -607,6 +601,39 @@ export function isValidNoChangeHandoff({ status, head, treeClean }) {
     status?.head === head &&
     treeClean === true
   );
+}
+
+/**
+ * Atomically write legacy brief content to the canonical cache path.
+ *
+ * Uses exclusive creation (`wx` flag) so a canonical file created by
+ * another process is never overwritten. On `EEXIST` the canonical
+ * content is read and returned instead.
+ *
+ * The optional `opts.writeFile` parameter is a test seam: tests can
+ * inject a function that intercepts the `writeFileSync` call for the
+ * canonical cache path, creates the file with distinct content, and
+ * throws `EEXIST` — deterministically exercising the race handler.
+ *
+ * @param {string} cache - canonical cache file path
+ * @param {string} content - legacy brief content to migrate
+ * @param {object} [opts]
+ * @param {Function} [opts.writeFile] - injectable writeFileSync (test seam)
+ * @returns {{ migrated: true } | { migrated: false, canonical: string }}
+ */
+export function migrateLegacyCache(cache, content, opts) {
+  var _opts = opts || {};
+  var writeFn = _opts.writeFile || fs.writeFileSync;
+  try {
+    fs.mkdirSync(path.dirname(cache), { recursive: true });
+    writeFn(cache, content, { flag: 'wx' });
+    return { migrated: true };
+  } catch (writeErr) {
+    if (writeErr.code === 'EEXIST') {
+      return { migrated: false, canonical: fs.readFileSync(cache, 'utf8') };
+    }
+    throw writeErr;
+  }
 }
 
 /** Push the approved branch. The only network write the loop performs. */
