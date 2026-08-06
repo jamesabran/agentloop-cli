@@ -542,9 +542,138 @@ describe('legacy cache migration', () => {
     expect(result.status).toBe(0);
 
     // The canonical file must still contain its own content (not overwritten
-    // by the legacy content).
+    // by the legacy content). This also validates the EEXIST defence:
+    // even if a race placed the canonical file between the existsSync
+    // check and the wx write, the content is never overwritten.
     var canonicalAfter = fs.readFileSync(path.join(agentDir, 'brief-' + key + '.md'), 'utf8');
     expect(canonicalAfter).toBe('canonical content');
+  });
+
+  it('migrates atomically with wx exclusive creation', () => {
+    // When only the legacy file exists, the wx write succeeds and the
+    // migrated content lands in the canonical file.
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-legacy-'));
+    tempDirs.push(project);
+
+    var agentDir = path.join(project, '.agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    var legacyContent = 'Atomic migration test content.';
+    fs.writeFileSync(path.join(agentDir, 'brief-3c-1.md'), legacyContent, 'utf8');
+
+    // No canonical file exists — wx must succeed.
+    var key = encodeCacheKey('3c-1');
+    var canonicalPath = path.join(agentDir, 'brief-' + key + '.md');
+    expect(fs.existsSync(canonicalPath)).toBe(false);
+
+    var result = spawnSync(
+      process.execPath,
+      [CONTROLLER, '--task', '3c-1', '--verbose'],
+      { cwd: project, encoding: 'utf8', timeout: 15000 },
+    );
+
+    // After migration the canonical file exists with the correct content.
+    expect(fs.existsSync(canonicalPath)).toBe(true);
+    expect(fs.readFileSync(canonicalPath, 'utf8')).toBe(legacyContent);
+  });
+
+  it('does not overwrite canonical file on EEXIST', () => {
+    // When the canonical file already exists, the legacy path is skipped
+    // entirely (the early canonical check at the top of resolveBrief
+    // catches it). The wx flag in the migration path is defence-in-depth
+    // for the race case where the file appears between the check and the
+    // write — this test validates the common (non-race) path.
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-legacy-'));
+    tempDirs.push(project);
+
+    var agentDir = path.join(project, '.agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    var key = encodeCacheKey('3c-1');
+    var canonicalPath = path.join(agentDir, 'brief-' + key + '.md');
+
+    // Pre-create both. The canonical file must win.
+    fs.writeFileSync(path.join(agentDir, 'brief-3c-1.md'), 'stale legacy', 'utf8');
+    fs.writeFileSync(canonicalPath, 'authoritative canonical', 'utf8');
+
+    var result = spawnSync(
+      process.execPath,
+      [CONTROLLER, '--task', '3c-1', '--verbose', '--dry-run'],
+      { cwd: project, encoding: 'utf8', timeout: 15000 },
+    );
+
+    expect(result.status).toBe(0);
+    // Canonical content must remain unchanged.
+    expect(fs.readFileSync(canonicalPath, 'utf8')).toBe('authoritative canonical');
+  });
+
+  it('rejects legacy file with mismatched case for Foo vs foo', () => {
+    // Task "Foo" must not match a legacy file "brief-foo.md".
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-legacy-'));
+    tempDirs.push(project);
+
+    var agentDir = path.join(project, '.agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    // Write the legacy file in lowercase.
+    fs.writeFileSync(path.join(agentDir, 'brief-foo.md'), 'wrong case', 'utf8');
+
+    // Task "Foo" (capital F) — readdirSync returns 'brief-foo.md',
+    // which does not === 'brief-Foo.md'.
+    var result = spawnSync(
+      process.execPath,
+      [CONTROLLER, '--task', 'Foo', '--verbose', '--dry-run'],
+      { cwd: project, encoding: 'utf8', timeout: 15000 },
+    );
+
+    // Must fail with "No brief" because the legacy entry case doesn't match.
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/No brief/);
+  });
+
+  it('rejects legacy file with mismatched case for foo vs Foo', () => {
+    // Task "foo" must not match a legacy file "brief-Foo.md".
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-legacy-'));
+    tempDirs.push(project);
+
+    var agentDir = path.join(project, '.agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    // Write the legacy file in mixed case.
+    fs.writeFileSync(path.join(agentDir, 'brief-Foo.md'), 'wrong case', 'utf8');
+
+    var result = spawnSync(
+      process.execPath,
+      [CONTROLLER, '--task', 'foo', '--verbose', '--dry-run'],
+      { cwd: project, encoding: 'utf8', timeout: 15000 },
+    );
+
+    // Must fail — directory entry 'brief-Foo.md' !== 'brief-foo.md'.
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/No brief/);
+  });
+
+  it('accepts exact-case legacy entry', () => {
+    // Task "Foo" with an exact-case legacy file "brief-Foo.md" must match.
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-legacy-'));
+    tempDirs.push(project);
+
+    var agentDir = path.join(project, '.agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    fs.writeFileSync(path.join(agentDir, 'brief-Foo.md'), 'exact case match', 'utf8');
+
+    var result = spawnSync(
+      process.execPath,
+      [CONTROLLER, '--task', 'Foo', '--verbose'],
+      { cwd: project, encoding: 'utf8', timeout: 15000 },
+    );
+
+    // Migration must succeed — canonical file must exist after.
+    var key = encodeCacheKey('Foo');
+    var canonicalPath = path.join(agentDir, 'brief-' + key + '.md');
+    expect(fs.existsSync(canonicalPath)).toBe(true);
+    expect(fs.readFileSync(canonicalPath, 'utf8')).toBe('exact case match');
   });
 
   it('does not look for legacy cache for unsafe IDs', () => {

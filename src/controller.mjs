@@ -259,16 +259,35 @@ async function resolveBrief({ task, options, generatedBrief }) {
   // Legacy cache fallback: before the encoding changed to fixed-width
   // hex, cache files for simple alphanumeric-dash IDs were written
   // directly as `brief-<id>.md`. When the canonical file is missing
-  // and the task ID is in the legacy-safe subset, check for and
-  // migrate a legacy cache file.
+  // and the task ID is in the legacy-safe subset, check for an
+  // exact-case directory entry and migrate atomically.
   if (isLegacySafeTaskId(task)) {
-    var legacy = path.join(AGENT_DIR, `brief-${task}.md`);
-    if (fs.existsSync(legacy)) {
-      var legacyBrief = fs.readFileSync(legacy, 'utf8');
-      // Migrate to the canonical filename for future lookups. Do not
-      // overwrite a canonical file if one appeared in the meantime.
-      if (!fs.existsSync(cache)) remember(legacyBrief);
-      return { brief: legacyBrief, source: legacy + ' (migrated to canonical)' };
+    var legacyName = 'brief-' + task + '.md';
+    var exactMatch = false;
+    try {
+      var dirEntries = fs.readdirSync(AGENT_DIR);
+      for (var di = 0; di < dirEntries.length; di++) {
+        if (dirEntries[di] === legacyName) { exactMatch = true; break; }
+      }
+    } catch (dirErr) {
+      if (dirErr.code !== 'ENOENT') throw dirErr;
+    }
+    if (exactMatch) {
+      var legacyPath = path.join(AGENT_DIR, legacyName);
+      var legacyBrief = fs.readFileSync(legacyPath, 'utf8');
+      if (!options.dryRun) {
+        try {
+          fs.mkdirSync(AGENT_DIR, { recursive: true });
+          fs.writeFileSync(cache, legacyBrief, { flag: 'wx' });
+        } catch (writeErr) {
+          if (writeErr.code === 'EEXIST') {
+            // Another process created the canonical cache first.
+            return { brief: fs.readFileSync(cache, 'utf8'), source: cache };
+          }
+          throw writeErr;
+        }
+      }
+      return { brief: legacyBrief, source: legacyPath + ' (migrated to canonical)' };
     }
   }
 
