@@ -16,6 +16,7 @@ import {
   encodeCacheKey,
   findTask,
   generateTaskBrief,
+  isValidTaskId,
   loadTaskFile,
   resolveTaskFilePath,
   selectNextTask,
@@ -236,23 +237,43 @@ describe('validateTaskFile — task-level validation', () => {
     expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/"id" must be a non-empty string/);
   });
 
-  it('rejects a task ID containing "."', () => {
+  it('accepts a task ID containing a dot (e.g. release.1)', () => {
     const repo = makeRepo();
-    const tasks = [{ id: 'x./bad', title: 'T', status: 'planned', dependsOn: [], goal: 'G', requirements: [], exclusions: [] }];
+    const tasks = [
+      { id: 'release.1', title: 'T', status: 'planned', dependsOn: [], goal: 'G', requirements: [], exclusions: [] },
+    ];
     const filePath = writeTaskFile(repo, { version: 1, tasks });
-    expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/not a valid task identifier/);
+    const validated = validateTaskFile(loadTaskFile(filePath), filePath);
+    expect(validated.tasks[0].id).toBe('release.1');
   });
 
-  it('rejects a task ID containing ".." traversal', () => {
+  it('accepts a task ID containing a slash (e.g. feature/api)', () => {
+    const repo = makeRepo();
+    const tasks = [
+      { id: 'feature/api', title: 'T', status: 'planned', dependsOn: [], goal: 'G', requirements: [], exclusions: [] },
+    ];
+    const filePath = writeTaskFile(repo, { version: 1, tasks });
+    const validated = validateTaskFile(loadTaskFile(filePath), filePath);
+    expect(validated.tasks[0].id).toBe('feature/api');
+  });
+
+  it('rejects a task ID containing a ".." path-traversal segment', () => {
     const repo = makeRepo();
     const tasks = [{ id: 'x/../../escaped', title: 'T', status: 'planned', dependsOn: [], goal: 'G', requirements: [], exclusions: [] }];
     const filePath = writeTaskFile(repo, { version: 1, tasks });
     expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/not a valid task identifier/);
   });
 
-  it('rejects a task ID containing "/"', () => {
+  it('rejects a task ID containing a "." path-traversal segment', () => {
     const repo = makeRepo();
-    const tasks = [{ id: 'x/y', title: 'T', status: 'planned', dependsOn: [], goal: 'G', requirements: [], exclusions: [] }];
+    const tasks = [{ id: 'x/./escaped', title: 'T', status: 'planned', dependsOn: [], goal: 'G', requirements: [], exclusions: [] }];
+    const filePath = writeTaskFile(repo, { version: 1, tasks });
+    expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/not a valid task identifier/);
+  });
+
+  it('rejects a task ID containing an empty segment (//)', () => {
+    const repo = makeRepo();
+    const tasks = [{ id: 'x//y', title: 'T', status: 'planned', dependsOn: [], goal: 'G', requirements: [], exclusions: [] }];
     const filePath = writeTaskFile(repo, { version: 1, tasks });
     expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/not a valid task identifier/);
   });
@@ -586,5 +607,69 @@ describe('encodeCacheKey', () => {
   it('contains only [A-Za-z0-9] and hyphens', () => {
     const key = encodeCacheKey('x/../../escaped!@#$%^&*()');
     expect(key).toMatch(/^[A-Za-z0-9-]*$/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Task-ID validation                                                  *
+ * ------------------------------------------------------------------ */
+
+describe('isValidTaskId', () => {
+  it('accepts simple alphanumeric IDs', () => {
+    expect(isValidTaskId('3c-1')).toBe(true);
+    expect(isValidTaskId('setup')).toBe(true);
+  });
+
+  it('accepts dotted IDs (e.g. release.1)', () => {
+    expect(isValidTaskId('release.1')).toBe(true);
+  });
+
+  it('accepts slashed IDs (e.g. feature/api)', () => {
+    expect(isValidTaskId('feature/api')).toBe(true);
+  });
+
+  it('rejects empty string', () => {
+    expect(isValidTaskId('')).toBe(false);
+  });
+
+  it('rejects IDs longer than 128 characters', () => {
+    expect(isValidTaskId('a'.repeat(129))).toBe(false);
+  });
+
+  it('accepts IDs at the 128-character limit', () => {
+    expect(isValidTaskId('a'.repeat(128))).toBe(true);
+  });
+
+  it('rejects ".." as a path-traversal segment', () => {
+    expect(isValidTaskId('x/../escaped')).toBe(false);
+    expect(isValidTaskId('x/../../escaped')).toBe(false);
+  });
+
+  it('rejects "." as a path-traversal segment', () => {
+    expect(isValidTaskId('x/./escaped')).toBe(false);
+  });
+
+  it('rejects an empty path segment (//)', () => {
+    expect(isValidTaskId('x//y')).toBe(false);
+  });
+
+  it('rejects a leading slash', () => {
+    expect(isValidTaskId('/leading')).toBe(false);
+  });
+
+  it('rejects a trailing slash', () => {
+    expect(isValidTaskId('trailing/')).toBe(false);
+  });
+
+  it('rejects characters outside the allowed set', () => {
+    expect(isValidTaskId('bad id')).toBe(false);
+    expect(isValidTaskId('bad@id')).toBe(false);
+    expect(isValidTaskId('bad?id')).toBe(false);
+  });
+
+  it('rejects null and non-strings', () => {
+    expect(isValidTaskId(null)).toBe(false);
+    expect(isValidTaskId(undefined)).toBe(false);
+    expect(isValidTaskId(42)).toBe(false);
   });
 });

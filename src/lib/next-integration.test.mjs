@@ -20,6 +20,8 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { encodeCacheKey } from './tasks.mjs';
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CONTROLLER = path.resolve(HERE, '..', 'controller.mjs');
 
@@ -433,13 +435,49 @@ describe('task IDs with path traversal are rejected', () => {
     expect(fs.existsSync(path.join(project, '.agent'))).toBe(false);
   });
 
-  it('rejects a task ID containing "." in the committed file', () => {
+  it('rejects a task ID with a "." path-traversal segment', () => {
     const project = makeProject([
-      { ...baseTask('bad.id'), status: 'next' },
+      { ...baseTask('setup'), status: 'completed' },
+      { ...baseTask('x/./escaped'), status: 'next', dependsOn: ['setup'] },
     ]);
 
     const result = runNext(project);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toMatch(/not a valid task identifier/);
+  });
+
+  it('accepts a task ID containing a dot in a non-traversal position', () => {
+    const project = makeProject([
+      { ...baseTask('release.1'), status: 'next' },
+    ]);
+
+    const result = runNext(project);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/Task ID: release\.1/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Cache-key path safety                                                *
+ * ------------------------------------------------------------------ */
+
+describe('encodeCacheKey prevents writes outside .agent/', () => {
+  it('produces a safe key for a traversal-shaped task ID', () => {
+    // When a task ID passes validation (no . or .. segments) the cache key
+    // is a defence-in-depth measure. Even if a traversal-shaped ID somehow
+    // reached the cache-path code, encodeCacheKey must render it safe.
+    const key = encodeCacheKey('x/../../escaped');
+    // Must not contain any path separators or traversal markers.
+    expect(key).not.toMatch(/\.\./);
+    expect(key).not.toMatch(/\//);
+    // The key must be a simple flat name.
+    expect(key).toMatch(/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/);
+  });
+
+  it('produces a key that path.join with .agent/ stays inside .agent/', () => {
+    const agentDir = path.resolve('/tmp/test-project/.agent');
+    const key = encodeCacheKey('x/../../escaped');
+    const resolved = path.resolve(agentDir, `brief-${key}.md`);
+    expect(resolved.startsWith(agentDir + path.sep)).toBe(true);
   });
 });

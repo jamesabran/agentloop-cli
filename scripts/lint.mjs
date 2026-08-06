@@ -41,6 +41,28 @@ function checkSyntax(file) {
 }
 
 /**
+ * Strip JavaScript string literals from a source line.
+ *
+ * Only removes template literals, double-quoted strings, and
+ * single-quoted strings. Comments are left intact — they are handled
+ * separately by {@link findDebuggerStatements} so that multi-line
+ * block-comment tracking works correctly even when `//` or `*/`
+ * appears inside comment text.
+ *
+ * @param {string} line
+ * @returns {string}
+ */
+export function stripStrings(line) {
+  return line
+    // Template literals — handles basic `${}` interpolation
+    .replace(/`(?:[^`\\$]|\$\{[^}]*\}|\\.)*`/g, '``')
+    // Double-quoted strings
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+    // Single-quoted strings
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''");
+}
+
+/**
  * Strip JavaScript string literals and comments from a source line so
  * a subsequent `debugger` check only matches actual statements, not
  * mentions of the word in strings, template literals, or comments.
@@ -67,9 +89,16 @@ export function stripStringsAndComments(line) {
 
 /**
  * Find every line that contains a genuine `debugger` statement in
- * `source`. Multi-line block comments are tracked across lines so that
- * mentions of the word inside a JSDoc or other block comment are never
- * flagged.
+ * `source`.
+ *
+ * Strips string literals first so their contents never influence comment
+ * detection. Tracks block-comment (`/* … */`) state across lines BEFORE
+ * removing `//` line comments — this is the critical order that keeps a
+ * `// */` line inside a block comment from hiding the real close marker.
+ *
+ * After comment removal, the remaining code text is checked for
+ * `debugger` with a negative lookahead that excludes property names
+ * (`{ debugger: false }`).
  *
  * @param {string} source - complete file contents
  * @returns {number[]} 1-based line numbers
@@ -79,41 +108,60 @@ export function findDebuggerStatements(source) {
   let inBlockComment = false;
 
   source.split(/\r?\n/).forEach((line, index) => {
-    // Remove strings and single-line comments first so that `/*` or `*/`
-    // inside a string literal is not mistaken for a comment boundary.
-    const stripped = stripStringsAndComments(line);
+    // Step 1: Strip string literals. This prevents `/*`, `*/`, `//`, and
+    // `debugger` inside strings from influencing the scan.
+    const noStrings = stripStrings(line);
 
-    if (inBlockComment) {
-      const endIdx = stripped.indexOf('*/');
-      if (endIdx === -1) return; // still inside the block comment
-      // Resume checking after the close marker
-      const remaining = stripped.slice(endIdx + 2);
-      inBlockComment = false;
-      if (/\bdebugger\b/.test(remaining)) debuggerLines.push(index + 1);
-      return;
-    }
+    // Step 2: Resolve block-comment state. We look for `/*` and `*/` in
+    // the string-free text BEFORE stripping `//` line comments, so that a
+    // `// */` line inside a block comment cannot hide the close marker.
+    let pos = 0;
+    let codeBeforeLineComment = '';
 
-    // Any remaining `/*` after string and comment stripping must be a real
-    // block-comment start (strings and existing comments are already gone).
-    const startIdx = stripped.indexOf('/*');
-    if (startIdx !== -1) {
-      const before = stripped.slice(0, startIdx);
-      const afterOpen = stripped.slice(startIdx + 2);
-      const endIdx = afterOpen.indexOf('*/');
-      if (endIdx !== -1) {
-        // Single-line block comment — already handled by stripStringsAndComments
-        // above, but check defensively.
-        const after = afterOpen.slice(endIdx + 2);
-        if (/\bdebugger\b/.test(before + after)) debuggerLines.push(index + 1);
-      } else {
-        // Multi-line block comment starts here
-        inBlockComment = true;
-        if (/\bdebugger\b/.test(before)) debuggerLines.push(index + 1);
+    while (pos < noStrings.length) {
+      if (inBlockComment) {
+        const endIdx = noStrings.indexOf('*/', pos);
+        if (endIdx === -1) return; // entire remainder of line is inside comment
+        pos = endIdx + 2;
+        inBlockComment = false;
+        continue;
       }
-      return;
+
+      // Look for a block-comment start at the current position
+      const startIdx = noStrings.indexOf('/*', pos);
+      if (startIdx !== -1) {
+        // Copy code before the comment start
+        codeBeforeLineComment += noStrings.slice(pos, startIdx);
+        const endIdx = noStrings.indexOf('*/', startIdx + 2);
+        if (endIdx !== -1) {
+          // Single-line block comment — skip it
+          pos = endIdx + 2;
+        } else {
+          // Multi-line block comment starts here
+          inBlockComment = true;
+          pos = noStrings.length; // nothing after `/*` on this line to process
+        }
+      } else {
+        // No more block-comment starts — the rest is code or a line comment
+        codeBeforeLineComment += noStrings.slice(pos);
+        break;
+      }
     }
 
-    if (/\bdebugger\b/.test(stripped)) debuggerLines.push(index + 1);
+    // Step 3: Strip `//` line comments from the block-comment-free text.
+    const lineCommentIdx = codeBeforeLineComment.indexOf('//');
+    const codeOnly =
+      lineCommentIdx === -1
+        ? codeBeforeLineComment
+        : codeBeforeLineComment.slice(0, lineCommentIdx);
+
+    // Step 4: Check for `debugger` as a statement — not a property name.
+    // Property:  { debugger: false }  — `debugger` is followed by `:`
+    // Statement: debugger;            — `debugger` is followed by `;`
+    // The negative lookahead `(?!\s*:)` rejects the property-name case.
+    if (/\bdebugger\b(?!\s*:)/.test(codeOnly)) {
+      debuggerLines.push(index + 1);
+    }
   });
 
   return debuggerLines;

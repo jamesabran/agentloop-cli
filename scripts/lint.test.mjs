@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { findDebuggerStatements, stripStringsAndComments } from './lint.mjs';
+import { findDebuggerStatements, stripStrings, stripStringsAndComments } from './lint.mjs';
 
 describe('stripStringsAndComments', () => {
   it('preserves an actual debugger statement', () => {
@@ -153,18 +153,88 @@ describe('findDebuggerStatements', () => {
     const result = findDebuggerStatements(source);
     expect(result).toEqual([9]);
   });
+
+  it('does not flag a property named debugger', () => {
+    // { debugger: false } is valid ES — debugger is a reserved word but
+    // can appear as an unquoted property name in object literals.
+    const result = findDebuggerStatements(
+      'const config = { debugger: false };',
+    );
+    expect(result).toEqual([]);
+  });
+
+  it('finds debugger even when a // line appears inside a block comment', () => {
+    // The `// */` inside the block comment must not hide the close marker
+    // from the scanner — if `//` is stripped before block-comment tracking,
+    // the `*/` is lost and the genuine `debugger;` on line 3 is missed.
+    const result = findDebuggerStatements('/* open\n// */\ndebugger;');
+    expect(result).toEqual([3]);
+  });
+
+  it('does not flag debugger used as a label in code', () => {
+    // `debugger:` is a labelled statement (though debugger is reserved, so
+    // this is hypothetical). The scanner should still treat it as a
+    // property/label pattern.
+    const result = findDebuggerStatements('debugger:\n  for (;;) {}');
+    expect(result).toEqual([]);
+  });
+
+  it('finds debugger with leading whitespace and no trailing semicolon', () => {
+    // Bare `debugger` with nothing after it on the line is a real statement.
+    const result = findDebuggerStatements('  debugger');
+    expect(result).toEqual([1]);
+  });
 });
 
 describe('lint script self-test', () => {
+  const allFiles = [];
+  const baseDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+  // Collect all .mjs files the lint scanner would check — src/, bin/, scripts/
+  function collect(dir) {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory() && entry.name !== 'node_modules') {
+        collect(full);
+      } else if (entry.isFile() && entry.name.endsWith('.mjs')) {
+        allFiles.push(full);
+      }
+    }
+  }
+  collect(path.join(baseDir, 'src'));
+  collect(path.join(baseDir, 'bin'));
+  collect(path.join(baseDir, 'scripts'));
+
   it('does not report its own file for debugger references', () => {
-    // The lint script contains the word "debugger" in comments and strings,
-    // including inside the multi-line JSDoc at the top of the file. It must
-    // pass its own check when the full multi-line-aware scanner is used.
     const lintSource = fs.readFileSync(
       path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'lint.mjs'),
       'utf8',
     );
     const debuggerLines = findDebuggerStatements(lintSource);
     expect(debuggerLines).toEqual([]);
+  });
+
+  it('finds no false positives across the complete repository', () => {
+    // Every .mjs file under src/, bin/, and scripts/ must produce zero
+    // false-positive debugger-statement reports. The word "debugger"
+    // appears in comments, strings, regexes, and variable names
+    // throughout this project — none of those are genuine statements.
+    const falsePositives = [];
+    for (const file of allFiles) {
+      const source = fs.readFileSync(file, 'utf8');
+      const lines = findDebuggerStatements(source);
+      if (lines.length > 0) {
+        falsePositives.push(
+          `${path.relative(baseDir, file)}: ${lines.join(', ')}`,
+        );
+      }
+    }
+    expect(falsePositives).toEqual([]);
   });
 });

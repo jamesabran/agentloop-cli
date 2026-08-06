@@ -76,7 +76,7 @@ const FIELD_LINE = /^([A-Z_]+):\s*(.*)$/;
 const SHA = /^[0-9a-f]{40}$/i;
 
 /** Issue numbers, `#5`, and local slugs all qualify as a task identifier. */
-const TASK_ID = /^#?([A-Za-z0-9][A-Za-z0-9._/-]{0,63})$/;
+const TASK_ID = /^#?([A-Za-z0-9][A-Za-z0-9._\/#-]{0,127})$/;
 
 /**
  * Pull every `AGENTLOOP_AGENT_STATUS` … `END_STATUS` region out of some text.

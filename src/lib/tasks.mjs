@@ -36,12 +36,35 @@ const REQUIRED_TASK_FIELDS = [
 ];
 
 /**
- * Task identifiers are namespace-safe strings used in filesystem paths and git
- * branch names. Dot segments (`.`, `..`) and forward slashes can cause path
- * traversal even in `path.join` or `path.resolve` calls, so the regex forbids
- * them rather than relying on downstream sanitisation alone.
+ * Task identifiers are namespace-safe strings used in git branch names,
+ * status-block handoff fields, and (through {@link encodeCacheKey})
+ * filesystem paths.
+ *
+ * Dots, forward slashes, hyphens, and underscores are all permitted in task
+ * IDs so that namespaced identifiers such as `release.1` and `feature/api`
+ * remain valid. Path traversal is rejected separately by
+ * {@link isValidTaskId} rather than by forbidding every dot and slash.
  */
-const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._\/#-]{0,127}$/;
+
+/**
+ * Return `true` when `id` is a valid task identifier.
+ *
+ * Valid identifiers start with an alphanumeric character, are at most 128
+ * characters long, and contain only `[A-Za-z0-9._/#-]`. In addition, no
+ * `/`-delimited segment may be `.` or `..`, which prevents path traversal
+ * even if the identifier were ever interpolated directly into a filesystem
+ * path.
+ *
+ * @param {string} id
+ * @returns {boolean}
+ */
+export function isValidTaskId(id) {
+  if (typeof id !== 'string' || id.length === 0 || id.length > 128) return false;
+  if (!TASK_ID_RE.test(id)) return false;
+  // Reject `.` and `..` as path segments (directory traversal).
+  return id.split('/').every((s) => s.length > 0 && s !== '.' && s !== '..');
+}
 
 /* ------------------------------------------------------------------ *
  * Path resolution                                                     *
@@ -197,10 +220,10 @@ export function validateTaskFile(data, filePath) {
     // id
     if (typeof task.id !== 'string' || task.id.trim().length === 0) {
       errors.push(`${prefix}: "id" must be a non-empty string.`);
-    } else if (!TASK_ID_RE.test(task.id)) {
+    } else if (!isValidTaskId(task.id)) {
       errors.push(
         `${prefix}: "id" ${JSON.stringify(task.id)} is not a valid task identifier. ` +
-          `Must match ${TASK_ID_RE}.`,
+          `Must match ${TASK_ID_RE} and contain no "." or ".." path segments.`,
       );
     } else if (ids.has(task.id)) {
       errors.push(`${prefix}: duplicate task ID ${JSON.stringify(task.id)}.`);

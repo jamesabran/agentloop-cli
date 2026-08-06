@@ -76,6 +76,7 @@ import {
   encodeCacheKey,
   findTask,
   generateTaskBrief,
+  isValidTaskId,
   loadTaskFile,
   resolveTaskFilePath,
   selectNextTask,
@@ -167,7 +168,7 @@ export function parseArgs(argv) {
     }
   }
 
-  if (options.task !== null && !/^#?[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(options.task)) {
+  if (options.task !== null && !isValidTaskId(options.task.replace(/^#/, ''))) {
     throw new Error(`--task ${JSON.stringify(options.task)} is not a valid task identifier.`);
   }
   if (options.task) options.task = options.task.replace(/^#/, '');
@@ -828,6 +829,16 @@ async function runLoop(options) {
     generatedBrief = result.generatedBrief;
   } else {
     task = options.task ?? loaded.task;
+    // `options.task` is already validated by parseArgs. `loaded.task`
+    // comes from a hand-editable state file and must be re-checked here
+    // because it bypasses the CLI guard.
+    if (task && options.task === null && !isValidTaskId(task)) {
+      log.error(
+        `Saved task identifier ${JSON.stringify(task)} is not a valid task identifier. ` +
+          'It may need repair in .agent/state.json, or select a task explicitly with --task or --next.',
+      );
+      return { stopReason: `Invalid saved task identifier: ${JSON.stringify(task)}.`, stopped: true };
+    }
   }
 
   if (!task) {
