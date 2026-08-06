@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { findDebuggerStatements, main, stripStrings, stripStringsAndComments } from './lint.mjs';
+import { findDebuggerStatements, main, stripStringsAndComments } from './lint.mjs';
 
 describe('stripStringsAndComments', () => {
   it('preserves an actual debugger statement', () => {
