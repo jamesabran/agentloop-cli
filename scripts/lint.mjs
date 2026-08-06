@@ -47,6 +47,9 @@ function checkSyntax(file) {
  *
  * The order matters: strings must be removed first so that `//` or `/*`
  * inside a string literal is not mistaken for a comment start.
+ *
+ * This function handles only single-line constructs. Multi-line block
+ * comments are tracked by {@link findDebuggerStatements}.
  */
 export function stripStringsAndComments(line) {
   return line
@@ -60,6 +63,60 @@ export function stripStringsAndComments(line) {
     .replace(/\/\/.*$/, '')
     // /* block comments */ (single-line only)
     .replace(/\/\*.*?\*\//g, '');
+}
+
+/**
+ * Find every line that contains a genuine `debugger` statement in
+ * `source`. Multi-line block comments are tracked across lines so that
+ * mentions of the word inside a JSDoc or other block comment are never
+ * flagged.
+ *
+ * @param {string} source - complete file contents
+ * @returns {number[]} 1-based line numbers
+ */
+export function findDebuggerStatements(source) {
+  const debuggerLines = [];
+  let inBlockComment = false;
+
+  source.split(/\r?\n/).forEach((line, index) => {
+    // Remove strings and single-line comments first so that `/*` or `*/`
+    // inside a string literal is not mistaken for a comment boundary.
+    const stripped = stripStringsAndComments(line);
+
+    if (inBlockComment) {
+      const endIdx = stripped.indexOf('*/');
+      if (endIdx === -1) return; // still inside the block comment
+      // Resume checking after the close marker
+      const remaining = stripped.slice(endIdx + 2);
+      inBlockComment = false;
+      if (/\bdebugger\b/.test(remaining)) debuggerLines.push(index + 1);
+      return;
+    }
+
+    // Any remaining `/*` after string and comment stripping must be a real
+    // block-comment start (strings and existing comments are already gone).
+    const startIdx = stripped.indexOf('/*');
+    if (startIdx !== -1) {
+      const before = stripped.slice(0, startIdx);
+      const afterOpen = stripped.slice(startIdx + 2);
+      const endIdx = afterOpen.indexOf('*/');
+      if (endIdx !== -1) {
+        // Single-line block comment — already handled by stripStringsAndComments
+        // above, but check defensively.
+        const after = afterOpen.slice(endIdx + 2);
+        if (/\bdebugger\b/.test(before + after)) debuggerLines.push(index + 1);
+      } else {
+        // Multi-line block comment starts here
+        inBlockComment = true;
+        if (/\bdebugger\b/.test(before)) debuggerLines.push(index + 1);
+      }
+      return;
+    }
+
+    if (/\bdebugger\b/.test(stripped)) debuggerLines.push(index + 1);
+  });
+
+  return debuggerLines;
 }
 
 function main() {
@@ -81,11 +138,7 @@ function main() {
 
     const source = fs.readFileSync(file, 'utf8');
     // `debugger` statements should never land in committed code.
-    const debuggerLines = [];
-    source.split(/\r?\n/).forEach((line, index) => {
-      const stripped = stripStringsAndComments(line);
-      if (/\bdebugger\b/.test(stripped)) debuggerLines.push(index + 1);
-    });
+    const debuggerLines = findDebuggerStatements(source);
     if (debuggerLines.length > 0) {
       fail(file, `debugger statement(s) on line(s): ${debuggerLines.join(', ')}`);
       continue;
