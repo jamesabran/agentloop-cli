@@ -264,12 +264,21 @@ export function requireRecovery(state, reason) {
     claudeSessionId: null,
     recoveryRequired: true,
     recoveryReason: String(reason).slice(0, 4000),
+    // Recovery means the previous ready-to-publish state must be
+    // revalidated through the workflow.
+    readyToPublishHead: null,
   };
 }
 
 /** Clear the explicit-recovery marker immediately before a fresh Claude run. */
 export function beginRecovery(state) {
-  return { ...state, recoveryRequired: false, recoveryReason: null };
+  return {
+    ...state,
+    recoveryRequired: false,
+    recoveryReason: null,
+    // A recovered Claude session must revalidate any prior readiness.
+    readyToPublishHead: null,
+  };
 }
 
 /** Milliseconds still to wait, or 0 when the pause has elapsed. */

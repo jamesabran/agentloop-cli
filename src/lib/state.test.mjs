@@ -297,4 +297,25 @@ describe('terminal Claude recovery', () => {
     expect(recovered.recoveryReason).toBeNull();
     expect(recovered.claudeSessionId).toBeNull();
   });
+
+  it('clears readyToPublishHead in both recovery transitions', () => {
+    const before = {
+      ...emptyState(),
+      task: '5',
+      branch: 'agent/task-5',
+      verdict: 'APPROVED',
+      readyToPublishHead: A,
+      claudeSessionId: '11111111-2222-3333-4444-555555555555',
+    };
+
+    // requireRecovery clears readiness.
+    const stopped = requireRecovery(before, 'Claude timed out');
+    expect(stopped.readyToPublishHead).toBeNull();
+    expect(stopped.recoveryRequired).toBe(true);
+
+    // beginRecovery also clears readiness.
+    const recovered = beginRecovery({ ...stopped, readyToPublishHead: A });
+    expect(recovered.readyToPublishHead).toBeNull();
+    expect(recovered.recoveryRequired).toBe(false);
+  });
 });

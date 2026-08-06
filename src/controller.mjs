@@ -639,10 +639,26 @@ export function migrateLegacyCache(cache, content, opts) {
   }
 }
 
-/** Push the approved branch, or report it ready when publish mode is manual. */
-async function runPublishStep({ context, options }) {
+/**
+ * Push the approved branch, or report it ready when publish mode is manual.
+ *
+ * The optional `_git` parameter is a test seam: tests inject mock
+ * implementations of the git helpers (`headCommit`, `workingTreeStatus`,
+ * `assertRemoteMatchesRepo`, `publishBranch`, `checkAuth`) so the full
+ * publish control flow can be exercised without real git operations.
+ *
+ * @param {{ context: object, options: object, _git?: object }} input
+ */
+export async function runPublishStep({ context, options, _git }) {
+  const g = _git || {};
+  const hc = g.headCommit || headCommit;
+  const wts = g.workingTreeStatus || workingTreeStatus;
+  const armr = g.assertRemoteMatchesRepo || assertRemoteMatchesRepo;
+  const pb = g.publishBranch || publishBranch;
+  const ca = g.checkAuth || checkAuth;
+
   const { state } = context;
-  const head = await headCommit();
+  const head = await hc();
 
   // decideLocal already established these; re-checking here is what makes the
   // push itself safe to read in isolation.
@@ -653,7 +669,7 @@ async function runPublishStep({ context, options }) {
     );
   }
 
-  const tree = await workingTreeStatus();
+  const tree = await wts();
   if (!tree.clean) {
     throw new LoopStopped(
       `Refusing to publish: the working tree has ${tree.changes.length} uncommitted change(s), ` +
@@ -672,7 +688,7 @@ async function runPublishStep({ context, options }) {
   if (PUBLISH_MODE === 'manual') {
     // Re-validate the live remote against the pinned repository before
     // reporting readiness — the same check auto mode runs before pushing.
-    await assertRemoteMatchesRepo();
+    await armr();
     context.state = clearFailures({ ...context.state, readyToPublishHead: head });
     log.info(
       `Commit ${head} on ${state.branch} was approved and passed all publication gates. ` +
@@ -693,9 +709,9 @@ async function runPublishStep({ context, options }) {
     return { continue: false, stopReason: 'Manual publish mode — the branch is ready for you to push.' };
   }
 
-  await checkAuth();
+  await ca();
   log.info(`Publishing approved commit ${short(head)} to ${state.branch}…`);
-  await publishBranch({ branch: state.branch, head });
+  await pb({ branch: state.branch, head });
 
   context.state = clearFailures({ ...context.state, publishedHead: head, readyToPublishHead: null });
   log.info(
