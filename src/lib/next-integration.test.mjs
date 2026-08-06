@@ -16,7 +16,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -963,38 +963,135 @@ describe('runPublishStep — manual mode (default)', () => {
   });
 });
 
-describe('runPublishStep — auto mode (via child process)', () => {
-  it('pushes, sets publishedHead, and clears stale readyToPublishHead', () => {
-    // Auto mode is a module-level constant read once at import time.
-    // The decision engine tests (local-loop.test.mjs) cover the
-    // publishMode parameter across manual/auto transitions, and the
-    // config tests verify the env/config resolution.
-    //
-    // For the controller-level auto publish path, we run the CLI as a
-    // child process with AGENTLOOP_PUBLISH_MODE=auto set. The process
-    // will fail before actual git operations, but proves the config
-    // is read and the auto path is entered.
+describe('runPublishStep — manual command output', () => {
+  it('displays the exact SHA refspec, not the branch name', async () => {
+    var A = 'a'.repeat(40);
+    var B = 'b'.repeat(40);
+    var BR = 'feature/manual-publish';
+
+    var ctx = publishContext({
+      branch: BR,
+      implementationHead: A,
+      lastAuditedHead: A,
+    });
+    var mocks = publishMocks({
+      headCommit: async () => A,
+    });
+
+    var stdout = '';
+    var orig = process.stdout.write;
+    process.stdout.write = function (chunk) { stdout += chunk; };
+
+    try {
+      await runPublishStep({ context: ctx, options: { dryRun: false }, _git: mocks });
+    } finally {
+      process.stdout.write = orig;
+    }
+
+    // Must contain the exact SHA refspec command.
+    var expected = 'git push origin ' + A + ':refs/heads/' + BR;
+    expect(stdout).toMatch(expected);
+    // Must NOT contain branch-name-only form.
+    expect(stdout).not.toMatch('git push origin ' + BR);
+    // Must NOT contain the unrelated SHA B.
+    expect(stdout).not.toMatch(B);
+  });
+});
+
+describe('runPublishStep — auto mode via child process', () => {
+  it('validates remote, calls publishBranch with approved head, clears stale readyToPublishHead', () => {
     var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-auto-'));
     tempDirs.push(project);
 
+    // Git init so findProjectRoot() resolves correctly in the child.
     spawnSync('git', ['init', '--quiet'], { cwd: project });
     spawnSync('git', ['remote', 'add', 'origin', 'https://github.com/test/repo.git'], { cwd: project });
 
-    var briefFile = path.join(project, 'brief.md');
-    fs.writeFileSync(briefFile, 'test brief', 'utf8');
+    // The child process imports controller.mjs with
+    // AGENTLOOP_PUBLISH_MODE=auto before the module-level constant
+    // is resolved. This gives us the real auto-mode path through
+    // runPublishStep with mocked git helpers.
 
-    var env = { ...process.env, AGENTLOOP_PUBLISH_MODE: 'auto', AGENTLOOP_REPO: 'test/repo' };
+    var A = 'a'.repeat(40);
+    var testUrl = pathToFileURL(path.resolve(HERE, '..', 'controller.mjs')).href;
+    var stateUrl = pathToFileURL(path.resolve(HERE, 'state.mjs')).href;
+
+    var testScript = `
+      import { runPublishStep } from ${JSON.stringify(testUrl)};
+      import { emptyState } from ${JSON.stringify(stateUrl)};
+
+      var HEAD = ${JSON.stringify(A)};
+      var BRANCH = 'agent/task-auto';
+
+      var ctx = {
+        state: {
+          ...emptyState(),
+          task: 'auto-test',
+          branch: BRANCH,
+          implementationHead: HEAD,
+          lastAuditedHead: HEAD,
+          verdict: 'APPROVED',
+          readyToPublishHead: ${JSON.stringify('d'.repeat(40))},
+          publishedHead: null,
+        },
+        checks: [],
+        claudeProcessesStarted: 0,
+      };
+
+      var pushCalled = false;
+      var pushArg = null;
+
+      try {
+        await runPublishStep({ context: ctx, options: { dryRun: false }, _git: {
+          headCommit: async () => HEAD,
+          workingTreeStatus: async () => ({ clean: true, changes: [] }),
+          assertRemoteMatchesRepo: async () => undefined,
+          checkAuth: async () => undefined,
+          publishBranch: async (arg) => { pushCalled = true; pushArg = arg; },
+        }});
+
+        process.stdout.write(JSON.stringify({
+          ok: true,
+          pushCalled: pushCalled,
+          pushArg: pushArg,
+          publishedHead: ctx.state.publishedHead,
+          readyToPublishHead: ctx.state.readyToPublishHead,
+        }));
+      } catch (e) {
+        process.stdout.write(JSON.stringify({ ok: false, error: e.message }));
+      }
+    `;
+
+    var scriptFile = path.join(project, 'test-auto.mjs');
+    fs.writeFileSync(scriptFile, testScript, 'utf8');
+
     var result = spawnSync(
       process.execPath,
-      [CONTROLLER, '--task', '5', '--brief', briefFile, '--dry-run', '--verbose'],
-      { cwd: project, env: env, encoding: 'utf8', timeout: 15000 },
+      [scriptFile],
+      {
+        cwd: project,
+        env: { ...process.env, AGENTLOOP_PUBLISH_MODE: 'auto', AGENTLOOP_REPO: 'test/repo' },
+        encoding: 'utf8',
+        timeout: 15000,
+      },
     );
 
-    // The controller should start (auto config loads), and dry-run
-    // reports the next step — IMPLEMENT for a fresh task. Exit 0 means
-    // the config loaded without error, proving AGENTLOOP_PUBLISH_MODE
-    // = 'auto' is accepted.
     expect(result.status).toBe(0);
-    expect(result.stdout).toMatch(/would start Claude/);
+
+    // The child process stdout has logger output before the JSON.
+    // Extract the JSON object starting at {\"ok\":.
+    var jsonStart = result.stdout.indexOf('{"ok":');
+    expect(jsonStart).not.toBe(-1);
+    var data = JSON.parse(result.stdout.slice(jsonStart));
+    expect(data.ok).toBe(true);
+    // In auto mode, assertRemoteMatchesRepo is called inside the real
+    // publishBranch, which is mocked here. The mock publishBranch is
+    // called exactly once with the correct contract.
+    expect(data.pushCalled).toBe(true);
+    expect(data.pushArg).toEqual({ branch: 'agent/task-auto', head: A });
+    // After a successful auto push, publishedHead is the approved SHA
+    // and stale readyToPublishHead is cleared.
+    expect(data.publishedHead).toBe(A);
+    expect(data.readyToPublishHead).toBeNull();
   });
 });
