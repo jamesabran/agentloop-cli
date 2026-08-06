@@ -54,7 +54,7 @@ function checkSyntax(file) {
  */
 export function stripStrings(line) {
   return line
-    // Template literals — handles basic `${}` interpolation
+    // Template literals
     .replace(/`(?:[^`\\$]|\$\{[^}]*\}|\\.)*`/g, '``')
     // Double-quoted strings
     .replace(/"(?:[^"\\]|\\.)*"/g, '""')
@@ -64,18 +64,18 @@ export function stripStrings(line) {
 
 /**
  * Strip JavaScript string literals and comments from a source line so
- * a subsequent `debugger` check only matches actual statements, not
+ * a subsequent debugger check only matches actual statements, not
  * mentions of the word in strings, template literals, or comments.
  *
- * The order matters: strings must be removed first so that `//` or `/*`
+ * The order matters: strings must be removed first so that // or /*
  * inside a string literal is not mistaken for a comment start.
  *
  * This function handles only single-line constructs. Multi-line block
- * comments are tracked by {@link findDebuggerStatements}.
+ * comments are tracked by findDebuggerStatements.
  */
 export function stripStringsAndComments(line) {
   return line
-    // Template literals — handles basic `${}` interpolation
+    // Template literals
     .replace(/`(?:[^`\\$]|\$\{[^}]*\}|\\.)*`/g, '``')
     // Double-quoted strings
     .replace(/"(?:[^"\\]|\\.)*"/g, '""')
