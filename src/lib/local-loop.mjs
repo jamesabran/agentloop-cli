@@ -47,7 +47,7 @@ export const ACTIONS = Object.freeze({
  * }} input
  * @returns {{ action: string, reason: string }}
  */
-export function decideLocal({ state, head, maxChangeRounds = MAX_CHANGE_ROUNDS }) {
+export function decideLocal({ state, head, maxChangeRounds = MAX_CHANGE_ROUNDS, publishMode = 'manual' }) {
   if (state.recoveryRequired) {
     return step(
       ACTIONS.STOP,
@@ -56,7 +56,26 @@ export function decideLocal({ state, head, maxChangeRounds = MAX_CHANGE_ROUNDS }
   }
 
   if (state.publishedHead && state.publishedHead === head) {
-    return step(ACTIONS.DONE, `The approved commit ${short(head)} is already published.`);
+    return step(ACTIONS.DONE, `The approved commit ${head} is already published.`);
+  }
+
+  // Manual mode: the commit was approved, gates passed, but AgentLoop has
+  // not pushed it.  Stop with the exact information the owner needs to
+  // push manually.
+  if (publishMode === 'manual' && state.readyToPublishHead && state.readyToPublishHead === head) {
+    return step(
+      ACTIONS.STOP,
+      `Commit ${head} was approved and passed all publication gates on ` +
+        `${state.branch ?? '(unknown branch)'}. Nothing has been pushed. ` +
+        'Push this branch manually when you are ready.',
+    );
+  }
+
+  // In auto mode an existing readyToPublishHead from a prior manual run
+  // is ignored — the publish step re-validates every gate and pushes.
+  if (publishMode === 'auto' && state.readyToPublishHead === head) {
+    // Fall through to the APPROVED verdict check below so the publish
+    // step re-runs all safety gates against the current HEAD.
   }
 
   if (state.verdict === 'BLOCKED') {
@@ -215,6 +234,7 @@ export function formatLocalReport({
     `- Change rounds used: ${state.changeRounds} of ${MAX_CHANGE_ROUNDS}`,
     `- Codex verdict: ${state.verdict ?? '(none)'}`,
     `- Published: ${state.publishedHead ?? 'no'}`,
+    `- Ready to publish (manual): ${state.readyToPublishHead ?? 'no'}`,
     `- Claude recovery required: ${state.recoveryRequired ? 'yes' : 'no'}`,
   ];
 

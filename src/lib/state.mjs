@@ -62,6 +62,8 @@ const SCHEMA = Object.freeze({
     value.every((entry) => typeof entry === 'string' && entry.length <= 4000),
   /** Set once the approved HEAD has been pushed. */
   publishedHead: (value) => value === null || SHA.test(String(value)),
+  /** Set when manual mode approves and gates pass but nothing is pushed. */
+  readyToPublishHead: (value) => value === null || SHA.test(String(value)),
   claudeSessionId: (value) => value === null || isUuid(value),
   consecutiveFailures: (value) => Number.isInteger(value) && value >= 0 && value <= 1000,
   failingStep: (value) => value === null || (typeof value === 'string' && value.length <= 64),
@@ -96,6 +98,7 @@ export function emptyState() {
     verdict: null,
     blockers: [],
     publishedHead: null,
+    readyToPublishHead: null,
     claudeSessionId: null,
     consecutiveFailures: 0,
     failingStep: null,

@@ -419,6 +419,90 @@ describe('saved active state referencing a missing task fails clearly', () => {
   });
 });
 
+describe('saved active state referencing a blocked task fails clearly', () => {
+  function writeState(project, taskId) {
+    fs.mkdirSync(path.join(project, '.agent'), { recursive: true });
+    fs.writeFileSync(
+      path.join(project, '.agent', 'state.json'),
+      JSON.stringify({
+        version: 4,
+        task: taskId,
+        branch: 'agent/task-' + taskId,
+        implementationHead: null,
+        implementationHandoffValid: false,
+        lastAuditedHead: null,
+        round: 0,
+        changeRounds: 0,
+        verdict: null,
+        blockers: [],
+        publishedHead: null,
+        readyToPublishHead: null,
+        claudeSessionId: null,
+        consecutiveFailures: 0,
+        failingStep: null,
+        usageLimitUntil: null,
+        usageLimitCount: 0,
+        recoveryRequired: false,
+        recoveryReason: null,
+        updatedAt: new Date().toISOString(),
+      }),
+      'utf8',
+    );
+  }
+
+  it('rejects a saved task that is blocked in the roadmap', () => {
+    const project = makeProject([
+      { ...baseTask('setup'), status: 'completed' },
+      { ...baseTask('blocked-task'), status: 'blocked' },
+    ]);
+    writeState(project, 'blocked-task');
+
+    const result = runNext(project);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/blocked/);
+    expect(result.stderr).toMatch(/blocked-task/);
+    // Must not silently select a different task
+    expect(result.stdout).not.toMatch(/Task ID:/);
+  });
+
+  it('rejects a saved task that is completed in the roadmap', () => {
+    const project = makeProject([
+      { ...baseTask('done'), status: 'completed' },
+    ]);
+    writeState(project, 'done');
+
+    const result = runNext(project);
+    // Completed tasks should not resume — falls through to selectNextTask,
+    // but with no eligible task remaining this fails.
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/No eligible task/);
+  });
+
+  it('still resumes a saved task with an eligible status', () => {
+    const project = makeProject([
+      { ...baseTask('active'), status: 'next' },
+    ]);
+    writeState(project, 'active');
+
+    const result = runNext(project);
+    // Resumes normally.
+    expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/Resuming active task/);
+  });
+
+  it('--next never selects a blocked task', () => {
+    const project = makeProject([
+      { ...baseTask('setup'), status: 'completed' },
+      { ...baseTask('blocked-task'), status: 'blocked' },
+      { ...baseTask('ready'), status: 'next' },
+    ]);
+    const result = runNext(project);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/Task ID: ready/);
+    expect(result.stdout).not.toMatch(/blocked-task/);
+  });
+});
+
 /* ------------------------------------------------------------------ *
  * Path-traversal task IDs are rejected before any mutation            *
  * ------------------------------------------------------------------ */

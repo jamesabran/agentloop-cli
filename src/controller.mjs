@@ -30,6 +30,7 @@ import {
   LIMITS,
   MAX_CHANGE_ROUNDS,
   PUBLISH_MODE,
+  REMOTE,
   REPO,
   REPORT_FILE,
   REPO_ROOT,
@@ -668,14 +669,24 @@ async function runPublishStep({ context, options }) {
   }
 
   if (PUBLISH_MODE === 'manual') {
-    context.state = clearFailures({ ...context.state, publishedHead: head });
+    context.state = clearFailures({ ...context.state, readyToPublishHead: head });
     log.info(
-      `Codex approved ${short(head)} on ${state.branch}. ` +
-        'Publish mode is manual — push this branch when you are ready. ' +
-        'Open a pull request for it if you want one merged; ' +
+      `Commit ${head} on ${state.branch} was approved and passed all publication gates. ` +
+        'Publish mode is manual — push this branch when you are ready.',
+    );
+    log.info(`  Branch:  ${state.branch}`);
+    log.info(`  Remote:  ${REMOTE}`);
+    log.info(`  Repo:    ${REPO}`);
+    log.info('  Nothing has been pushed.');
+    log.info(
+      '  Safe manual action:\n' +
+        `    git push ${REMOTE} ${state.branch}`,
+    );
+    log.info(
+      'Open a pull request for this branch if you want one merged; ' +
         'the controller does not open, update, merge, or close one.',
     );
-    return { continue: true };
+    return { continue: false, stopReason: 'Manual publish mode — the branch is ready for you to push.' };
   }
 
   await checkAuth();
@@ -781,41 +792,55 @@ function resolveNextTask({ loaded, options }) {
     );
   }
 
-  if (activeTaskId && activeTask && activeTask.status !== 'completed') {
-    // Verify the active task still exists in the committed task file and
-    // has not been completed.
-    if (options.dryRun) {
-      log.info(
-        `Resuming active task: ${JSON.stringify(activeTaskId)} ("${activeTask.title}") ` +
-          `(status: ${activeTask.status})`,
+  if (activeTaskId && activeTask) {
+    // Completed tasks must not resume. Blocked tasks must not resume —
+    // they are deferred or genuinely blocked in the roadmap.
+    if (activeTask.status === 'completed') {
+      // Fall through to new-task selection below (completed tasks should
+      // not be the active task, but if state was hand-edited, don't resume).
+    } else if (activeTask.status === 'blocked') {
+      throw new Error(
+        `Saved active task ${JSON.stringify(activeTaskId)} ("${activeTask.title}") ` +
+          `is blocked in ${tasksFilePath}. ` +
+          'It cannot be resumed. Review the task file and either unblock the task ' +
+          'or remove .agent/state.json to clear the saved state.',
       );
-      log.info('  This is a resume, not a new selection — runtime state identifies an active task.');
     } else {
-      log.info(
-        `Resuming active task ${JSON.stringify(activeTaskId)} ("${activeTask.title}") ` +
-          'from saved runtime state.',
-      );
-    }
+      // Verify the active task still exists in the committed task file and
+      // has an eligible status.
+      if (options.dryRun) {
+        log.info(
+          `Resuming active task: ${JSON.stringify(activeTaskId)} ("${activeTask.title}") ` +
+            `(status: ${activeTask.status})`,
+        );
+        log.info('  This is a resume, not a new selection — runtime state identifies an active task.');
+      } else {
+        log.info(
+          `Resuming active task ${JSON.stringify(activeTaskId)} ("${activeTask.title}") ` +
+            'from saved runtime state.',
+        );
+      }
 
-    const deps = dependencyStatuses(activeTask, taskMap);
-    const brief = generateTaskBrief(
-      activeTask,
-      deps,
-      DETERMINISTIC_CHECKS,
-      MAX_CHANGE_ROUNDS,
-    );
-
-    if (options.dryRun) {
-      logDryRunNext({
-        task: activeTask,
+      const deps = dependencyStatuses(activeTask, taskMap);
+      const brief = generateTaskBrief(
+        activeTask,
         deps,
-        tasksFilePath,
-        branch: options.branch ?? loaded.branch ?? defaultBranch(activeTaskId),
-        isResume: true,
-      });
-    }
+        DETERMINISTIC_CHECKS,
+        MAX_CHANGE_ROUNDS,
+      );
 
-    return { task: activeTaskId, generatedBrief: brief };
+      if (options.dryRun) {
+        logDryRunNext({
+          task: activeTask,
+          deps,
+          tasksFilePath,
+          branch: options.branch ?? loaded.branch ?? defaultBranch(activeTaskId),
+          isResume: true,
+        });
+      }
+
+      return { task: activeTaskId, generatedBrief: brief };
+    }
   }
 
   // No resumable active task — select the next task deterministically.
@@ -976,7 +1001,7 @@ async function runLoop(options) {
 
     for (let step = 0; step < LIMITS.maxStepsPerRun; step += 1) {
       const head = await headCommit();
-      decision = decideLocal({ state: context.state, head });
+      decision = decideLocal({ state: context.state, head, publishMode: PUBLISH_MODE });
 
       log.state({
         'Live HEAD': short(head) ?? '(none)',

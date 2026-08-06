@@ -120,6 +120,78 @@ describe('decideLocal — an approval covers one commit and no other', () => {
   });
 });
 
+describe('decideLocal — manual publish mode', () => {
+  function decide(state, head, mode) {
+    return decideLocal({ state, head, publishMode: mode }).action;
+  }
+
+  it('stops when manual-ready head matches, without setting publishedHead', () => {
+    const state = task({
+      implementationHead: B,
+      lastAuditedHead: B,
+      verdict: 'APPROVED',
+      readyToPublishHead: B,
+    });
+    expect(decide(state, B, 'manual')).toBe(ACTIONS.STOP);
+  });
+
+  it('still publishes in auto mode even with readyToPublishHead set', () => {
+    const state = task({
+      implementationHead: B,
+      lastAuditedHead: B,
+      verdict: 'APPROVED',
+      readyToPublishHead: B,
+    });
+    expect(decide(state, B, 'auto')).toBe(ACTIONS.PUBLISH);
+  });
+
+  it('publishes an approval normally in manual mode when not yet manual-ready', () => {
+    const state = recordAudit(task({ implementationHead: B, lastAuditedHead: A, round: 1 }), {
+      head: B,
+      verdict: 'APPROVED',
+    });
+    expect(decide(state, B, 'manual')).toBe(ACTIONS.PUBLISH);
+  });
+
+  it('publishes an approval in auto mode', () => {
+    const state = recordAudit(task({ implementationHead: B, lastAuditedHead: A, round: 1 }), {
+      head: B,
+      verdict: 'APPROVED',
+    });
+    expect(decide(state, B, 'auto')).toBe(ACTIONS.PUBLISH);
+  });
+
+  it('marks done when publishedHead matches in auto mode', () => {
+    const state = task({
+      implementationHead: B,
+      lastAuditedHead: B,
+      verdict: 'APPROVED',
+      publishedHead: B,
+    });
+    expect(decide(state, B, 'auto')).toBe(ACTIONS.DONE);
+  });
+
+  it('manual-ready state does not return DONE', () => {
+    const state = task({
+      implementationHead: B,
+      lastAuditedHead: B,
+      verdict: 'APPROVED',
+      readyToPublishHead: B,
+    });
+    expect(decide(state, B, 'auto')).not.toBe(ACTIONS.DONE);
+  });
+
+  it('re-audits when HEAD moved past a manual-ready commit', () => {
+    const state = task({
+      implementationHead: C,
+      lastAuditedHead: B,
+      verdict: 'APPROVED',
+      readyToPublishHead: B,
+    });
+    expect(decide(state, C, 'manual')).toBe(ACTIONS.AUDIT);
+  });
+});
+
 describe('decideLocal — stopping instead of looping', () => {
   it(`stops after ${MAX_CHANGE_ROUNDS} change rounds`, () => {
     const state = task({

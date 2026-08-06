@@ -48,7 +48,7 @@
     {
       "id": "3d-2",
       "title": "Improve timeout handling",
-      "status": "blocked",
+      "status": "next",
       "dependsOn": [],
       "goal": "Increase the implementation timeout and preserve recovery state when a timeout occurs.",
       "requirements": [
@@ -63,7 +63,7 @@
     {
       "id": "3d-3",
       "title": "Continuous cycle execution",
-      "status": "blocked",
+      "status": "planned",
       "dependsOn": [],
       "goal": "Automatically continue through implementation, checks, audit, revision rounds, rechecks, and publishing without requiring the user to run the controller again between successful stages.",
       "requirements": [
