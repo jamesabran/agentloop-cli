@@ -999,7 +999,7 @@ describe('runPublishStep — manual command output', () => {
 });
 
 describe('runPublishStep — auto mode via child process', () => {
-  it('validates remote, calls publishBranch with approved head, clears stale readyToPublishHead', () => {
+  it('validates remote through publishBranch, pushes the approved head, persists publishedHead and clears readyToPublishHead', () => {
     var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-auto-'));
     tempDirs.push(project);
 
@@ -1009,19 +1009,22 @@ describe('runPublishStep — auto mode via child process', () => {
 
     // The child process imports controller.mjs with
     // AGENTLOOP_PUBLISH_MODE=auto before the module-level constant
-    // is resolved. This gives us the real auto-mode path through
-    // runPublishStep with mocked git helpers.
+    // is resolved. This exercises the real auto-mode path through
+    // runPublishStep with deterministic injected git helpers.
 
     var A = 'a'.repeat(40);
     var testUrl = pathToFileURL(path.resolve(HERE, '..', 'controller.mjs')).href;
     var stateUrl = pathToFileURL(path.resolve(HERE, 'state.mjs')).href;
 
     var testScript = `
+      import fs from 'node:fs';
+      import path from 'node:path';
       import { runPublishStep } from ${JSON.stringify(testUrl)};
-      import { emptyState } from ${JSON.stringify(stateUrl)};
+      import { emptyState, loadState, saveState } from ${JSON.stringify(stateUrl)};
 
       var HEAD = ${JSON.stringify(A)};
       var BRANCH = 'agent/task-auto';
+      var STATE_FILE = path.join(process.cwd(), '.agent', 'state.json');
 
       var ctx = {
         state: {
@@ -1031,7 +1034,7 @@ describe('runPublishStep — auto mode via child process', () => {
           implementationHead: HEAD,
           lastAuditedHead: HEAD,
           verdict: 'APPROVED',
-          readyToPublishHead: ${JSON.stringify('d'.repeat(40))},
+          readyToPublishHead: HEAD,
           publishedHead: null,
         },
         checks: [],
@@ -1040,22 +1043,34 @@ describe('runPublishStep — auto mode via child process', () => {
 
       var pushCalled = false;
       var pushArg = null;
+      var assertRemoteCalled = false;
+      var checkAuthCalled = false;
 
       try {
         await runPublishStep({ context: ctx, options: { dryRun: false }, _git: {
           headCommit: async () => HEAD,
           workingTreeStatus: async () => ({ clean: true, changes: [] }),
-          assertRemoteMatchesRepo: async () => undefined,
-          checkAuth: async () => undefined,
+          assertRemoteMatchesRepo: async () => { assertRemoteCalled = true; },
+          checkAuth: async () => { checkAuthCalled = true; },
           publishBranch: async (arg) => { pushCalled = true; pushArg = arg; },
         }});
+
+        // Persist and reload so the assertion verifies durability, not
+        // only an in-memory mutation.
+        fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+        saveState(ctx.state, STATE_FILE);
+        var reloaded = loadState(STATE_FILE);
 
         process.stdout.write(JSON.stringify({
           ok: true,
           pushCalled: pushCalled,
           pushArg: pushArg,
+          assertRemoteCalled: assertRemoteCalled,
+          checkAuthCalled: checkAuthCalled,
           publishedHead: ctx.state.publishedHead,
           readyToPublishHead: ctx.state.readyToPublishHead,
+          reloadedPublishedHead: reloaded.publishedHead,
+          reloadedReadyToPublishHead: reloaded.readyToPublishHead,
         }));
       } catch (e) {
         process.stdout.write(JSON.stringify({ ok: false, error: e.message }));
@@ -1084,14 +1099,112 @@ describe('runPublishStep — auto mode via child process', () => {
     expect(jsonStart).not.toBe(-1);
     var data = JSON.parse(result.stdout.slice(jsonStart));
     expect(data.ok).toBe(true);
-    // In auto mode, assertRemoteMatchesRepo is called inside the real
-    // publishBranch, which is mocked here. The mock publishBranch is
-    // called exactly once with the correct contract.
+    // publishBranch is called exactly once with the approved head and
+    // the expected branch — it does not receive only an implicit branch tip.
     expect(data.pushCalled).toBe(true);
     expect(data.pushArg).toEqual({ branch: 'agent/task-auto', head: A });
-    // After a successful auto push, publishedHead is the approved SHA
-    // and stale readyToPublishHead is cleared.
+    // Auto mode calls checkAuth before the push.
+    expect(data.checkAuthCalled).toBe(true);
+    // Auto mode delegates repository-target validation to publishBranch
+    // (which calls assertRemoteMatchesRepo internally in production).
+    // The direct assertRemoteMatchesRepo mock is not called — the auto
+    // path reaches it through publishBranch, not as a separate step.
+    expect(data.assertRemoteCalled).toBe(false);
+    // After a successful auto push, the in-memory state records the
+    // published commit and clears the manual-ready flag.
     expect(data.publishedHead).toBe(A);
     expect(data.readyToPublishHead).toBeNull();
+    // The persisted state, reloaded from disk, carries the same values.
+    expect(data.reloadedPublishedHead).toBe(A);
+    expect(data.reloadedReadyToPublishHead).toBeNull();
+  });
+});
+
+describe('runPublishStep — production seam', () => {
+  // The _git parameter is a test-only injectable.  When callers omit it
+  // the destructuring fallback resolves each helper to the production
+  // implementation imported from git.mjs.  This test proves the seam
+  // does not alter the default path: a child process loads the module
+  // fresh (so REPO_ROOT resolves to the temp project), and runPublishStep
+  // is called without _git.  If the fallback were broken the call would
+  // throw before reaching the dry-run log message.
+  it('uses real git helpers when _git is not provided', () => {
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-seam-'));
+    tempDirs.push(project);
+
+    spawnSync('git', ['init', '--quiet'], { cwd: project });
+    spawnSync('git', ['config', 'user.email', 'test@test.test'], { cwd: project });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: project });
+    spawnSync('git', ['remote', 'add', 'origin', 'https://github.com/test/repo.git'], { cwd: project });
+    fs.writeFileSync(path.join(project, 'README.md'), 'test', 'utf8');
+    spawnSync('git', ['add', 'README.md'], { cwd: project });
+    spawnSync('git', ['commit', '-m', 'initial', '--quiet'], { cwd: project });
+
+    var head = spawnSync('git', ['rev-parse', 'HEAD'], {
+      cwd: project, encoding: 'utf8',
+    }).stdout.trim();
+
+    var testUrl = pathToFileURL(path.resolve(HERE, '..', 'controller.mjs')).href;
+    var stateUrl = pathToFileURL(path.resolve(HERE, 'state.mjs')).href;
+
+    var testScript = `
+      import { runPublishStep } from ${JSON.stringify(testUrl)};
+      import { emptyState } from ${JSON.stringify(stateUrl)};
+
+      var HEAD = ${JSON.stringify(head)};
+
+      var ctx = {
+        state: {
+          ...emptyState(),
+          task: 'seam-test',
+          branch: 'agent/task-seam',
+          implementationHead: HEAD,
+          lastAuditedHead: HEAD,
+          verdict: 'APPROVED',
+        },
+        checks: [],
+        claudeProcessesStarted: 0,
+      };
+
+      try {
+        // No _git parameter — the real git helpers must resolve.
+        var outcome = await runPublishStep({
+          context: ctx,
+          options: { dryRun: true },
+        });
+        process.stdout.write(JSON.stringify({
+          ok: true,
+          outcomeContinue: outcome.continue,
+          stopReason: outcome.stopReason,
+        }));
+      } catch (e) {
+        process.stdout.write(JSON.stringify({ ok: false, error: e.message }));
+      }
+    `;
+
+    // Write the script outside the repo so the working tree stays clean
+    // for runPublishStep's workingTreeStatus check.
+    var scriptFile = path.join(os.tmpdir(), 'test-seam.mjs');
+    fs.writeFileSync(scriptFile, testScript, 'utf8');
+
+    var result = spawnSync(
+      process.execPath,
+      [scriptFile],
+      {
+        cwd: project,
+        env: { ...process.env, AGENTLOOP_REPO: 'test/repo' },
+        encoding: 'utf8',
+        timeout: 15000,
+      },
+    );
+
+    expect(result.status).toBe(0);
+
+    var jsonStart = result.stdout.indexOf('{"ok":');
+    expect(jsonStart).not.toBe(-1);
+    var data = JSON.parse(result.stdout.slice(jsonStart));
+    expect(data.ok).toBe(true);
+    expect(data.outcomeContinue).toBe(false);
+    expect(data.stopReason).toMatch(/Dry run/);
   });
 });
