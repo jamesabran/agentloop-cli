@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "3c-1",
+      "title": "Complete and harden roadmap next-task selection",
+      "status": "completed",
+      "dependsOn": [],
+      "goal": "Resolve all correctness and safety blockers found in the independent audit so the --next enhancement can be approved.",
+      "requirements": [
+        "Make generated brief-cache paths safe for every valid task ID.",
+        "Reject task IDs containing . or .. path components.",
+        "Use a path-safe encoded cache key rather than interpolating raw task IDs into filesystem paths.",
+        "Add regression tests proving IDs such as x/../../escaped cannot cause writes outside .agent/.",
+        "Strip only a leading UTF-8 BOM before parsing agentloop.tasks.json.",
+        "Add a BOM-prefixed task-file regression test.",
+        "When saved active workflow state references a task missing from the current roadmap, fail clearly without selecting a replacement task or discarding the existing review/recovery state.",
+        "Add regression coverage for the stale-active-state case.",
+        "Make the project's deterministic checks consistent so the configured/default lint check succeeds instead of failing because npm run lint is missing.",
+        "Choose the smallest repository-consistent lint correction and update relevant tests or documentation.",
+        "Fix task-file validation diagnostics so an earlier task error does not prevent complete field validation of later tasks.",
+        "Preserve all existing explicit-task behavior, deterministic selection rules, recovery protections, exact-head gates, and publishing safety.",
+        "Run typecheck, lint, full tests, and build during implementation."
+      ],
+      "exclusions": [
+        "Do not implement configurable manual/automatic publishing.",
+        "Do not weaken task-file validation.",
+        "Do not silently discard or replace active workflow state.",
+        "Do not push, tag, release, merge, or reinstall ALCLI."
+      ]
+    },
+    {
+      "id": "3d-1",
+      "title": "Add configurable manual and automatic publishing",
+      "status": "next",
+      "dependsOn": ["3c-1"],
+      "goal": "Allow projects to choose whether approved commits are pushed automatically or left for manual publishing.",
+      "requirements": [
+        "Support a publishMode configuration in agentloop.config.json.",
+        "Default behavior must be manual.",
+        "Preserve exact-head approval and existing publish safety gates."
+      ],
+      "exclusions": [
+        "Do not change the Codex approval gate.",
+        "Do not remove or weaken any existing safety check."
+      ]
+    },
+    {
+      "id": "3d-2",
+      "title": "Improve timeout handling",
+      "status": "planned",
+      "dependsOn": [],
+      "goal": "Increase the implementation timeout and preserve recovery state when a timeout occurs.",
+      "requirements": [
+        "Increase the default implementation timeout from 6 minutes to 15 minutes.",
+        "Consider inactivity-based timeout handling instead of total runtime alone.",
+        "Preserve recovery state when a timeout occurs."
+      ],
+      "exclusions": [
+        "Do not implement this task yet — planned only."
+      ]
+    },
+    {
+      "id": "3d-3",
+      "title": "Continuous cycle execution",
+      "status": "planned",
+      "dependsOn": [],
+      "goal": "Automatically continue through implementation, checks, audit, revision rounds, rechecks, and publishing without requiring the user to run the controller again between successful stages.",
+      "requirements": [
+        "Continue through Claude implementation, deterministic checks, Codex audit, revision rounds, rechecks, and publishing in one invocation.",
+        "Stop only when the task is complete, a real blocker occurs, an agent times out or reaches a usage limit, the configured retry limit is reached, or human input is genuinely required.",
+        "Keep the existing checkpointing and recovery behavior intact.",
+        "Make continuous end-to-end execution the default experience."
+      ],
+      "exclusions": [
+        "Do not implement this task yet — planned only."
+      ]
+    }
+  ]
+}
