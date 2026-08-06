@@ -350,7 +350,7 @@ describe('validateTaskFile — task-level validation', () => {
       { id: 'dup', title: '', status: 'bad', dependsOn: [], goal: '', requirements: [], exclusions: [] },
     ];
     const filePath = writeTaskFile(repo, { version: 1, tasks });
-    expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow();
+    expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/duplicate/);
   });
 
   it('validates later tasks fully even when an earlier task has errors', () => {
@@ -363,6 +363,28 @@ describe('validateTaskFile — task-level validation', () => {
     ];
     const filePath = writeTaskFile(repo, { version: 1, tasks });
     expect(() => validateTaskFile(loadTaskFile(filePath), filePath)).toThrow(/does not exist/);
+  });
+
+  it('validates later tasks even when an earlier task is missing required fields', () => {
+    const repo = makeRepo();
+    const tasks = [
+      // First task is missing "goal" and "requirements" entirely — triggers the
+      // per-field skip for task[0] but must not block task[1] validation.
+      { id: 'incomplete', title: 'Incomplete', status: 'planned', dependsOn: [], exclusions: [] },
+      // Second task has an invalid status — must still be caught.
+      { id: 'second', title: 'Second', status: 'not-a-status', dependsOn: [], goal: 'G', requirements: [], exclusions: [] },
+    ];
+    const filePath = writeTaskFile(repo, { version: 1, tasks });
+    let message;
+    try {
+      validateTaskFile(loadTaskFile(filePath), filePath);
+    } catch (error) {
+      message = error.message;
+    }
+    // Task 0 missing-field errors must be present
+    expect(message).toMatch(/missing required field "goal"/);
+    // Task 1 status error must also be present — proves later tasks are validated
+    expect(message).toMatch(/must be one of/);
   });
 });
 

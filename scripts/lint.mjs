@@ -14,7 +14,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { findMjsFiles } from './lib/find-mjs-files.mjs';
 
@@ -40,6 +40,28 @@ function checkSyntax(file) {
   }
 }
 
+/**
+ * Strip JavaScript string literals and comments from a source line so
+ * a subsequent `debugger` check only matches actual statements, not
+ * mentions of the word in strings, template literals, or comments.
+ *
+ * The order matters: strings must be removed first so that `//` or `/*`
+ * inside a string literal is not mistaken for a comment start.
+ */
+export function stripStringsAndComments(line) {
+  return line
+    // Template literals — handles basic `${}` interpolation
+    .replace(/`(?:[^`\\$]|\$\{[^}]*\}|\\.)*`/g, '``')
+    // Double-quoted strings
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+    // Single-quoted strings
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+    // // line comments (safe after strings are removed)
+    .replace(/\/\/.*$/, '')
+    // /* block comments */ (single-line only)
+    .replace(/\/\*.*?\*\//g, '');
+}
+
 function main() {
   const files = [
     ...findMjsFiles(path.join(ROOT, 'src')),
@@ -61,7 +83,8 @@ function main() {
     // `debugger` statements should never land in committed code.
     const debuggerLines = [];
     source.split(/\r?\n/).forEach((line, index) => {
-      if (/\bdebugger\b/.test(line)) debuggerLines.push(index + 1);
+      const stripped = stripStringsAndComments(line);
+      if (/\bdebugger\b/.test(stripped)) debuggerLines.push(index + 1);
     });
     if (debuggerLines.length > 0) {
       fail(file, `debugger statement(s) on line(s): ${debuggerLines.join(', ')}`);
@@ -82,4 +105,9 @@ function main() {
   return 0;
 }
 
-process.exitCode = main();
+const invokedDirectly =
+  process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+
+if (invokedDirectly) {
+  process.exitCode = main();
+}
