@@ -54,8 +54,9 @@ function checkSyntax(file) {
  */
 export function stripStrings(line) {
   return line
-    // Template literals
-    .replace(/`(?:[^`\\$]|\$\{[^}]*\}|\\.)*`/g, '``')
+    // Template literals — backticks are \x60 (hex escape) to leave no ambiguity
+    // with JavaScript template-literal syntax
+    .replace(/\x60(?:[^\x60\\$]|\$\{[^}]*\}|\\.)*\x60/g, '\x60\x60')
     // Double-quoted strings
     .replace(/"(?:[^"\\]|\\.)*"/g, '""')
     // Single-quoted strings
@@ -75,8 +76,9 @@ export function stripStrings(line) {
  */
 export function stripStringsAndComments(line) {
   return line
-    // Template literals
-    .replace(/`(?:[^`\\$]|\$\{[^}]*\}|\\.)*`/g, '``')
+    // Template literals — backticks are \x60 (hex escape) to leave no ambiguity
+    // with JavaScript template-literal syntax
+    .replace(/\x60(?:[^\x60\\$]|\$\{[^}]*\}|\\.)*\x60/g, '\x60\x60')
     // Double-quoted strings
     .replace(/"(?:[^"\\]|\\.)*"/g, '""')
     // Single-quoted strings
@@ -167,7 +169,7 @@ export function findDebuggerStatements(source) {
   return debuggerLines;
 }
 
-function main() {
+export function main() {
   const files = [
     ...findMjsFiles(path.join(ROOT, 'src')),
     ...findMjsFiles(path.join(ROOT, 'bin')),

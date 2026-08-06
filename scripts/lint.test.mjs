@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
-import { findDebuggerStatements, stripStrings, stripStringsAndComments } from './lint.mjs';
+import { findDebuggerStatements, main, stripStrings, stripStringsAndComments } from './lint.mjs';
 
 describe('stripStringsAndComments', () => {
   it('preserves an actual debugger statement', () => {
@@ -236,5 +236,15 @@ describe('lint script self-test', () => {
       }
     }
     expect(falsePositives).toEqual([]);
+  });
+
+  it('runs the full lint pipeline and reports zero problems', () => {
+    // The main() function scans the actual repository files and returns
+    // the exit code. This test verifies the script works end-to-end.
+    // If scripts/lint.mjs has a syntax error, the import above fails
+    // before this test even starts, so this also serves as a gate for
+    // the typecheck script's --check on the lint script itself.
+    const exitCode = main();
+    expect(exitCode).toBe(0);
   });
 });
