@@ -577,36 +577,67 @@ describe('dependencyStatuses', () => {
  * ------------------------------------------------------------------ */
 
 describe('encodeCacheKey', () => {
-  it('produces a path-safe key for valid task IDs', () => {
-    expect(encodeCacheKey('3c-1')).toBe('3c-1');
-    expect(encodeCacheKey('setup')).toBe('setup');
-    expect(encodeCacheKey('feature-a')).toBe('feature-a');
+  it('produces deterministic hex keys for valid task IDs', () => {
+    // Each character is encoded as its UTF-16 code unit in lowercase hex.
+    expect(encodeCacheKey('3c-1')).toBe('33632d31');
+    expect(encodeCacheKey('setup')).toBe('7365747570');
+    expect(encodeCacheKey('feature-a')).toBe('666561747572652d61');
   });
 
-  it('replaces non-alphanumeric characters with hyphens', () => {
-    expect(encodeCacheKey('x/../../escaped')).toBe('x-escaped');
-    expect(encodeCacheKey('a.b.c')).toBe('a-b-c');
-    expect(encodeCacheKey('task#1')).toBe('task-1');
+  it('is injective — distinct task IDs produce distinct keys', () => {
+    // Collision regression: the old lossy encoding mapped both
+    // "feature/api" and "feature.api" to "feature-api".
+    var slashKey = encodeCacheKey('feature/api');
+    var dotKey = encodeCacheKey('feature.api');
+    expect(slashKey).not.toBe(dotKey);
+    // Verify the characters that differ:
+    expect(slashKey).toMatch(/2f/); // '/' is U+002F
+    expect(dotKey).toMatch(/2e/);  // '.' is U+002E
   });
 
-  it('collapses runs of hyphens', () => {
-    expect(encodeCacheKey('a///b')).toBe('a-b');
-    expect(encodeCacheKey('a..b')).toBe('a-b');
+  it('distinguishes other punctuation combinations', () => {
+    // Each pair must produce a different key.
+    var pairs = [
+      ['task#1', 'task-1'],
+      ['a.b', 'a-b'],
+      ['x_y', 'x-y'],
+      ['ns/task', 'ns-task'],
+    ];
+    for (var pi = 0; pi < pairs.length; pi++) {
+      var a = pairs[pi][0];
+      var b = pairs[pi][1];
+      expect(encodeCacheKey(a), a + ' vs ' + b).not.toBe(encodeCacheKey(b));
+    }
   });
 
-  it('strips leading and trailing hyphens', () => {
-    expect(encodeCacheKey('/leading')).toBe('leading');
-    expect(encodeCacheKey('trailing/')).toBe('trailing');
-    expect(encodeCacheKey('/both/')).toBe('both');
+  it('handles Unicode task IDs', () => {
+    // BMP character (U+00E9 é = 0xe9)
+    var key = encodeCacheKey('café');
+    expect(key).toMatch(/^[0-9a-f]+$/);
+    expect(key).toContain('e9');
+    // Supplementary-plane character (U+1F600 😀 = surrogate pair D83D DE00)
+    var emoji = encodeCacheKey('\u{1F600}');
+    expect(emoji).toMatch(/^[0-9a-f]+$/);
+    expect(emoji).not.toBe(encodeCacheKey('\u{1F601}')); // different emoji
   });
 
-  it('never produces an empty key', () => {
-    expect(encodeCacheKey('...')).toBe('');
+  it('contains only lowercase hex digits', () => {
+    var key = encodeCacheKey('x/../../escaped!@#$%^&*()');
+    expect(key).toMatch(/^[0-9a-f]*$/);
+    expect(key).not.toBe('');
   });
 
-  it('contains only [A-Za-z0-9] and hyphens', () => {
-    const key = encodeCacheKey('x/../../escaped!@#$%^&*()');
-    expect(key).toMatch(/^[A-Za-z0-9-]*$/);
+  it('handles traversal-shaped input safely', () => {
+    // Even if a traversal-shaped ID reached this function (defence-in-depth),
+    // the output must be a single flat hex string with no path separators.
+    var key = encodeCacheKey('x/../../escaped');
+    expect(key).not.toMatch(/\.\./);
+    expect(key).not.toMatch(/\//);
+    expect(key).toMatch(/^[0-9a-f]+$/);
+  });
+
+  it('handles an empty string', () => {
+    expect(encodeCacheKey('')).toBe('');
   });
 });
 

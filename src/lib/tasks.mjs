@@ -509,27 +509,35 @@ export function dependencyStatuses(task, taskMap) {
  * ------------------------------------------------------------------ */
 
 /**
- * Encode a task ID into a path-safe filesystem key.
+ * Encode a task identifier into a deterministic, path-safe cache key.
  *
- * The committed task file's `id` field is validated against
- * {@link TASK_ID_RE} before this function is ever called, but a
- * defence-in-depth encoding here means even a validator bug or a
- * hand-edited state file cannot cause writes outside `.agent/`.
+ * The input is encoded as the lowercase hexadecimal representation of its
+ * UTF-8 bytes. The result is injective — distinct task IDs always produce
+ * distinct cache keys, so IDs such as `feature/api` and `feature.api`
+ * cannot collide.
  *
- * Replaces every character that is not alphanumeric or a hyphen with
- * a single hyphen, collapses runs of hyphens, and strips leading and
- * trailing hyphens. The result is guaranteed to contain only
- * `[A-Za-z0-9]` and `-`, with no `..`, `/`, or empty segments.
+ * The output contains only `[0-9a-f]`, which is safe on every common
+ * filesystem (no `/`, `..`, or empty segments).
  *
  * @param {string} taskId
- * @returns {string} path-safe cache key
+ * @returns {string} deterministic, collision-free cache key
  */
 export function encodeCacheKey(taskId) {
-  return String(taskId)
-    .replace(/[^A-Za-z0-9-]/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-/, '')
-    .replace(/-$/, '');
+  var str = String(taskId);
+  var hex = '';
+  for (var i = 0; i < str.length; i++) {
+    var cp = str.charCodeAt(i);
+    // Handle surrogate pairs for code points above U+FFFF.
+    if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < str.length) {
+      var lo = str.charCodeAt(i + 1);
+      if (lo >= 0xdc00 && lo <= 0xdfff) {
+        cp = ((cp - 0xd800) * 0x400) + (lo - 0xdc00) + 0x10000;
+        i++;
+      }
+    }
+    hex += cp.toString(16).padStart(cp > 0xffff ? 6 : cp > 0xff ? 4 : 2, '0');
+  }
+  return hex;
 }
 
 /**

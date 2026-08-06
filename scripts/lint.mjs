@@ -138,8 +138,9 @@ export function stripStringsAndComments(line) {
 /**
  * Check whether the character at `idx` in `source` is the start of a
  * genuine `debugger` statement. A genuine statement is the `debugger`
- * keyword standing alone, not followed by a colon (property name or
- * label) and not part of a longer identifier.
+ * keyword standing alone: not preceded by `.` (member access), not
+ * followed by `:` (property name or label), and not part of a longer
+ * identifier.
  *
  * @param {string} source
  * @param {number} idx -- where 'd' was found
@@ -149,10 +150,12 @@ function isDebuggerStatement(source, idx) {
   // Check for the exact keyword
   if (source.slice(idx, idx + 8) !== 'debugger') return false;
 
-  // Must be at a word boundary on the left
+  // Must be at a word boundary on the left.
   if (idx > 0) {
     var before = source[idx - 1];
     if (/[A-Za-z0-9_$]/.test(before)) return false;
+    // Reject member/property access: obj.debugger, obj?.debugger
+    if (before === '.') return false;
   }
 
   // After 'debugger', skip whitespace (spaces and tabs only, not newlines)
@@ -180,8 +183,15 @@ function isDebuggerStatement(source, idx) {
  * across lines so that mentions of the word inside a JSDoc or other block
  * comment are never flagged.
  *
- * The scanner also skips `debugger` when it appears as an object property
- * (`{ debugger: false }`) or as part of a longer identifier
+ * A context stack tracks nested template literals and interpolation
+ * expressions. When the scanner enters `${...}` inside a template literal
+ * it switches to code-scanning mode, so genuine `debugger` statements
+ * inside interpolation are detected. Nested template literals and
+ * interpolation expressions are handled safely through the same stack.
+ *
+ * The scanner skips `debugger` when it appears as an object property
+ * (`{ debugger: false }`), as member access (`object.debugger`,
+ * `object?.debugger`), or as part of a longer identifier
  * (`debuggerLines`).
  *
  * @param {string} source - complete file contents
@@ -195,6 +205,14 @@ export function findDebuggerStatements(source) {
   //        tl (template literal), lc (line comment), bc (block comment)
   var state = 'code';
   var BT = String.fromCharCode(0x60); // backtick
+
+  // Context stack — each entry is the state to return to after the
+  // current nested construct closes (template literal or interpolation).
+  var ctxStack = [];
+  // Interpolation brace-depth stack — one entry per active interpolation
+  // level. The top value tracks how many unclosed `{` are open inside the
+  // current `${...}` body.
+  var interpStack = [];
 
   while (i < source.length) {
     var ch = source[i];
@@ -216,6 +234,24 @@ export function findDebuggerStatements(source) {
 
     // ---- code state ----
     if (state === 'code') {
+      // Brace tracking inside interpolation
+      if (ch === '{' && interpStack.length > 0) {
+        interpStack[interpStack.length - 1]++;
+        i++;
+        continue;
+      }
+      if (ch === '}' && interpStack.length > 0) {
+        if (interpStack[interpStack.length - 1] === 0) {
+          interpStack.pop();
+          state = ctxStack.pop(); // back to tl
+          i++;
+          continue;
+        }
+        interpStack[interpStack.length - 1]--;
+        i++;
+        continue;
+      }
+
       // Line comment start
       if (ch === '/' && i + 1 < source.length && source[i + 1] === '/') {
         state = 'lc';
@@ -233,7 +269,7 @@ export function findDebuggerStatements(source) {
       // Single-quoted string
       if (ch === "'") { state = 'sq'; i++; continue; }
       // Template literal
-      if (ch === BT) { state = 'tl'; i++; continue; }
+      if (ch === BT) { ctxStack.push('code'); state = 'tl'; i++; continue; }
 
       // debugger keyword
       if (ch === 'd' && isDebuggerStatement(source, i)) {
@@ -265,32 +301,15 @@ export function findDebuggerStatements(source) {
     // ---- template literal ----
     if (state === 'tl') {
       if (ch === '\\') { i += 2; continue; }
-      // Template interpolation ${...}
+      // Template interpolation ${...} — switch to code scanning
       if (ch === '$' && i + 1 < source.length && source[i + 1] === '{') {
-        var depth = 1;
+        ctxStack.push('tl');
+        interpStack.push(0);
+        state = 'code';
         i += 2;
-        while (i < source.length && depth > 0) {
-          var ec = source[i];
-          if (ec === '\n') line++;
-          else if (ec === '\r') {
-            line++;
-            if (i + 1 < source.length && source[i + 1] === '\n') i++;
-          } else if (ec === '{') depth++;
-          else if (ec === '}') depth--;
-          else if (ec === BT) {
-            // Nested template literal -- skip to closing backtick
-            i++;
-            while (i < source.length && source[i] !== BT) {
-              if (source[i] === '\\') i++;
-              else if (source[i] === '\n') line++;
-              i++;
-            }
-          }
-          i++;
-        }
         continue;
       }
-      if (ch === BT) state = 'code';
+      if (ch === BT) state = ctxStack.pop();
       i++;
       continue;
     }

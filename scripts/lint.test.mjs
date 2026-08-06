@@ -163,6 +163,42 @@ describe('findDebuggerStatements', () => {
     expect(result).toEqual([]);
   });
 
+  it('does not flag debugger as member/property access', () => {
+    // object.debugger and object?.debugger are property accesses, not
+    // debugger statements.
+    expect(findDebuggerStatements('object.debugger;')).toEqual([]);
+    expect(findDebuggerStatements('object?.debugger;')).toEqual([]);
+    expect(findDebuggerStatements('this.debugger = true;')).toEqual([]);
+  });
+
+  it('detects debugger inside template literal interpolation', () => {
+    // The expression inside ${...} is JavaScript code; debugger
+    // statements there must be detected.
+    var result = findDebuggerStatements('const x = `hello ${debugger;}`;');
+    expect(result).toEqual([1]);
+  });
+
+  it('detects debugger inside arrow function in interpolation', () => {
+    // Complex interpolation expressions with blocks must be scanned.
+    var source = 'const x = `${(() => { debugger; return 1; })()}`;';
+    var result = findDebuggerStatements(source);
+    expect(result).toEqual([1]);
+  });
+
+  it('detects debugger inside nested interpolation', () => {
+    // Nested template literals and interpolations must not break scanning.
+    var source = 'const x = `outer ${`inner ${debugger;}`}`;';
+    var result = findDebuggerStatements(source);
+    expect(result).toEqual([1]);
+  });
+
+  it('does not flag debugger inside template-literal text', () => {
+    // The word "debugger" in the template text (not inside ${...}) is
+    // not code and must not be flagged.
+    var result = findDebuggerStatements('const x = `debugger`;');
+    expect(result).toEqual([]);
+  });
+
   it('finds debugger even when a // line appears inside a block comment', () => {
     // The `// */` inside the block comment must not hide the close marker
     // from the scanner — if `//` is stripped before block-comment tracking,

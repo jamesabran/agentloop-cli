@@ -470,8 +470,8 @@ describe('encodeCacheKey prevents writes outside .agent/', () => {
     // Must not contain any path separators or traversal markers.
     expect(key).not.toMatch(/\.\./);
     expect(key).not.toMatch(/\//);
-    // The key must be a simple flat name.
-    expect(key).toMatch(/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/);
+    // The key must be a flat hex string.
+    expect(key).toMatch(/^[0-9a-f]+$/);
   });
 
   it('produces a key that path.join with .agent/ stays inside .agent/', () => {
