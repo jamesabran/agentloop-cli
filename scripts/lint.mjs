@@ -154,20 +154,14 @@ export function stripStringsAndComments(line) {
  */
 export function findDebuggerStatements(source) {
   var debuggerLines = [];
-  try {
-    var ast = acornParse(source, {
-      ecmaVersion: 'latest',
-      sourceType: 'module',
-      locations: true,
-      allowHashBang: true,
-      allowReturnOutsideFunction: true,
-    });
-    walk(ast);
-  } catch (_) {
-    // Parse error — the file would not pass `node --check` either.  The
-    // syntax check in main() already catches parse errors before calling
-    // this function, so an empty result here is the safe fallback.
-  }
+  var ast = acornParse(source, {
+    ecmaVersion: 'latest',
+    sourceType: 'module',
+    locations: true,
+    allowHashBang: true,
+    allowReturnOutsideFunction: true,
+  });
+  walk(ast);
   return debuggerLines;
 
   function walk(node) {
@@ -207,7 +201,17 @@ export function main() {
 
     var source = fs.readFileSync(file, 'utf8');
     // debugger statements should never land in committed code.
-    var debuggerLines = findDebuggerStatements(source);
+    var debuggerLines;
+    try {
+      debuggerLines = findDebuggerStatements(source);
+    } catch (parseErr) {
+      var msg = parseErr.message || 'parse error';
+      if (parseErr.loc) {
+        msg = 'parse error at line ' + parseErr.loc.line + ', column ' + parseErr.loc.column + ': ' + msg;
+      }
+      fail(file, msg);
+      continue;
+    }
     if (debuggerLines.length > 0) {
       fail(file, 'debugger statement(s) on line(s): ' + debuggerLines.join(', '));
       continue;

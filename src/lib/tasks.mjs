@@ -533,6 +533,39 @@ export function encodeCacheKey(taskId) {
 }
 
 /**
+ * Regular expression matching the subset of task IDs whose legacy
+ * (lossy hyphen-based) cache-key encoding was the identity function.
+ *
+ * These IDs consist exclusively of alphanumeric characters and single
+ * hyphens between them — no consecutive hyphens and no leading or
+ * trailing hyphens. For this subset the legacy cache path was always
+ * `brief-<id>.md` and two distinct IDs never mapped to the same path.
+ *
+ * @type {RegExp}
+ */
+var LEGACY_SAFE_RE = /^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$/;
+
+/**
+ * Return `true` when `id` is safe for a legacy cache-filename fallback.
+ *
+ * The legacy encoder replaced every character outside `[A-Za-z0-9-]`
+ * with a hyphen and collapsed consecutive hyphens. For IDs that already
+ * contain only `[A-Za-z0-9]` separated by at most single hyphens the
+ * transformation was the identity function, so the legacy filename is
+ * unambiguous, collision-free, and filesystem-safe.
+ *
+ * IDs containing dots, slashes, consecutive hyphens, or other
+ * punctuation are NOT legacy-safe — the lossy encoder could map
+ * distinct IDs to the same filename.
+ *
+ * @param {string} id
+ * @returns {boolean}
+ */
+export function isLegacySafeTaskId(id) {
+  return typeof id === 'string' && LEGACY_SAFE_RE.test(id);
+}
+
+/**
  * Generate a runtime implementation brief from a committed task.
  *
  * The generated brief may be cached under `.agent/`, but it must be

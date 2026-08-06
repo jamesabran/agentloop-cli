@@ -481,3 +481,129 @@ describe('encodeCacheKey prevents writes outside .agent/', () => {
     expect(resolved.startsWith(agentDir + path.sep)).toBe(true);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * Legacy cache migration                                              *
+ * ------------------------------------------------------------------ */
+
+describe('legacy cache migration', () => {
+  it('finds and migrates an existing legacy brief-3c-1.md cache', () => {
+    // Simulate a pre-existing installation: .agent/brief-3c-1.md from
+    // before the fixed-width hex encoding was introduced.
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-legacy-'));
+    tempDirs.push(project);
+
+    var agentDir = path.join(project, '.agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    var legacyContent = 'Issue #42: Test task from legacy cache\nhttps://example.com\n\nTest body.';
+    fs.writeFileSync(path.join(agentDir, 'brief-3c-1.md'), legacyContent, 'utf8');
+
+    // Non-dry-run so migration writes actually happen.
+    // This will fail later (no Claude), but the cache migration happens first.
+    var result = spawnSync(
+      process.execPath,
+      [CONTROLLER, '--task', '3c-1', '--verbose'],
+      { cwd: project, encoding: 'utf8', timeout: 15000 },
+    );
+
+    // The migration must have written the canonical file before the
+    // controller tried to start Claude and failed.
+    var key = encodeCacheKey('3c-1');
+    var canonicalPath = path.join(agentDir, 'brief-' + key + '.md');
+    expect(fs.existsSync(canonicalPath)).toBe(true);
+    var migrated = fs.readFileSync(canonicalPath, 'utf8');
+    expect(migrated).toBe(legacyContent);
+
+    // The legacy file should still exist (migration copies, doesn't delete).
+    expect(fs.existsSync(path.join(agentDir, 'brief-3c-1.md'))).toBe(true);
+  });
+
+  it('canonical file wins when both exist', () => {
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-legacy-'));
+    tempDirs.push(project);
+
+    var agentDir = path.join(project, '.agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    // Create both legacy and canonical files with different content.
+    fs.writeFileSync(path.join(agentDir, 'brief-3c-1.md'), 'legacy content', 'utf8');
+    var key = encodeCacheKey('3c-1');
+    fs.writeFileSync(path.join(agentDir, 'brief-' + key + '.md'), 'canonical content', 'utf8');
+
+    // With --dry-run the canonical file should be read and legacy ignored.
+    var result = spawnSync(
+      process.execPath,
+      [CONTROLLER, '--task', '3c-1', '--verbose', '--dry-run'],
+      { cwd: project, encoding: 'utf8', timeout: 15000 },
+    );
+
+    // Dry-run shouldn't crash looking for briefs.
+    expect(result.status).toBe(0);
+
+    // The canonical file must still contain its own content (not overwritten
+    // by the legacy content).
+    var canonicalAfter = fs.readFileSync(path.join(agentDir, 'brief-' + key + '.md'), 'utf8');
+    expect(canonicalAfter).toBe('canonical content');
+  });
+
+  it('does not look for legacy cache for unsafe IDs', () => {
+    // An ID with a slash must never trigger a legacy-path lookup.
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-legacy-'));
+    tempDirs.push(project);
+
+    var agentDir = path.join(project, '.agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    // Create a legacy file using the old lossy encoding for feature/api
+    // (which would have been brief-feature-api.md). This must NOT be found
+    // because feature/api is not in the legacy-safe subset.
+    fs.writeFileSync(path.join(agentDir, 'brief-feature-api.md'), 'should not be read', 'utf8');
+
+    var result = spawnSync(
+      process.execPath,
+      [CONTROLLER, '--task', 'feature/api', '--verbose', '--dry-run'],
+      { cwd: project, encoding: 'utf8', timeout: 15000 },
+    );
+
+    // Should fail with "No brief" because the legacy file is not consulted
+    // for unsafe IDs and there is no --brief flag or canonical cache.
+    expect(result.status).not.toBe(0);
+    // The error message must mention the brief, not a parse or unexpected crash.
+    expect(result.stderr).toMatch(/No brief/);
+  });
+
+  it('new writes use only the canonical filename', () => {
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-legacy-'));
+    tempDirs.push(project);
+
+    var agentDir = path.join(project, '.agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+
+    var key = encodeCacheKey('setup');
+    var canonicalPath = path.join(agentDir, 'brief-' + key + '.md');
+    var legacyPath = path.join(agentDir, 'brief-setup.md');
+
+    // Neither file exists initially.
+    expect(fs.existsSync(canonicalPath)).toBe(false);
+    expect(fs.existsSync(legacyPath)).toBe(false);
+
+    // Run with --brief to force a cache write.
+    var briefFile = path.join(project, 'custom-brief.md');
+    fs.writeFileSync(briefFile, 'custom brief content', 'utf8');
+
+    var result = spawnSync(
+      process.execPath,
+      [CONTROLLER, '--task', 'setup', '--brief', briefFile, '--verbose'],
+      { cwd: project, encoding: 'utf8', timeout: 15000 },
+    );
+
+    // The canonical file must have been written.
+    expect(fs.existsSync(canonicalPath)).toBe(true);
+    // The legacy-format filename must NOT have been written.
+    expect(fs.existsSync(legacyPath)).toBe(false);
+    // The canonical file must contain the expected content.
+    var written = fs.readFileSync(canonicalPath, 'utf8');
+    expect(written).toBe('custom brief content');
+  });
+});

@@ -16,6 +16,7 @@ import {
   encodeCacheKey,
   findTask,
   generateTaskBrief,
+  isLegacySafeTaskId,
   isValidTaskId,
   loadTaskFile,
   resolveTaskFilePath,
@@ -652,6 +653,55 @@ describe('encodeCacheKey', () => {
 /* ------------------------------------------------------------------ *
  * Task-ID validation                                                  *
  * ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ *
+ * Legacy-safe task ID subset                                          *
+ * ------------------------------------------------------------------ */
+
+describe('isLegacySafeTaskId', () => {
+  it('accepts simple alphanumeric IDs used by existing installations', () => {
+    expect(isLegacySafeTaskId('3c-1')).toBe(true);
+    expect(isLegacySafeTaskId('setup')).toBe(true);
+    expect(isLegacySafeTaskId('5')).toBe(true);
+    expect(isLegacySafeTaskId('agent-task-42')).toBe(true);
+    expect(isLegacySafeTaskId('fix-bug-123')).toBe(true);
+  });
+
+  it('rejects IDs containing dots', () => {
+    // Dots collapse to hyphens under the legacy encoder, so legacy-safe
+    // must be false (collision risk: a.b → a-b, which is another valid ID).
+    expect(isLegacySafeTaskId('release.1')).toBe(false);
+    expect(isLegacySafeTaskId('feature.api')).toBe(false);
+  });
+
+  it('rejects IDs containing slashes', () => {
+    // Slashes collapse to hyphens; also path-traversal risk.
+    expect(isLegacySafeTaskId('feature/api')).toBe(false);
+    expect(isLegacySafeTaskId('ns/task')).toBe(false);
+  });
+
+  it('rejects IDs with consecutive hyphens', () => {
+    // 'task--v2' and 'task-v2' would collide (both → task-v2).
+    expect(isLegacySafeTaskId('task--v2')).toBe(false);
+  });
+
+  it('rejects IDs with leading or trailing hyphens', () => {
+    expect(isLegacySafeTaskId('-task')).toBe(false);
+    expect(isLegacySafeTaskId('task-')).toBe(false);
+  });
+
+  it('rejects IDs with other punctuation', () => {
+    expect(isLegacySafeTaskId('task#1')).toBe(false);
+    expect(isLegacySafeTaskId('a_b')).toBe(false);
+  });
+
+  it('rejects non-strings', () => {
+    expect(isLegacySafeTaskId(null)).toBe(false);
+    expect(isLegacySafeTaskId(undefined)).toBe(false);
+    expect(isLegacySafeTaskId(42)).toBe(false);
+    expect(isLegacySafeTaskId('')).toBe(false);
+  });
+});
 
 describe('isValidTaskId', () => {
   it('accepts simple alphanumeric IDs', () => {

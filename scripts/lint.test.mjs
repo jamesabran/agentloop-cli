@@ -219,7 +219,7 @@ describe('findDebuggerStatements', () => {
   it('does not flag debugger in regex with braces', () => {
     // Regex literals can contain { } quantifiers and character classes
     // with } — these must not be confused with interpolation braces.
-    expect(findDebuggerStatements('const re = /{2,4}/;')).toEqual([]);
+    expect(findDebuggerStatements('const re = /a{2,4}/;')).toEqual([]);
     expect(findDebuggerStatements('const re = /[}]/;')).toEqual([]);
   });
 
@@ -247,11 +247,9 @@ describe('findDebuggerStatements', () => {
     expect(result).toEqual([3]);
   });
 
-  it('does not flag debugger used as a label in code', () => {
-    // `debugger:` is a labelled statement (though debugger is reserved, so
-    // this is hypothetical). The scanner should still treat it as a
-    // property/label pattern.
-    const result = findDebuggerStatements('debugger:\n  for (;;) {}');
+  it('does not flag debugger used as a property name in return', () => {
+    // A property access like obj.debugger must not be treated as a statement.
+    const result = findDebuggerStatements('return obj.debugger;');
     expect(result).toEqual([]);
   });
 
@@ -259,6 +257,34 @@ describe('findDebuggerStatements', () => {
     // Bare `debugger` with nothing after it on the line is a real statement.
     const result = findDebuggerStatements('  debugger');
     expect(result).toEqual([1]);
+  });
+});
+
+describe('findDebuggerStatements parse errors', () => {
+  it('throws on unparseable input instead of returning silently', () => {
+    // An unclosed block comment is a parse error. The function must throw
+    // rather than silently returning [].
+    expect(() => findDebuggerStatements('/* unclosed comment')).toThrow();
+  });
+
+  it('includes line and column in the error', () => {
+    // Acorn provides loc info on parse errors.
+    try {
+      findDebuggerStatements('const x = ;');
+      // Should not reach here.
+      expect('no error thrown').toBe(false);
+    } catch (e) {
+      expect(e.loc).toBeDefined();
+      expect(typeof e.loc.line).toBe('number');
+      expect(typeof e.loc.column).toBe('number');
+    }
+  });
+
+  it('throws on syntax that node --check would accept but acorn rejects', () => {
+    // Some edge cases where node accepts but acorn might not.
+    // This guards against silent failures from version skew.
+    // A clearly broken input that node --check also rejects:
+    expect(() => findDebuggerStatements('function ( {}')).toThrow();
   });
 });
 

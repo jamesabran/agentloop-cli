@@ -76,6 +76,7 @@ import {
   encodeCacheKey,
   findTask,
   generateTaskBrief,
+  isLegacySafeTaskId,
   isValidTaskId,
   loadTaskFile,
   resolveTaskFilePath,
@@ -253,6 +254,22 @@ async function resolveBrief({ task, options, generatedBrief }) {
 
   if (fs.existsSync(cache)) {
     return { brief: fs.readFileSync(cache, 'utf8'), source: cache };
+  }
+
+  // Legacy cache fallback: before the encoding changed to fixed-width
+  // hex, cache files for simple alphanumeric-dash IDs were written
+  // directly as `brief-<id>.md`. When the canonical file is missing
+  // and the task ID is in the legacy-safe subset, check for and
+  // migrate a legacy cache file.
+  if (isLegacySafeTaskId(task)) {
+    var legacy = path.join(AGENT_DIR, `brief-${task}.md`);
+    if (fs.existsSync(legacy)) {
+      var legacyBrief = fs.readFileSync(legacy, 'utf8');
+      // Migrate to the canonical filename for future lookups. Do not
+      // overwrite a canonical file if one appeared in the meantime.
+      if (!fs.existsSync(cache)) remember(legacyBrief);
+      return { brief: legacyBrief, source: legacy + ' (migrated to canonical)' };
+    }
   }
 
   if (!/^\d+$/.test(task)) {
