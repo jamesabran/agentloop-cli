@@ -17,9 +17,69 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { afterEach, describe, expect, it } from 'vitest';
-
 import { assertRemoteMatchesRepo, parseGithubOwnerRepo } from './git.mjs';
+
+// ---------------------------------------------------------------------------
+// Test-runner compatibility
+// ---------------------------------------------------------------------------
+// Vitest sets VITEST=true in the process environment.  When absent the
+// file is being loaded by the Node built-in test runner (`node --test`).
+// Each runner has its own test-registration API — detect which one is
+// active and wire up the right describe / it / afterEach / expect so the
+// same test definitions are discovered and executed by both.
+// ---------------------------------------------------------------------------
+
+const IS_VITEST = process.env.VITEST === 'true';
+
+let describe, it, afterEach, expect;
+
+if (IS_VITEST) {
+  // Vitest runner
+  ({ describe, it, afterEach, expect } = await import('vitest'));
+} else {
+  // Node built-in test runner
+  ({ describe, it, afterEach } = await import('node:test'));
+
+  const { strict: assert } = await import('node:assert');
+
+  /**
+   * Minimal expect-like wrapper over {@link node:assert} so the test
+   * bodies do not need a runner-specific assertion style.  Only the
+   * matchers actually used in this file are implemented.
+   */
+  function _expect(actual, negated) {
+    negated = !!negated;
+    return {
+      toBe(expected) {
+        if (negated) assert.notStrictEqual(actual, expected);
+        else assert.strictEqual(actual, expected);
+      },
+      toBeNull() {
+        if (negated) assert.notStrictEqual(actual, null);
+        else assert.strictEqual(actual, null);
+      },
+      toMatch(pattern) {
+        if (negated) assert.doesNotMatch(actual, pattern);
+        else assert.match(actual, pattern);
+      },
+      get not() {
+        return _expect(actual, true);
+      },
+      get resolves() {
+        return {
+          async toBeUndefined() {
+            const resolved = await actual;
+            assert.strictEqual(resolved, undefined);
+          },
+        };
+      },
+    };
+  }
+
+  expect = function (actual) { return _expect(actual); };
+}
+
+// ---------------------------------------------------------------------------
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
