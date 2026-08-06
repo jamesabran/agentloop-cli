@@ -32,7 +32,7 @@
     {
       "id": "3d-1",
       "title": "Add configurable manual and automatic publishing",
-      "status": "next",
+      "status": "completed",
       "dependsOn": ["3c-1"],
       "goal": "Allow projects to choose whether approved commits are pushed automatically or left for manual publishing.",
       "requirements": [
@@ -48,7 +48,7 @@
     {
       "id": "3d-2",
       "title": "Improve timeout handling",
-      "status": "planned",
+      "status": "blocked",
       "dependsOn": [],
       "goal": "Increase the implementation timeout and preserve recovery state when a timeout occurs.",
       "requirements": [
@@ -63,7 +63,7 @@
     {
       "id": "3d-3",
       "title": "Continuous cycle execution",
-      "status": "planned",
+      "status": "blocked",
       "dependsOn": [],
       "goal": "Automatically continue through implementation, checks, audit, revision rounds, rechecks, and publishing without requiring the user to run the controller again between successful stages.",
       "requirements": [
