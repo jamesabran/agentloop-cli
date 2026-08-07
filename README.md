@@ -344,7 +344,8 @@ native-argument-passing quirk that eats npm's own `--` separator whenever it is
 immediately followed by another `--`-prefixed token, leaving npm to swallow
 the option as its own unrecognized config instead of forwarding it. The
 controller recovers every supported option — `--task`, `--brief`, `--branch`,
-`--dry-run`, `--next`, `--recover`, `--self-check`, `--verbose`, and `--help` —
+`--dry-run`, `--next`, `--push-mode`, `--recover`, `--self-check`, `--verbose`,
+and `--help` —
 from the npm config values that mangling leaves behind (`recoverCliArgs` in
 `src/lib/npm-args.mjs`), the same single function every entry point
 (`agentloop`, direct `controller.mjs` invocation, and `agent:dry-run`) uses.
@@ -372,6 +373,8 @@ agentloop --next [--dry-run]
   --brief <file>    Task description to use instead of reading the issue
                     (valid only with an explicit --task, not with --next)
   --branch <name>   Local working branch (default: agent/task-<id>)
+  --push-mode <m>   Publish mode: "manual" (default) or "auto". Overrides
+                    AGENTLOOP_PUBLISH_MODE and publishMode in config.
   --dry-run         Report the next local step, change nothing
   --recover         Explicitly clear a terminal Claude failure; starts a new session
   --self-check      Offline demonstration of the loop; no agents, no network
@@ -616,6 +619,7 @@ All optional.
 | `AGENTLOOP_CHECK_TIMEOUT_MS` | `1200000` | One deterministic check |
 | `AGENTLOOP_MAX_CHANGE_ROUNDS` | `2`, or `maxChangeRounds` in config | `REQUEST_CHANGES` rounds before stopping |
 | `AGENTLOOP_MAX_FAILURES` | `3` | Failures on one step before stopping |
+| `AGENTLOOP_PUBLISH_MODE` | `manual`, or `publishMode` in config | `manual` or `auto`; overridden by `--push-mode` |
 | `AGENTLOOP_REPO` | resolved | May only assert the resolved repository, not redirect it |
 | `AGENTLOOP_BASE_BRANCH` | resolved | May only assert the resolved base branch, not redirect it |
 

@@ -6,6 +6,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/) —
 though it is pre-1.0, so minor versions may still include breaking changes.
 
+## [0.2.0] - 2026-08-07
+
+### Added
+
+- **Roadmap-driven task execution (`--next`).** A committed
+  `agentloop.tasks.json` file defines the project's planned work with task
+  IDs, titles, goals, requirements, exclusions, dependencies, and statuses.
+  `--next` selects the next eligible task deterministically — the
+  controller owns the decision; Claude and Codex never choose which task
+  comes next. Full validation of the task file runs before any branch or
+  state mutation; an invalid file is rejected first.
+- **Configurable publish mode (`--push-mode`).** `--push-mode manual|auto`
+  controls whether the controller pushes an approved branch immediately
+  (`auto`) or stops after approval with the exact `git push` command
+  printed for you to run (`manual`, the default). The flag overrides
+  `AGENTLOOP_PUBLISH_MODE` and `publishMode` in `agentloop.config.json`.
+  All existing publication safety gates run identically in both modes.
+- **Lint script.** A deterministic check for leftover `debugger` statements
+  and unparseable source files — things `node --check` can't see. Uses an
+  acorn-based AST walker so comments, strings, template literals, regexes,
+  and property names are never false positives.
+- **`AGENTS.md`** with concise, token-efficient execution rules for
+  automated agents working in this repository.
+
+### Changed
+
+- **Publication is now manual by default.** On Codex approval the
+  controller validates the remote, records readiness, and prints the exact
+  `git push <remote> <sha>:refs/heads/<branch>` command. Nothing is pushed
+  until you run it. Set `--push-mode auto` or `publishMode: "auto"` in
+  config to restore the previous automatic-push behaviour.
+- **Exact-SHA publishing.** The controller pushes the exact approved commit
+  SHA (`<sha>:refs/heads/<branch>`), not the branch tip, so nothing
+  committed after the approval can reach GitHub.
+- **Repository-boundary assertion before publish.** Manual and auto modes
+  both verify the live remote matches the pinned repository before acting.
+
+### Fixed
+
+- Stale `readyToPublishHead` is cleared on new commits, recovery, and
+  successful auto-publish, so a prior approval can never apply to a
+  different commit.
+- Blocked tasks in `agentloop.tasks.json` are never selected by `--next`
+  and saved active state for a blocked task is rejected with a clear
+  diagnostic.
+- Legacy cache migration for task briefs is atomic (exclusive-create) and
+  case-sensitive on Windows.
+
 ## [0.1.1] - 2026-08-05
 
 ### Fixed
