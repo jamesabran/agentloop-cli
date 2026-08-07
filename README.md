@@ -51,9 +51,11 @@ bin directly):
 
 ## What it does
 
-1. Selects the task from `--task` (or the one saved in `.agent/`).
-2. Resolves the task brief: `--brief <file>`, the cached copy in `.agent/`, or —
-   when the task id is an issue number — a single read of that issue.
+1. Selects the task from `--task`, `--next` (deterministic roadmap-driven
+   selection), or the one saved in `.agent/`.
+2. Resolves the task brief: `--brief <file>`, generated from the committed
+   task file (for `--next`), the cached copy in `.agent/`, or — when the task
+   id is an issue number — a single read of that issue.
 3. Checks out one local working branch for the task, creating it from the
    configured base branch.
 4. Decides the next step from the saved state and the live local `HEAD`.
@@ -103,6 +105,7 @@ override any of that:
   "remote": "origin",
   "repo": null,
   "maxChangeRounds": 2,
+  "tasksFile": "agentloop.tasks.json",
   "checks": [
     { "name": "typecheck", "script": "typecheck" },
     { "name": "lint", "script": "lint" },
@@ -122,6 +125,11 @@ before handing a commit to Codex; the default matches a typical
 `typecheck`/`lint`/`test`/`build` project. If your project uses different
 script names, or a different number of checks, list them here.
 
+`tasksFile` is the path to the committed roadmap file, relative to the
+repository root. It must be a relative path inside the repository — absolute
+paths and traversal outside the repository are rejected. See
+[Task roadmap](#task-roadmap-agentlooptasksjson) below.
+
 Claude is never granted any of these commands, or any `npm`/`node`/`npx`
 command at all — see [Verification runs only in the
 controller](#verification-runs-only-in-the-controller) below.
@@ -134,6 +142,149 @@ commit conventions, scope boundaries, and documentation of what the
 verification commands are (informational for Claude; the controller is what
 actually runs them). AgentLoop does not require one; a project with no
 `AGENTS.md` still works, just without that extra context.
+
+## Task roadmap (`agentloop.tasks.json`)
+
+A committed, structured file at the repository root that defines the project's
+planned work. It is durable planning data, designed for version control.
+`.agent/` remains disposable, gitignored runtime state — the task file is the
+source of truth for what to work on next.
+
+```json
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "setup",
+      "title": "Project setup",
+      "status": "completed",
+      "dependsOn": [],
+      "goal": "Set up the project structure and configuration.",
+      "requirements": [
+        "Initialise the repository with the standard tooling"
+      ],
+      "exclusions": [
+        "CI/CD pipeline configuration"
+      ]
+    },
+    {
+      "id": "3c-1",
+      "title": "First feature",
+      "status": "next",
+      "dependsOn": ["setup"],
+      "goal": "Implement the first feature.",
+      "requirements": [
+        "Feature A implementation",
+        "Tests for feature A"
+      ],
+      "exclusions": [
+        "Documentation updates"
+      ]
+    },
+    {
+      "id": "3c-2",
+      "title": "Second feature",
+      "status": "planned",
+      "dependsOn": ["setup"],
+      "goal": "Implement the second feature.",
+      "requirements": [
+        "Feature B implementation"
+      ],
+      "exclusions": [
+        "Performance tuning"
+      ]
+    }
+  ]
+}
+```
+
+### Task fields
+
+| Field | Required | Description |
+|---|---|---|
+| `id` | yes | Unique task identifier (letters, digits, `.`, `_`, `/`, `-`) |
+| `title` | yes | Human-readable task name |
+| `status` | yes | One of: `planned`, `next`, `in_progress`, `completed`, `blocked` |
+| `dependsOn` | yes | Array of task IDs that must be `completed` before this task is eligible |
+| `goal` | yes | What this task should accomplish |
+| `requirements` | yes | Array of required behaviours for the implementation |
+| `exclusions` | yes | Array of behaviours explicitly outside this task's scope |
+
+### Status meanings
+
+| Status | Meaning |
+|---|---|
+| `planned` | Ready to be worked on once dependencies are met |
+| `next` | The one task that should be selected next (at most one eligible at a time) |
+| `in_progress` | Currently being worked on |
+| `completed` | Done — dependencies on this task are now satisfied |
+| `blocked` | Cannot proceed — skipped during selection |
+
+### Deterministic task selection
+
+When you run `--next`, the controller — not Claude and not Codex — chooses the
+task:
+
+1. Ignore `completed` tasks.
+2. Ignore `blocked` tasks.
+3. Every dependency must reference an existing task.
+4. Every dependency must have status `completed`.
+5. Determine all otherwise eligible tasks.
+6. Prefer one eligible task marked `next`.
+7. **Fail** when more than one eligible task is marked `next`.
+8. When no eligible `next` exists, choose the first eligible `planned` task in
+   file order.
+9. Do not infer completion from ordering.
+10. **Fail** clearly when no eligible task exists.
+
+The selection is deterministic and independently testable. The task file is
+**committed planning data** — the controller does not automatically modify
+committed statuses in this phase.
+
+### Active-task resume
+
+When `--next` is run and valid resumable runtime state (`.agent/state.json`)
+already identifies an active task:
+
+- The active task is **resumed** through the existing recovery/resume rules.
+- It is not silently replaced with a newly selected task.
+- The task file is still validated before any mutations.
+- The controller verifies the active task still exists in the committed task file.
+- A clear message reports that the active task is being resumed.
+
+### Generated runtime brief
+
+When `--next` selects a task, the controller converts it into the implementation
+brief consumed by Claude and Codex. The generated brief includes:
+
+- Task ID, title, goal, requirements, and explicit exclusions
+- Dependency IDs and statuses
+- Configured verification commands
+- Maximum correction rounds and other constraints
+
+The generated brief may be cached under `.agent/` for resume, but it is
+reproducible from the committed task file and configuration. The cached brief is
+never the durable source of truth.
+
+### Dry-run with `--next`
+
+```powershell
+agentloop --dry-run --next
+```
+
+Shows, without mutating anything:
+
+- Resolved task-file path
+- Selected task ID and title
+- Why the task is eligible
+- Dependency IDs and statuses
+- Generated branch name
+- Configured checks and maximum correction rounds
+- That the brief will be generated from the committed task file
+- Whether the command is selecting a new task or resuming an active task
+
+Dry-run does not create branches, write files, create `.agent/`, modify runtime
+state, or invoke any agent.
 
 ## Verification runs only in the controller
 
@@ -168,13 +319,20 @@ Start with the two safe modes. Neither starts an agent.
 # Offline. Walks the whole loop and prints every transition.
 npm run agent:self-check
 
-# Reports the step it would take next, changes nothing.
+# With a task file: see which task --next would select (changes nothing).
+npm run agent:dry-run -- --next
+
+# With an explicit task: reports the step it would take next, changes nothing.
 npm run agent:dry-run -- --task 7 --brief docs/task-7.md
 ```
 
 Then, when you are ready to let it act:
 
 ```powershell
+# Roadmap-driven: select the next task deterministically.
+npx agentloop --next
+
+# Or with an explicit task ID and brief:
 npx agentloop --task 7 --brief docs/task-7.md
 # or, equivalently, if you added the npm script above:
 npm run agent -- --task 7 --brief docs/task-7.md
@@ -186,8 +344,8 @@ native-argument-passing quirk that eats npm's own `--` separator whenever it is
 immediately followed by another `--`-prefixed token, leaving npm to swallow
 the option as its own unrecognized config instead of forwarding it. The
 controller recovers every supported option — `--task`, `--brief`, `--branch`,
-`--dry-run`, `--recover`, `--self-check`, `--verbose`, and `--help` — from the
-npm config values that mangling leaves behind (`recoverCliArgs` in
+`--dry-run`, `--next`, `--recover`, `--self-check`, `--verbose`, and `--help` —
+from the npm config values that mangling leaves behind (`recoverCliArgs` in
 `src/lib/npm-args.mjs`), the same single function every entry point
 (`agentloop`, direct `controller.mjs` invocation, and `agent:dry-run`) uses.
 An option already present in argv is always left as-is; recovery only ever
@@ -207,9 +365,12 @@ All options:
 
 ```text
 agentloop --task <id> [options]
+agentloop --next [--dry-run]
 
   --task <id>       Task or issue identifier (required the first time)
+  --next            Select the next task from agentloop.tasks.json deterministically
   --brief <file>    Task description to use instead of reading the issue
+                    (valid only with an explicit --task, not with --next)
   --branch <name>   Local working branch (default: agent/task-<id>)
   --dry-run         Report the next local step, change nothing
   --recover         Explicitly clear a terminal Claude failure; starts a new session
@@ -218,7 +379,39 @@ agentloop --task <id> [options]
   --help            Show this message
 ```
 
+### With a task roadmap
+
+If your project has an `agentloop.tasks.json`, `--next` selects the next task
+deterministically:
+
+```powershell
+# See what would be selected, without changing anything:
+npm run agent -- --dry-run --next
+
+# Run the selected task:
+npm run agent -- --next
+```
+
+The controller validates the entire task file before any branch or state
+mutation — an invalid file is rejected before anything changes.
+
+`--next` and `--task`/`--brief` are mutually exclusive. `--next` selects
+deterministically; `--task <id>` works on a specific task. A custom brief is
+only valid with an explicit `--task`.
+
 ## Starting a piece of work
+
+**Roadmap-driven** (with `agentloop.tasks.json`):
+
+1. Define your tasks in `agentloop.tasks.json` — scope, acceptance criteria,
+   dependencies, and exclusions for each task.
+2. Mark the next task to work on as `"status": "next"`.
+3. Run `agentloop --next` and leave the machine awake.
+4. When it stops, read `.agent/report.md`.
+5. Update the committed task statuses by hand when a task is complete.
+6. Run `agentloop --next` again for the next task.
+
+**Explicit** (with `--task`):
 
 1. Write the scope, acceptance criteria, and exclusions — as a GitHub issue, or
    as a local Markdown file.
@@ -273,14 +466,16 @@ agentloop-cli/
       claude-agent.mjs       non-interactive Claude runs and stream-json progress
       codex-agent.mjs        read-only Codex audits
       prompts.mjs            what each agent is told
+      tasks.mjs              committed task-file loading, validation, and selection
       process.mjs            Windows-aware process launching
       logger.mjs             console and file logging
       npm-args.mjs           recovers every CLI option from npm's Windows arg loss
 
 <your project>/
-  agentloop.config.json  optional — base branch, checks, repo, agent settings
-  AGENTS.md               optional — project-specific rules for both agents
-  .agent/                 gitignored — everything the controller writes
+  agentloop.config.json   optional — base branch, checks, repo, agent settings
+  agentloop.tasks.json     committed — task roadmap, the durable source of truth
+  AGENTS.md                optional — project-specific rules for both agents
+  .agent/                  gitignored — everything the controller writes
     state.json            task, branch, heads, round, verdict, blockers
     brief-<task>.md        the task description, cached on first resolution
     audit-<task>-round-N.md   each Codex report, verbatim
@@ -471,8 +666,11 @@ test file would be.
 
 - One task at a time. Switching `--task` discards the previous task's review
   position; its branch and commits are untouched, but it restarts the loop.
+- The controller does not automatically modify committed task statuses. Mark a
+  task as `completed` in `agentloop.tasks.json` by hand after it is published.
 - The machine must be awake for agents to run. The branch and `.agent/` survive
   a restart; the controller resumes from them.
 - Agents run under your OS user with your credentials, by design for this
   phase. Watch the first few runs.
+- Configurable manual/auto pushing of committed statuses is not yet implemented.
 - No Windows service, no self-hosted runner, and no MCP support. All deferred.

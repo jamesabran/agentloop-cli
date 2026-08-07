@@ -28,7 +28,7 @@ export const VERDICTS = Object.freeze(['APPROVED', 'REQUEST_CHANGES', 'BLOCKED']
 
 const SHA = /^[0-9a-f]{40}$/i;
 /** Issue numbers, `#5`, and local slugs all qualify as a task identifier. */
-const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._/#-]{0,63}$/;
+const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._\/#-]{0,127}$/;
 
 /**
  * Every persisted key, with the shape it must have.
@@ -62,6 +62,8 @@ const SCHEMA = Object.freeze({
     value.every((entry) => typeof entry === 'string' && entry.length <= 4000),
   /** Set once the approved HEAD has been pushed. */
   publishedHead: (value) => value === null || SHA.test(String(value)),
+  /** Set when manual mode approves and gates pass but nothing is pushed. */
+  readyToPublishHead: (value) => value === null || SHA.test(String(value)),
   claudeSessionId: (value) => value === null || isUuid(value),
   consecutiveFailures: (value) => Number.isInteger(value) && value >= 0 && value <= 1000,
   failingStep: (value) => value === null || (typeof value === 'string' && value.length <= 64),
@@ -96,6 +98,7 @@ export function emptyState() {
     verdict: null,
     blockers: [],
     publishedHead: null,
+    readyToPublishHead: null,
     claudeSessionId: null,
     consecutiveFailures: 0,
     failingStep: null,
@@ -190,6 +193,9 @@ export function recordImplementation(state, head) {
     // is no longer HEAD. `lastAuditedHead` is kept, because it is the start of
     // the range the next audit reviews.
     verdict: null,
+    // A new commit also invalidates any previous manual-readiness — the new
+    // commit has not been audited or approved.
+    readyToPublishHead: null,
   };
 }
 
@@ -258,12 +264,21 @@ export function requireRecovery(state, reason) {
     claudeSessionId: null,
     recoveryRequired: true,
     recoveryReason: String(reason).slice(0, 4000),
+    // Recovery means the previous ready-to-publish state must be
+    // revalidated through the workflow.
+    readyToPublishHead: null,
   };
 }
 
 /** Clear the explicit-recovery marker immediately before a fresh Claude run. */
 export function beginRecovery(state) {
-  return { ...state, recoveryRequired: false, recoveryReason: null };
+  return {
+    ...state,
+    recoveryRequired: false,
+    recoveryReason: null,
+    // A recovered Claude session must revalidate any prior readiness.
+    readyToPublishHead: null,
+  };
 }
 
 /** Milliseconds still to wait, or 0 when the pause has elapsed. */

@@ -201,6 +201,20 @@ describe('recordImplementation', () => {
     // Kept: it is where the next audit's range starts.
     expect(next.lastAuditedHead).toBe(A);
   });
+
+  it('clears readyToPublishHead — new commit invalidates prior manual readiness', () => {
+    const manualReady = {
+      ...emptyState(),
+      implementationHead: A,
+      lastAuditedHead: A,
+      verdict: 'APPROVED',
+      readyToPublishHead: A,
+    };
+    const next = recordImplementation(manualReady, B);
+    expect(next.readyToPublishHead).toBeNull();
+    expect(next.verdict).toBeNull();
+    expect(next.implementationHead).toBe(B);
+  });
 });
 
 describe('recordAudit', () => {
@@ -282,5 +296,26 @@ describe('terminal Claude recovery', () => {
     expect(recovered.recoveryRequired).toBe(false);
     expect(recovered.recoveryReason).toBeNull();
     expect(recovered.claudeSessionId).toBeNull();
+  });
+
+  it('clears readyToPublishHead in both recovery transitions', () => {
+    const before = {
+      ...emptyState(),
+      task: '5',
+      branch: 'agent/task-5',
+      verdict: 'APPROVED',
+      readyToPublishHead: A,
+      claudeSessionId: '11111111-2222-3333-4444-555555555555',
+    };
+
+    // requireRecovery clears readiness.
+    const stopped = requireRecovery(before, 'Claude timed out');
+    expect(stopped.readyToPublishHead).toBeNull();
+    expect(stopped.recoveryRequired).toBe(true);
+
+    // beginRecovery also clears readiness.
+    const recovered = beginRecovery({ ...stopped, readyToPublishHead: A });
+    expect(recovered.readyToPublishHead).toBeNull();
+    expect(recovered.recoveryRequired).toBe(false);
   });
 });

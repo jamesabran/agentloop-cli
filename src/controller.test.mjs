@@ -47,6 +47,51 @@ describe('parseArgs refuses the base branch', () => {
   });
 });
 
+describe('parseArgs --next', () => {
+  it('parses --next', () => {
+    expect(parseArgs(['--next']).next).toBe(true);
+    expect(parseArgs([]).next).toBe(false);
+  });
+
+  it('parses --dry-run --next', () => {
+    const options = parseArgs(['--dry-run', '--next']);
+    expect(options.dryRun).toBe(true);
+    expect(options.next).toBe(true);
+  });
+
+  it('rejects --next with --task', () => {
+    expect(() => parseArgs(['--next', '--task', '5'])).toThrow(/mutually exclusive/);
+    expect(() => parseArgs(['--task', '5', '--next'])).toThrow(/mutually exclusive/);
+  });
+
+  it('rejects --next with --brief', () => {
+    expect(() => parseArgs(['--next', '--brief', 'custom.md'])).toThrow(/mutually exclusive/);
+  });
+
+  it('preserves existing --task and --brief support', () => {
+    const options = parseArgs(['--task', '3c-1', '--brief', 'docs/task.md']);
+    expect(options.task).toBe('3c-1');
+    expect(options.brief).toBe('docs/task.md');
+    expect(options.next).toBe(false);
+  });
+
+  it('preserves --self-check', () => {
+    expect(parseArgs(['--self-check']).selfCheck).toBe(true);
+  });
+
+  it('accepts --task with "." in the id', () => {
+    expect(parseArgs(['--task', 'bad.id']).task).toBe('bad.id');
+  });
+
+  it('accepts --task with "/" in the id', () => {
+    expect(parseArgs(['--task', 'x/y']).task).toBe('x/y');
+  });
+
+  it('rejects --task with ".." traversal in the id', () => {
+    expect(() => parseArgs(['--task', 'x/../../escaped'])).toThrow(/not a valid task identifier/);
+  });
+});
+
 describe('Claude process and Codex handoff gates', () => {
   it('permits only one Claude process in a controller invocation', () => {
     const context = { claudeProcessesStarted: 0 };

@@ -26,10 +26,15 @@ import { pathToFileURL } from 'node:url';
 import {
   AGENT_DIR,
   BASE_BRANCH,
+  DETERMINISTIC_CHECKS,
   LIMITS,
   MAX_CHANGE_ROUNDS,
+  PUBLISH_MODE,
+  REMOTE,
   REPO,
   REPORT_FILE,
+  REPO_ROOT,
+  TASKS_FILE_RELATIVE,
 } from './lib/config.mjs';
 import { runClaude, streamClaudeProgress } from './lib/claude-agent.mjs';
 import { runCodexAudit } from './lib/codex-agent.mjs';
@@ -37,6 +42,7 @@ import { classifyAuditOutcome } from './lib/audit.mjs';
 import { failureExcerpt, runChecks, summariseChecks } from './lib/checks.mjs';
 import { checkAuth, getIssue } from './lib/github.mjs';
 import {
+  assertRemoteMatchesRepo,
   commitsIn,
   currentBranch,
   ensureBranch,
@@ -68,13 +74,27 @@ import {
   selectTask,
 } from './lib/state.mjs';
 import { readStatus } from './lib/status-block.mjs';
+import {
+  dependencyStatuses,
+  encodeCacheKey,
+  findTask,
+  generateTaskBrief,
+  isLegacySafeTaskId,
+  isValidTaskId,
+  loadTaskFile,
+  resolveTaskFilePath,
+  selectNextTask,
+  validateTaskFile,
+} from './lib/tasks.mjs';
 
 const USAGE = `AgentLoop workflow controller — local implement-and-review loop
 
   agentloop --task <id> [options]
+  agentloop --next [--dry-run]
 
 Options:
   --task <id>       Task or issue identifier to work on (required the first time)
+  --next            Select the next task from agentloop.tasks.json deterministically
   --brief <file>    Task description to use instead of reading the issue
   --branch <name>   Local working branch (default: agent/task-<id>)
   --dry-run         Report the next local step, change nothing
@@ -82,6 +102,9 @@ Options:
   --self-check      Offline demonstration of the loop; no agents, no network
   --verbose         Include debug logging
   --help            Show this message
+
+Task selection with --next is deterministic and auditable: the controller owns
+the decision; Claude and Codex never choose which task comes next.
 
 Local state, logs, audit reports, and the final report live in .agent/.
 That directory is gitignored and never contains credentials.
@@ -93,6 +116,7 @@ export function parseArgs(argv) {
     brief: null,
     branch: null,
     dryRun: false,
+    next: false,
     selfCheck: false,
     recover: false,
     verbose: false,
@@ -104,6 +128,9 @@ export function parseArgs(argv) {
     switch (arg) {
       case '--dry-run':
         options.dryRun = true;
+        break;
+      case '--next':
+        options.next = true;
         break;
       case '--self-check':
         options.selfCheck = true;
@@ -135,7 +162,17 @@ export function parseArgs(argv) {
     }
   }
 
-  if (options.task !== null && !/^#?[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/.test(options.task)) {
+  // --next conflicts with explicit --task and --brief
+  if (options.next) {
+    if (options.task !== null) {
+      throw new Error('--next and --task are mutually exclusive. Use --next to select the next task deterministically, or --task <id> to work on a specific task.');
+    }
+    if (options.brief !== null) {
+      throw new Error('--next and --brief are mutually exclusive. A custom brief is only valid with an explicitly supplied --task.');
+    }
+  }
+
+  if (options.task !== null && !isValidTaskId(options.task.replace(/^#/, ''))) {
     throw new Error(`--task ${JSON.stringify(options.task)} is not a valid task identifier.`);
   }
   if (options.task) options.task = options.task.replace(/^#/, '');
@@ -193,8 +230,8 @@ class LoopStopped extends Error {}
  * is the one time the loop touches GitHub before publishing, and it is a read:
  * the issue is never labelled, commented on, or closed.
  */
-async function resolveBrief({ task, options }) {
-  const cache = path.join(AGENT_DIR, `brief-${task}.md`);
+async function resolveBrief({ task, options, generatedBrief }) {
+  const cache = path.join(AGENT_DIR, `brief-${encodeCacheKey(task)}.md`);
 
   // Cached on first resolution so later rounds — which may be separate
   // invocations, days apart — need neither the flag nor the network again.
@@ -204,6 +241,14 @@ async function resolveBrief({ task, options }) {
     fs.writeFileSync(cache, brief, 'utf8');
   };
 
+  // A generated brief from --next / the committed task file takes highest
+  // precedence. Cache it for resume, but the committed file is the durable
+  // source of truth.
+  if (generatedBrief !== undefined && generatedBrief !== null) {
+    remember(generatedBrief);
+    return { brief: generatedBrief, source: 'generated from committed task file' };
+  }
+
   if (options.brief) {
     const brief = fs.readFileSync(options.brief, 'utf8');
     remember(brief);
@@ -212,6 +257,35 @@ async function resolveBrief({ task, options }) {
 
   if (fs.existsSync(cache)) {
     return { brief: fs.readFileSync(cache, 'utf8'), source: cache };
+  }
+
+  // Legacy cache fallback: before the encoding changed to fixed-width
+  // hex, cache files for simple alphanumeric-dash IDs were written
+  // directly as `brief-<id>.md`. When the canonical file is missing
+  // and the task ID is in the legacy-safe subset, check for an
+  // exact-case directory entry and migrate atomically.
+  if (isLegacySafeTaskId(task)) {
+    var legacyName = 'brief-' + task + '.md';
+    var exactMatch = false;
+    try {
+      var dirEntries = fs.readdirSync(AGENT_DIR);
+      for (var di = 0; di < dirEntries.length; di++) {
+        if (dirEntries[di] === legacyName) { exactMatch = true; break; }
+      }
+    } catch (dirErr) {
+      if (dirErr.code !== 'ENOENT') throw dirErr;
+    }
+    if (exactMatch) {
+      var legacyPath = path.join(AGENT_DIR, legacyName);
+      var legacyBrief = fs.readFileSync(legacyPath, 'utf8');
+      if (!options.dryRun) {
+        var result = migrateLegacyCache(cache, legacyBrief);
+        if (!result.migrated) {
+          return { brief: result.canonical, source: cache };
+        }
+      }
+      return { brief: legacyBrief, source: legacyPath + ' (migrated to canonical)' };
+    }
   }
 
   if (!/^\d+$/.test(task)) {
@@ -532,10 +606,59 @@ export function isValidNoChangeHandoff({ status, head, treeClean }) {
   );
 }
 
-/** Push the approved branch. The only network write the loop performs. */
-async function runPublishStep({ context, options }) {
+/**
+ * Atomically write legacy brief content to the canonical cache path.
+ *
+ * Uses exclusive creation (`wx` flag) so a canonical file created by
+ * another process is never overwritten. On `EEXIST` the canonical
+ * content is read and returned instead.
+ *
+ * The optional `opts.writeFile` parameter is a test seam: tests can
+ * inject a function that intercepts the `writeFileSync` call for the
+ * canonical cache path, creates the file with distinct content, and
+ * throws `EEXIST` — deterministically exercising the race handler.
+ *
+ * @param {string} cache - canonical cache file path
+ * @param {string} content - legacy brief content to migrate
+ * @param {object} [opts]
+ * @param {Function} [opts.writeFile] - injectable writeFileSync (test seam)
+ * @returns {{ migrated: true } | { migrated: false, canonical: string }}
+ */
+export function migrateLegacyCache(cache, content, opts) {
+  var _opts = opts || {};
+  var writeFn = _opts.writeFile || fs.writeFileSync;
+  try {
+    fs.mkdirSync(path.dirname(cache), { recursive: true });
+    writeFn(cache, content, { flag: 'wx' });
+    return { migrated: true };
+  } catch (writeErr) {
+    if (writeErr.code === 'EEXIST') {
+      return { migrated: false, canonical: fs.readFileSync(cache, 'utf8') };
+    }
+    throw writeErr;
+  }
+}
+
+/**
+ * Push the approved branch, or report it ready when publish mode is manual.
+ *
+ * The optional `_git` parameter is a test seam: tests inject mock
+ * implementations of the git helpers (`headCommit`, `workingTreeStatus`,
+ * `assertRemoteMatchesRepo`, `publishBranch`, `checkAuth`) so the full
+ * publish control flow can be exercised without real git operations.
+ *
+ * @param {{ context: object, options: object, _git?: object }} input
+ */
+export async function runPublishStep({ context, options, _git }) {
+  const g = _git || {};
+  const hc = g.headCommit || headCommit;
+  const wts = g.workingTreeStatus || workingTreeStatus;
+  const armr = g.assertRemoteMatchesRepo || assertRemoteMatchesRepo;
+  const pb = g.publishBranch || publishBranch;
+  const ca = g.checkAuth || checkAuth;
+
   const { state } = context;
-  const head = await headCommit();
+  const head = await hc();
 
   // decideLocal already established these; re-checking here is what makes the
   // push itself safe to read in isolation.
@@ -546,7 +669,7 @@ async function runPublishStep({ context, options }) {
     );
   }
 
-  const tree = await workingTreeStatus();
+  const tree = await wts();
   if (!tree.clean) {
     throw new LoopStopped(
       `Refusing to publish: the working tree has ${tree.changes.length} uncommitted change(s), ` +
@@ -555,15 +678,42 @@ async function runPublishStep({ context, options }) {
   }
 
   if (options.dryRun) {
-    log.info(`[dry-run] would push ${short(head)} to ${state.branch}`);
+    log.info(
+      `[dry-run] ${PUBLISH_MODE === 'auto' ? 'would push' : 'would report ready for manual publishing'} ` +
+        `${short(head)} on ${state.branch}`,
+    );
     return { continue: false, stopReason: 'Dry run: nothing was pushed.' };
   }
 
-  await checkAuth();
-  log.info(`Publishing approved commit ${short(head)} to ${state.branch}…`);
-  await publishBranch({ branch: state.branch, head });
+  if (PUBLISH_MODE === 'manual') {
+    // Re-validate the live remote against the pinned repository before
+    // reporting readiness — the same check auto mode runs before pushing.
+    await armr();
+    context.state = clearFailures({ ...context.state, readyToPublishHead: head });
+    log.info(
+      `Commit ${head} on ${state.branch} was approved and passed all publication gates. ` +
+        'Publish mode is manual — push this branch when you are ready.',
+    );
+    log.info(`  Branch:  ${state.branch}`);
+    log.info(`  Remote:  ${REMOTE}`);
+    log.info(`  Repo:    ${REPO}`);
+    log.info('  Nothing has been pushed.');
+    log.info(
+      '  Safe manual action:\n' +
+        `    git push ${REMOTE} ${head}:refs/heads/${state.branch}`,
+    );
+    log.info(
+      'Open a pull request for this branch if you want one merged; ' +
+        'the controller does not open, update, merge, or close one.',
+    );
+    return { continue: false, stopReason: 'Manual publish mode — the branch is ready for you to push.' };
+  }
 
-  context.state = clearFailures({ ...context.state, publishedHead: head });
+  await ca();
+  log.info(`Publishing approved commit ${short(head)} to ${state.branch}…`);
+  await pb({ branch: state.branch, head });
+
+  context.state = clearFailures({ ...context.state, publishedHead: head, readyToPublishHead: null });
   log.info(
     `Published. Open a pull request for ${state.branch} when you want it reviewed for merge; ` +
       'the controller does not open, update, merge, or close one.',
@@ -594,7 +744,7 @@ function afterFailedStep(context, step, reason) {
  * ------------------------------------------------------------------ */
 
 function auditReportPath(state, round) {
-  return path.join(AGENT_DIR, `audit-${state.task}-round-${round}.md`);
+  return path.join(AGENT_DIR, `audit-${encodeCacheKey(state.task)}-round-${round}.md`);
 }
 
 function writeAuditReport(state, round, text) {
@@ -618,6 +768,168 @@ function readAuditReport(state) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Next-task resolution                                                *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Resolve the next task from the committed task file when `--next` is used.
+ *
+ * Validates the entire task file before any branch or state mutation, then
+ * either resumes the active runtime task or selects the next one
+ * deterministically from the validated file.
+ *
+ * @param {{ loaded: object, options: object }} input
+ * @returns {{ task: string, generatedBrief: string }}
+ */
+function resolveNextTask({ loaded, options }) {
+  const tasksFilePath = resolveTaskFilePath(TASKS_FILE_RELATIVE, REPO_ROOT);
+
+  if (options.dryRun) {
+    log.info(`Task file: ${tasksFilePath}`);
+  }
+
+  const taskData = loadTaskFile(tasksFilePath);
+  const validated = validateTaskFile(taskData, tasksFilePath);
+  const tasks = validated.tasks;
+  const taskMap = new Map(tasks.map((t) => [t.id, t]));
+
+  // Active-task resume: when valid runtime state already identifies an
+  // active task, resume it through the existing recovery/resume rules.
+  // Do not silently replace it with a newly selected task.
+  const activeTaskId = loaded.task;
+  const activeTask = activeTaskId ? findTask(tasks, activeTaskId) : null;
+
+  // When saved state references a task that no longer exists in the
+  // committed roadmap, fail clearly. Silently selecting a different task
+  // would discard the existing review/recovery state without the owner
+  // ever knowing the active task went missing.
+  if (activeTaskId && !activeTask) {
+    throw new Error(
+      `Saved active task ${JSON.stringify(activeTaskId)} was not found in ${tasksFilePath}. ` +
+        'The task may have been removed, renamed, or the wrong task file is configured. ' +
+        'Review the task file and either restore the missing task or remove .agent/state.json ' +
+        'to start fresh.',
+    );
+  }
+
+  if (activeTaskId && activeTask) {
+    // Completed tasks must not resume. Blocked tasks must not resume —
+    // they are deferred or genuinely blocked in the roadmap.
+    if (activeTask.status === 'completed') {
+      // Fall through to new-task selection below (completed tasks should
+      // not be the active task, but if state was hand-edited, don't resume).
+    } else if (activeTask.status === 'blocked') {
+      throw new Error(
+        `Saved active task ${JSON.stringify(activeTaskId)} ("${activeTask.title}") ` +
+          `is blocked in ${tasksFilePath}. ` +
+          'It cannot be resumed. Review the task file and either unblock the task ' +
+          'or remove .agent/state.json to clear the saved state.',
+      );
+    } else {
+      // Verify the active task still exists in the committed task file and
+      // has an eligible status.
+      if (options.dryRun) {
+        log.info(
+          `Resuming active task: ${JSON.stringify(activeTaskId)} ("${activeTask.title}") ` +
+            `(status: ${activeTask.status})`,
+        );
+        log.info('  This is a resume, not a new selection — runtime state identifies an active task.');
+      } else {
+        log.info(
+          `Resuming active task ${JSON.stringify(activeTaskId)} ("${activeTask.title}") ` +
+            'from saved runtime state.',
+        );
+      }
+
+      const deps = dependencyStatuses(activeTask, taskMap);
+      const brief = generateTaskBrief(
+        activeTask,
+        deps,
+        DETERMINISTIC_CHECKS,
+        MAX_CHANGE_ROUNDS,
+      );
+
+      if (options.dryRun) {
+        logDryRunNext({
+          task: activeTask,
+          deps,
+          tasksFilePath,
+          branch: options.branch ?? loaded.branch ?? defaultBranch(activeTaskId),
+          isResume: true,
+        });
+      }
+
+      return { task: activeTaskId, generatedBrief: brief };
+    }
+  }
+
+  // No resumable active task — select the next task deterministically.
+  const selection = selectNextTask(tasks);
+  const nextTask = selection.task;
+
+  if (options.dryRun) {
+    log.info(
+      `Selecting next task: ${JSON.stringify(nextTask.id)} ("${nextTask.title}")`,
+    );
+    log.info(`  Reason: ${selection.reason}`);
+  } else {
+    log.info(
+      `Selected next task: ${JSON.stringify(nextTask.id)} ("${nextTask.title}")`,
+    );
+    log.info(`  ${selection.reason}`);
+  }
+
+  const deps = dependencyStatuses(nextTask, taskMap);
+  const brief = generateTaskBrief(
+    nextTask,
+    deps,
+    DETERMINISTIC_CHECKS,
+    MAX_CHANGE_ROUNDS,
+  );
+
+  if (options.dryRun) {
+    logDryRunNext({
+      task: nextTask,
+      deps,
+      tasksFilePath,
+      branch: options.branch ?? defaultBranch(nextTask.id),
+      isResume: false,
+    });
+  }
+
+  return { task: nextTask.id, generatedBrief: brief };
+}
+
+/**
+ * Show detailed dry-run information for `--dry-run --next`.
+ *
+ * Dry-run must not create branches, switch branches, write files, create
+ * `.agent/`, modify runtime state, invoke Claude, or invoke Codex.
+ */
+function logDryRunNext({ task, deps, tasksFilePath, branch, isResume }) {
+  log.info(`  Task ID: ${task.id}`);
+  log.info(`  Title: ${task.title}`);
+  log.info(`  Status: ${task.status}`);
+  log.info(`  Goal: ${task.goal}`);
+
+  if (deps.length > 0) {
+    log.info('  Dependencies:');
+    for (const dep of deps) {
+      log.info(`    - ${dep.id}: ${dep.status}`);
+    }
+  } else {
+    log.info('  Dependencies: none');
+  }
+
+  log.info(`  Branch: ${branch}`);
+  log.info(`  Checks: ${DETERMINISTIC_CHECKS.map((c) => c.name).join(', ')}`);
+  log.info(`  Max correction rounds: ${MAX_CHANGE_ROUNDS}`);
+  log.info('  Brief: generated from the committed task file');
+  log.info(`  Selection: ${isResume ? 'resuming active task' : 'new task selected deterministically'}`);
+  log.info(`  Task file: ${tasksFilePath}`);
+}
+
+/* ------------------------------------------------------------------ *
  * Run                                                                 *
  * ------------------------------------------------------------------ */
 
@@ -631,11 +943,31 @@ async function runLoop(options) {
     );
   }
 
-  const task = options.task ?? loaded.task;
+  let task;
+  let generatedBrief = null;
+
+  if (options.next) {
+    const result = resolveNextTask({ loaded, options });
+    task = result.task;
+    generatedBrief = result.generatedBrief;
+  } else {
+    task = options.task ?? loaded.task;
+    // `options.task` is already validated by parseArgs. `loaded.task`
+    // comes from a hand-editable state file and must be re-checked here
+    // because it bypasses the CLI guard.
+    if (task && options.task === null && !isValidTaskId(task)) {
+      log.error(
+        `Saved task identifier ${JSON.stringify(task)} is not a valid task identifier. ` +
+          'It may need repair in .agent/state.json, or select a task explicitly with --task or --next.',
+      );
+      return { stopReason: `Invalid saved task identifier: ${JSON.stringify(task)}.`, stopped: true };
+    }
+  }
+
   if (!task) {
     // Nothing has been selected, so there is no state to report against and
     // nothing to resume. This is a usage problem, not a stopped task.
-    log.info('No task selected and none saved in .agent/. Pass --task <id>.');
+    log.info('No task selected and none saved in .agent/. Pass --task <id> or --next.');
     return { stopReason: 'No task selected.', usage: !options.dryRun };
   }
 
@@ -675,7 +1007,7 @@ async function runLoop(options) {
   // are what the owner picks the task back up from, so they are written on
   // every path out of the loop.
   try {
-    const resolved = await resolveBrief({ task, options });
+    const resolved = await resolveBrief({ task, options, generatedBrief });
     context.brief = resolved.brief;
     log.debug(`Task brief from ${resolved.source}.`);
 
@@ -689,7 +1021,7 @@ async function runLoop(options) {
 
     for (let step = 0; step < LIMITS.maxStepsPerRun; step += 1) {
       const head = await headCommit();
-      decision = decideLocal({ state: context.state, head });
+      decision = decideLocal({ state: context.state, head, publishMode: PUBLISH_MODE });
 
       log.state({
         'Live HEAD': short(head) ?? '(none)',

@@ -145,9 +145,13 @@ describe('recoverCliArgs — --recover recovery', () => {
   });
 });
 
-describe('recoverCliArgs — the other boolean options (--dry-run, --self-check, --verbose, --help)', () => {
+describe('recoverCliArgs — the other boolean options (--dry-run, --next, --self-check, --verbose, --help)', () => {
   it('recovers --dry-run from its boolean config', () => {
     expect(recoverCliArgs([], { npm_config_dry_run: 'true' })).toEqual(['--dry-run']);
+  });
+
+  it('recovers --next from its boolean config', () => {
+    expect(recoverCliArgs([], { npm_config_next: 'true' })).toEqual(['--next']);
   });
 
   it('recovers --self-check from its boolean config', () => {
@@ -160,6 +164,15 @@ describe('recoverCliArgs — the other boolean options (--dry-run, --self-check,
 
   it('recovers --help from its boolean config', () => {
     expect(recoverCliArgs([], { npm_config_help: 'true' })).toEqual(['--help']);
+  });
+
+  it('recovers --dry-run --next together', () => {
+    expect(
+      recoverCliArgs([], {
+        npm_config_dry_run: 'true',
+        npm_config_next: 'true',
+      }),
+    ).toEqual(['--dry-run', '--next']);
   });
 
   it('recovers every boolean option together, alongside task and branch', () => {
@@ -190,6 +203,7 @@ describe('recoverCliArgs — boolean environment values are parsed strictly', ()
   // produces — must not enable the option.
   const boolean = [
     ['--dry-run', 'npm_config_dry_run'],
+    ['--next', 'npm_config_next'],
     ['--recover', 'npm_config_recover'],
     ['--self-check', 'npm_config_self_check'],
     ['--verbose', 'npm_config_verbose'],

@@ -162,6 +162,22 @@ export const STATE_FILE = path.join(AGENT_DIR, 'state.json');
 export const LOG_DIR = path.join(AGENT_DIR, 'logs');
 export const REPORT_FILE = path.join(AGENT_DIR, 'report.md');
 
+/**
+ * Committed task-file path, relative to the repository root.
+ *
+ * The file is durable planning data, committed alongside the code. `.agent/`
+ * remains disposable, gitignored runtime state.
+ *
+ * Default: `agentloop.tasks.json`. An `agentloop.config.json` may override it
+ * with a `tasksFile` relative path; absolute paths and paths that traverse
+ * outside the repository are rejected at resolution time (see
+ * `resolveTaskFilePath` in lib/tasks.mjs).
+ */
+export const TASKS_FILE_RELATIVE =
+  typeof PROJECT_CONFIG.tasksFile === 'string' && PROJECT_CONFIG.tasksFile.trim() !== ''
+    ? PROJECT_CONFIG.tasksFile.trim()
+    : 'agentloop.tasks.json';
+
 const DEFAULT_CHECKS = Object.freeze([
   Object.freeze({ name: 'typecheck', script: 'typecheck' }),
   Object.freeze({ name: 'lint', script: 'lint' }),
@@ -230,6 +246,32 @@ export const MAX_CHANGE_ROUNDS = Number(
   process.env.AGENTLOOP_MAX_CHANGE_ROUNDS ??
     (Number.isInteger(PROJECT_CONFIG.maxChangeRounds) ? PROJECT_CONFIG.maxChangeRounds : 2),
 );
+
+/**
+ * Publishing behaviour for approved commits.
+ *
+ * `"manual"` (the default) means the controller stops before pushing —
+ * the owner inspects and pushes the approved branch themselves.
+ * `"auto"` means the controller pushes the branch immediately after
+ * Codex approves the commit that is still HEAD.
+ *
+ * Configurable via `publishMode` in `agentloop.config.json` or the
+ * `AGENTLOOP_PUBLISH_MODE` environment variable. An unrecognised value
+ * raises an error at startup rather than silently defaulting.
+ *
+ * @type {'manual' | 'auto'}
+ */
+export const PUBLISH_MODE = validatePublishMode(
+  process.env.AGENTLOOP_PUBLISH_MODE ?? PROJECT_CONFIG.publishMode,
+);
+
+function validatePublishMode(value) {
+  if (value === undefined || value === null) return 'manual';
+  if (value === 'manual' || value === 'auto') return value;
+  throw new Error(
+    `Invalid publish mode ${JSON.stringify(value)}. Valid values are "manual" and "auto".`,
+  );
+}
 
 const CLAUDE_CONFIG = PROJECT_CONFIG.claude ?? {};
 
