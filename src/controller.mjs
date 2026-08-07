@@ -97,6 +97,8 @@ Options:
   --next            Select the next task from agentloop.tasks.json deterministically
   --brief <file>    Task description to use instead of reading the issue
   --branch <name>   Local working branch (default: agent/task-<id>)
+  --push-mode <mode> Publish mode: "manual" (default) or "auto". Overrides
+                     AGENTLOOP_PUBLISH_MODE and publishMode in config.
   --dry-run         Report the next local step, change nothing
   --recover         Explicitly clear a terminal Claude failure and start a new session
   --self-check      Offline demonstration of the loop; no agents, no network
@@ -115,6 +117,7 @@ export function parseArgs(argv) {
     task: null,
     brief: null,
     branch: null,
+    pushMode: null,
     dryRun: false,
     next: false,
     selfCheck: false,
@@ -156,6 +159,18 @@ export function parseArgs(argv) {
       case '--branch':
         options.branch = argv[i + 1] ?? null;
         i += 1;
+        break;
+      case '--push-mode':
+        {
+          const raw = argv[i + 1] ?? null;
+          i += 1;
+          if (raw !== 'manual' && raw !== 'auto') {
+            throw new Error(
+              `--push-mode must be "manual" or "auto", got ${JSON.stringify(raw)}.`,
+            );
+          }
+          options.pushMode = raw;
+        }
         break;
       default:
         throw new Error(`Unknown option: ${arg}`);
@@ -649,7 +664,7 @@ export function migrateLegacyCache(cache, content, opts) {
  *
  * @param {{ context: object, options: object, _git?: object }} input
  */
-export async function runPublishStep({ context, options, _git }) {
+export async function runPublishStep({ context, options, _git, pushMode = PUBLISH_MODE }) {
   const g = _git || {};
   const hc = g.headCommit || headCommit;
   const wts = g.workingTreeStatus || workingTreeStatus;
@@ -679,13 +694,13 @@ export async function runPublishStep({ context, options, _git }) {
 
   if (options.dryRun) {
     log.info(
-      `[dry-run] ${PUBLISH_MODE === 'auto' ? 'would push' : 'would report ready for manual publishing'} ` +
+      `[dry-run] ${pushMode === 'auto' ? 'would push' : 'would report ready for manual publishing'} ` +
         `${short(head)} on ${state.branch}`,
     );
     return { continue: false, stopReason: 'Dry run: nothing was pushed.' };
   }
 
-  if (PUBLISH_MODE === 'manual') {
+  if (pushMode === 'manual') {
     // Re-validate the live remote against the pinned repository before
     // reporting readiness — the same check auto mode runs before pushing.
     await armr();
@@ -933,6 +948,16 @@ function logDryRunNext({ task, deps, tasksFilePath, branch, isResume }) {
  * Run                                                                 *
  * ------------------------------------------------------------------ */
 
+/**
+ * Resolve the effective push mode for this invocation.
+ *
+ * CLI --push-mode > AGENTLOOP_PUBLISH_MODE > agentloop.config.json publishMode > 'manual'.
+ */
+function resolvePushMode(options) {
+  if (options.pushMode !== null) return options.pushMode;
+  return PUBLISH_MODE;
+}
+
 async function runLoop(options) {
   const loaded = loadState();
 
@@ -945,6 +970,7 @@ async function runLoop(options) {
 
   let task;
   let generatedBrief = null;
+  const pushMode = resolvePushMode(options);
 
   if (options.next) {
     const result = resolveNextTask({ loaded, options });
@@ -1021,7 +1047,7 @@ async function runLoop(options) {
 
     for (let step = 0; step < LIMITS.maxStepsPerRun; step += 1) {
       const head = await headCommit();
-      decision = decideLocal({ state: context.state, head, publishMode: PUBLISH_MODE });
+      decision = decideLocal({ state: context.state, head, publishMode: pushMode });
 
       log.state({
         'Live HEAD': short(head) ?? '(none)',
@@ -1043,7 +1069,7 @@ async function runLoop(options) {
           outcome = await runAuditStep({ context, options });
           break;
         case ACTIONS.PUBLISH:
-          outcome = await runPublishStep({ context, options });
+          outcome = await runPublishStep({ context, options, pushMode });
           break;
         case ACTIONS.DONE:
         case ACTIONS.STOP:

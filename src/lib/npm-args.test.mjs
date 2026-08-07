@@ -69,6 +69,14 @@ describe('recoverCliArgs — brief recovery', () => {
     ]);
   });
 
+  it('recovers --push-mode from npm boolean config', () => {
+    expect(
+      recoverCliArgs(['--task', '5', 'manual'], {
+        npm_config_push_mode: 'true',
+      }),
+    ).toEqual(['--task', '5', '--push-mode', 'manual']);
+  });
+
   it('recovers task, brief, and branch together, in the documented order', () => {
     // The documented invocation is `--task <id> --brief <file> --branch
     // <name>`; the surviving bare values are claimed in that same order,

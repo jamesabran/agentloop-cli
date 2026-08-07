@@ -52,6 +52,7 @@ const VALUE_OPTIONS = [
   { flag: '--task', configKey: 'npm_config_task' },
   { flag: '--brief', configKey: 'npm_config_brief' },
   { flag: '--branch', configKey: 'npm_config_branch' },
+  { flag: '--push-mode', configKey: 'npm_config_push_mode' },
 ];
 
 /** Options that take no value — bare flags, recovered only from an exact `'true'`. */

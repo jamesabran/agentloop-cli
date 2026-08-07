@@ -998,6 +998,88 @@ describe('runPublishStep — manual command output', () => {
   });
 });
 
+describe('runPublishStep — CLI push-mode override', () => {
+  it('manual mode via parameter sets readyToPublishHead without pushing', async () => {
+    var pushCalled = false;
+    var ctx = publishContext();
+    var mocks = publishMocks({
+      publishBranch: async () => { pushCalled = true; },
+    });
+
+    await runPublishStep({ context: ctx, options: { dryRun: false }, _git: mocks, pushMode: 'manual' });
+
+    expect(pushCalled).toBe(false);
+    expect(ctx.state.readyToPublishHead).toBe(HEAD);
+    expect(ctx.state.publishedHead).toBeNull();
+  });
+
+  it('auto mode via parameter pushes and sets publishedHead', async () => {
+    var pushCalled = false;
+    var pushArg = null;
+    var ctx = publishContext();
+    var mocks = publishMocks({
+      publishBranch: async (arg) => { pushCalled = true; pushArg = arg; },
+    });
+
+    await runPublishStep({ context: ctx, options: { dryRun: false }, _git: mocks, pushMode: 'auto' });
+
+    expect(pushCalled).toBe(true);
+    expect(pushArg).toEqual({ branch: BRANCH, head: HEAD });
+    expect(ctx.state.publishedHead).toBe(HEAD);
+    expect(ctx.state.readyToPublishHead).toBeNull();
+  });
+
+  it('auto mode parameter overrides a manual PUBLISH_MODE env var', async () => {
+    // The parameter is passed explicitly as 'auto', so the module-level
+    // PUBLISH_MODE (which might be 'manual') is never consulted.
+    var pushCalled = false;
+    var ctx = publishContext();
+    var mocks = publishMocks({
+      publishBranch: async () => { pushCalled = true; },
+    });
+
+    await runPublishStep({ context: ctx, options: { dryRun: false }, _git: mocks, pushMode: 'auto' });
+
+    expect(pushCalled).toBe(true);
+    expect(ctx.state.publishedHead).toBe(HEAD);
+  });
+
+  it('omitting pushMode parameter falls back to module-level PUBLISH_MODE', async () => {
+    // Without pushMode parameter, the default = PUBLISH_MODE kicks in.
+    // In the test environment PUBLISH_MODE is 'manual', so no push occurs.
+    var pushCalled = false;
+    var ctx = publishContext();
+    var mocks = publishMocks({
+      publishBranch: async () => { pushCalled = true; },
+    });
+
+    await runPublishStep({ context: ctx, options: { dryRun: false }, _git: mocks });
+
+    expect(pushCalled).toBe(false);
+    expect(ctx.state.readyToPublishHead).toBe(HEAD);
+    expect(ctx.state.publishedHead).toBeNull();
+  });
+
+  it('manual mode never executes a remote push', async () => {
+    var assertCalled = false;
+    var pushCalled = false;
+    var authCalled = false;
+    var ctx = publishContext();
+    var mocks = publishMocks({
+      assertRemoteMatchesRepo: async () => { assertCalled = true; },
+      publishBranch: async () => { pushCalled = true; },
+      checkAuth: async () => { authCalled = true; },
+    });
+
+    await runPublishStep({ context: ctx, options: { dryRun: false }, _git: mocks, pushMode: 'manual' });
+
+    // Manual mode validates remote but never pushes and never calls auth.
+    expect(assertCalled).toBe(true);
+    expect(pushCalled).toBe(false);
+    expect(authCalled).toBe(false);
+  });
+});
+
 describe('runPublishStep — auto mode via child process', () => {
   it('validates remote through publishBranch, pushes the approved head, persists publishedHead and clears readyToPublishHead', () => {
     var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-auto-'));

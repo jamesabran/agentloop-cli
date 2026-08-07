@@ -92,6 +92,46 @@ describe('parseArgs --next', () => {
   });
 });
 
+describe('parseArgs --push-mode', () => {
+  it('parses --push-mode manual', () => {
+    const options = parseArgs(['--task', '5', '--push-mode', 'manual']);
+    expect(options.pushMode).toBe('manual');
+  });
+
+  it('parses --push-mode auto', () => {
+    const options = parseArgs(['--task', '5', '--push-mode', 'auto']);
+    expect(options.pushMode).toBe('auto');
+  });
+
+  it('defaults pushMode to null when not specified', () => {
+    const options = parseArgs(['--task', '5']);
+    expect(options.pushMode).toBeNull();
+  });
+
+  it('rejects an invalid push mode value', () => {
+    expect(() => parseArgs(['--task', '5', '--push-mode', 'on-approval']))
+      .toThrow(/"manual" or "auto"/);
+  });
+
+  it('rejects --push-mode with a missing value (end of argv)', () => {
+    expect(() => parseArgs(['--task', '5', '--push-mode']))
+      .toThrow(/"manual" or "auto"/);
+  });
+
+  it('accepts --push-mode auto with --next', () => {
+    const options = parseArgs(['--next', '--push-mode', 'auto']);
+    expect(options.pushMode).toBe('auto');
+    expect(options.next).toBe(true);
+  });
+
+  it('accepts --push-mode manual with --dry-run --next', () => {
+    const options = parseArgs(['--dry-run', '--next', '--push-mode', 'manual']);
+    expect(options.pushMode).toBe('manual');
+    expect(options.next).toBe(true);
+    expect(options.dryRun).toBe(true);
+  });
+});
+
 describe('Claude process and Codex handoff gates', () => {
   it('permits only one Claude process in a controller invocation', () => {
     const context = { claudeProcessesStarted: 0 };
