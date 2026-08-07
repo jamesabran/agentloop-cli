@@ -676,5 +676,7 @@ test file would be.
   a restart; the controller resumes from them.
 - Agents run under your OS user with your credentials, by design for this
   phase. Watch the first few runs.
-- Configurable manual/auto pushing of committed statuses is not yet implemented.
+- Manual publishing is the default (`--push-mode manual`); `--push-mode auto`
+  enables automatic publishing after Codex approval. Automatic committed
+  status updates in `agentloop.tasks.json` are not yet implemented.
 - No Windows service, no self-hosted runner, and no MCP support. All deferred.
