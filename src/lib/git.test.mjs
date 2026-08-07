@@ -206,7 +206,10 @@ describe('publishBranch rejects a repointed remote before any push', () => {
       + '  }));\n'
       + '}\n';
 
-    var scriptFile = path.join(os.tmpdir(), 'test-publish-branch.mjs');
+    // Place the script inside the per-test project directory so the
+    // existing tempDirs cleanup removes it automatically — no shared
+    // fixed path and no leftover file.
+    var scriptFile = path.join(project, '_publish-branch-test.mjs');
     fs.writeFileSync(scriptFile, testScript, 'utf8');
 
     var result = spawnSync(
