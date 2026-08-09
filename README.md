@@ -541,12 +541,18 @@ the commit, looping forever on a finding — not an agent trying to escape.
   is clean, and the report came from this invocation's own Claude process —
   the same conditions a new-commit handoff must meet.
 - **Claude cannot run away.** Each invocation starts at most one Claude
-  process, has a six-minute default timeout capped at fifteen minutes, streams
-  supported `stream-json` progress to the console, and kills its full Windows
-  process tree on timeout.
+  process, has a thirty-minute default timeout (configurable via
+  `AGENTLOOP_CLAUDE_TIMEOUT_MS`, capped at two hours), streams supported
+  `stream-json` progress to the console, and kills its full Windows process
+  tree on timeout. Tasks should be split based on logical scope and
+  auditability, not merely to fit the timeout; raise the ceiling deliberately
+  for larger coherent tasks rather than reaching for it by default.
 - **Claude failures require an explicit recovery.** Timeout, non-zero exit,
   usage/process-limit exhaustion, or a missing/invalid status writes the local
   report, discards the session, and requires `--recover`; no retry is implicit.
+  In interactive terminal runs, a timeout prompts whether to continue the same
+  task with a fresh timeout window before reaching the terminal failure path;
+  CI and non-interactive runs stop immediately without prompting.
 - **Deterministic checks run before Codex, and only in the controller.** The
   controller runs the configured checks itself, through `checks.mjs`, against
   Claude's committed HEAD — independently of anything Claude reports. A
@@ -614,7 +620,7 @@ All optional.
 | `AGENTLOOP_CODEX_MODEL` | CLI default | Model for audits |
 | `AGENTLOOP_CLAUDE_PERMISSION_MODE` | `acceptEdits`, or `claude.permissionMode` in config | Claude permission mode |
 | `AGENTLOOP_CLAUDE_ALLOWED_TOOLS` | see above | Claude tool allowlist |
-| `AGENTLOOP_CLAUDE_TIMEOUT_MS` | `360000` (maximum `900000`) | One Claude process wall-clock timeout |
+| `AGENTLOOP_CLAUDE_TIMEOUT_MS` | `1800000` (30 min, maximum `7200000` / 2 hr) | One Claude process wall-clock timeout. Raise for larger coherent tasks; split tasks by scope, not merely to fit the clock. |
 | `AGENTLOOP_CODEX_TIMEOUT_MS` | `1800000` | One audit turn |
 | `AGENTLOOP_CHECK_TIMEOUT_MS` | `1200000` | One deterministic check |
 | `AGENTLOOP_MAX_CHANGE_ROUNDS` | `2`, or `maxChangeRounds` in config | `REQUEST_CHANGES` rounds before stopping |

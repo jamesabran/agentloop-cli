@@ -21,6 +21,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
 import {
@@ -334,6 +335,25 @@ export function claimClaudeProcess(context) {
   return true;
 }
 
+/**
+ * Ask whether to continue after a timeout.
+ *
+ * Empty input (Enter) defaults to yes — the `[Y/n]` convention. Only used when
+ * stdin is a TTY; non-interactive runs never call this.
+ *
+ * @returns {Promise<boolean>} true to continue, false to stop
+ */
+function promptContinue() {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.question('Execution timeout reached. Continue task? [Y/n] ', (answer) => {
+      rl.close();
+      const trimmed = answer.trim().toLowerCase();
+      resolve(trimmed === '' || trimmed === 'y' || trimmed === 'yes');
+    });
+  });
+}
+
 /** A terminal Claude failure discards its session and requires --recover. */
 function stopClaudeTerminal(context, step, reason) {
   const message = `Claude ${step} failed: ${reason}. ` +
@@ -390,35 +410,53 @@ async function runClaudeStep({ decision, context, options }) {
   const before = await headCommit();
 
   log.info(`${fixing ? 'Returning Codex findings to Claude' : 'Starting Claude'} on ${state.task}…`);
-  const resume = Boolean(state.claudeSessionId);
   let outcome;
-  try {
-    outcome = await runClaude({
-      prompt,
-      sessionId: resume ? state.claudeSessionId : null,
-      resume,
-      onStdout: streamClaudeProgress((progress) => {
-        for (const line of progress.split(/\r?\n/)) {
-          if (line.trim() !== '') log.info(`Claude: ${line}`);
-        }
-      }),
-    });
-  } catch (error) {
-    stopClaudeTerminal(context, fixing ? 'fix' : 'implementation', error.message ?? 'process error');
-  }
+  for (;;) {
+    const resume = Boolean(context.state.claudeSessionId);
+    try {
+      outcome = await runClaude({
+        prompt,
+        sessionId: resume ? context.state.claudeSessionId : null,
+        resume,
+        onStdout: streamClaudeProgress((progress) => {
+          for (const line of progress.split(/\r?\n/)) {
+            if (line.trim() !== '') log.info(`Claude: ${line}`);
+          }
+        }),
+      });
+    } catch (error) {
+      stopClaudeTerminal(context, fixing ? 'fix' : 'implementation', error.message ?? 'process error');
+    }
 
-  context.state = { ...state, claudeSessionId: outcome.sessionId ?? state.claudeSessionId };
+    context.state = { ...context.state, claudeSessionId: outcome.sessionId ?? context.state.claudeSessionId };
 
-  if (outcome.usageLimited) {
-    stopClaudeTerminal(
-      context,
-      fixing ? 'fix' : 'implementation',
-      `Claude process limit exhausted (${outcome.error ?? 'usage limit reached'})`,
-    );
-  }
+    if (outcome.usageLimited) {
+      stopClaudeTerminal(
+        context,
+        fixing ? 'fix' : 'implementation',
+        `Claude process limit exhausted (${outcome.error ?? 'usage limit reached'})`,
+      );
+    }
 
-  if (!outcome.ok) {
-    stopClaudeTerminal(context, fixing ? 'fix' : 'implementation', outcome.error ?? 'non-zero process exit');
+    if (outcome.timedOut) {
+      // Non-interactive runs must remain deterministic: no prompt, no wait.
+      if (!process.stdin.isTTY) {
+        stopClaudeTerminal(context, fixing ? 'fix' : 'implementation', outcome.error);
+      }
+      log.warn(`Claude timed out after ${LIMITS.claudeTimeoutMs}ms.`);
+      const cont = await promptContinue();
+      if (!cont) {
+        stopClaudeTerminal(context, fixing ? 'fix' : 'implementation', 'User chose to stop after timeout.');
+      }
+      log.info('Continuing with a fresh timeout window…');
+      continue;
+    }
+
+    if (!outcome.ok) {
+      stopClaudeTerminal(context, fixing ? 'fix' : 'implementation', outcome.error ?? 'non-zero process exit');
+    }
+
+    break;
   }
 
   const read = readStatus(outcome.text, { role: 'CLAUDE' });

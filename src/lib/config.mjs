@@ -462,8 +462,8 @@ export const CLAUDE_ALLOWED_TOOLS = validateAllowedTools(
   process.env.AGENTLOOP_CLAUDE_ALLOWED_TOOLS,
 );
 
-const DEFAULT_CLAUDE_TIMEOUT_MS = 6 * 60 * 1000;
-const MAX_CLAUDE_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_CLAUDE_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_CLAUDE_TIMEOUT_MS = 120 * 60 * 1000;
 
 function boundedPositiveInteger(value, fallback, maximum) {
   const parsed = Number(value);
@@ -473,9 +473,17 @@ function boundedPositiveInteger(value, fallback, maximum) {
 
 export const LIMITS = Object.freeze({
   /**
-   * One Claude process gets a short wall-clock window. The ceiling is
-   * deliberate: an environment override must not turn one controller run
-   * into an unattended hours-long session.
+   * Wall-clock timeout for one Claude process.
+   *
+   * Defaults to 30 minutes — enough for a substantial implementation or fix
+   * round without forcing the owner to split a coherent task purely to satisfy
+   * an arbitrary timeout. Tasks should still be split based on logical scope
+   * and auditability, not merely to fit the clock.
+   *
+   * Configurable via `AGENTLOOP_CLAUDE_TIMEOUT_MS` (milliseconds). The ceiling
+   * exists so an environment override cannot turn one controller run into an
+   * unattended hours-long session; raise it deliberately for larger coherent
+   * tasks rather than reaching for it by default.
    */
   claudeTimeoutMs: boundedPositiveInteger(
     process.env.AGENTLOOP_CLAUDE_TIMEOUT_MS,

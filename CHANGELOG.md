@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/) —
 though it is pre-1.0, so minor versions may still include breaking changes.
 
+## [0.2.1] - 2026-08-09
+
+### Changed
+
+- **Claude execution timeout default raised from 6 minutes to 30 minutes.**
+  The safety ceiling is raised from 15 minutes to 2 hours, configurable via
+  `AGENTLOOP_CLAUDE_TIMEOUT_MS` (milliseconds). In interactive terminal runs,
+  when the timeout is reached the controller prompts whether to continue with
+  a fresh timeout window rather than immediately failing the task — the same
+  session is resumed so no work is lost. Non-interactive/CI runs stop
+  deterministically as before. Tasks should still be split based on logical
+  scope and auditability, not merely to fit the clock; raise the timeout
+  deliberately for larger coherent tasks rather than reaching for it by
+  default. The separate Codex, CLI, and check timeouts are unchanged.
+
 ## [0.2.0] - 2026-08-07
 
 ### Added

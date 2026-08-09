@@ -21,7 +21,7 @@ import {
   LIMITS,
   REPO_ROOT,
 } from './config.mjs';
-import { CommandError, npmGlobalDirs, resolveExecutable, run } from './process.mjs';
+import { npmGlobalDirs, resolveExecutable, run } from './process.mjs';
 
 let claudePath = null;
 
@@ -268,6 +268,7 @@ export function classifyClaudeOutcome({ outcome, result, text, session }) {
  * @returns {Promise<{
  *   ok: boolean, usageLimited: boolean, resumeAtMs: number|null,
  *   sessionId: string|null, text: string, raw: string, error: string|null,
+ *   timedOut?: boolean,
  * }>}
  */
 export async function runClaude({ prompt, sessionId = null, resume = false, onStdout }) {
@@ -290,7 +291,16 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
   if (classified.usageLimited) return classified;
 
   if (outcome.timedOut) {
-    throw new CommandError(`Claude timed out after ${LIMITS.claudeTimeoutMs}ms.`);
+    return {
+      ok: false,
+      usageLimited: false,
+      resumeAtMs: null,
+      sessionId: result?.session_id ?? session,
+      text,
+      raw: outcome.stdout,
+      error: `Claude timed out after ${LIMITS.claudeTimeoutMs}ms.`,
+      timedOut: true,
+    };
   }
 
   return classified;

@@ -789,15 +789,27 @@ describe('normal controller verification still works', () => {
   });
 });
 
-describe('Claude timeout is short and bounded', () => {
-  it('defaults to six minutes', () => {
+describe('Claude timeout is configurable with a safety ceiling', () => {
+  it('defaults to thirty minutes', () => {
     const dir = makeProject();
     const result = importConfigField('LIMITS', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout).claudeTimeoutMs).toBe(6 * 60 * 1000);
+    expect(JSON.parse(result.stdout).claudeTimeoutMs).toBe(30 * 60 * 1000);
   });
 
-  it('caps an oversized environment override at fifteen minutes', () => {
+  it('honours an explicit override within the ceiling', () => {
+    const dir = makeProject();
+    const result = importConfigField('LIMITS', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_TIMEOUT_MS: String(45 * 60 * 1000) }),
+    });
+    expect(result.status).toBe(0);
+    const limits = JSON.parse(result.stdout);
+    expect(limits.claudeTimeoutMs).toBe(45 * 60 * 1000);
+    expect(limits.claudeTimeoutMaxMs).toBe(120 * 60 * 1000);
+  });
+
+  it('caps an oversized environment override at the maximum', () => {
     const dir = makeProject();
     const result = importConfigField('LIMITS', {
       cwd: dir,
@@ -806,7 +818,7 @@ describe('Claude timeout is short and bounded', () => {
     expect(result.status).toBe(0);
     const limits = JSON.parse(result.stdout);
     expect(limits.claudeTimeoutMs).toBe(limits.claudeTimeoutMaxMs);
-    expect(limits.claudeTimeoutMaxMs).toBe(15 * 60 * 1000);
+    expect(limits.claudeTimeoutMaxMs).toBe(120 * 60 * 1000);
   });
 });
 
