@@ -555,15 +555,14 @@ the commit, looping forever on a finding — not an agent trying to escape.
   task with a fresh timeout window before reaching the terminal failure path;
   CI and non-interactive runs stop immediately without prompting.
 - **Interactive permission relay.** When Claude requests a tool not covered by
-  the fixed allowlist (e.g. a new Bash command), a PreToolUse hook intercepts
-  the call and the controller relays the request to the same terminal:
-  `[1] Yes — allow once`, `[2] Yes — accept reusable permission rule`, or
-  `[3] No — deny`.  The hook — a small auto-generated Node.js script — checks
-  hard-deny rules before any file IPC, so a denied request is never offered for
-  approval.  The relay is only active when the controller runs in an
-  interactive terminal; non-interactive runs deny every permission request
-  without prompting (never auto-approve).  Set `AGENTLOOP_DISABLE_PERMISSION_RELAY=1`
-  to disable the relay entirely and keep the existing auto-deny behaviour.
+  the fixed allowlist, a PreToolUse hook intercepts the call and the controller
+  relays the request to the same terminal.  A random nonce protects each
+  request/response pair so stale or pre-placed approval files cannot satisfy a
+  new request.  The hook and its settings are written to `.agent/` (gitignored)
+  and cleaned up after the Claude process exits.  The relay is only active for
+  the standard `claude` binary; when `AGENTLOOP_CLAUDE_BIN` points to
+  `claude-ds` or another binary, the hook is skipped automatically.  Set
+  `AGENTLOOP_DISABLE_PERMISSION_RELAY=1` to disable the relay entirely.
 - **Deterministic checks run before Codex, and only in the controller.** The
   controller runs the configured checks itself, through `checks.mjs`, against
   Claude's committed HEAD — independently of anything Claude reports. A

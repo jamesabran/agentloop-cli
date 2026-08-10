@@ -7,17 +7,27 @@
  *  **Hook side** — runs as a Claude Code PreToolUse hook command.  Reads the
  *    tool-call JSON from stdin, checks against ALCLI hard-deny rules and the
  *    static `--allowedTools` list, and either exits silently (tools that are
- *    already allowed) or writes a permission-request file that the controller
- *    picks up.
+ *    already allowed) or writes a nonce-protected permission-request file that
+ *    the controller picks up.
  *
  *  **Controller side** — polls `.agent/permission-request.json` while Claude
  *    runs, checks hard-deny rules (belt-and-braces), prompts the interactive
- *    user, and writes the decision back.
+ *    user, and writes a nonce-correlated decision back.
+ *
+ * Every request carries a cryptographic nonce; only a response that echoes it
+ * is accepted.  Stale or pre-placed response files are deleted before writing
+ * the request and ignored if they don't carry the matching nonce.
  *
  * Non-interactive runs never auto-approve — the controller denies every
  * request that reaches it when stdin is not a TTY.
+ *
+ * The relay is only enabled for the standard `claude` binary.  When
+ * `AGENTLOOP_CLAUDE_BIN` points to `claude-ds` or another tool, the hook
+ * settings are skipped entirely so no Claude Code-specific flags reach an
+ * unsupported binary.
  */
 
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -29,10 +39,6 @@ import { createInterface } from 'node:readline';
 /**
  * Build a canonical tool-entry string for pattern matching —
  * `ToolName(args)` or plain `ToolName`.
- *
- * @param {string} toolName
- * @param {object} toolInput
- * @returns {string}
  */
 export function buildToolEntry(toolName, toolInput) {
   if (!toolName || typeof toolName !== 'string') return null;
@@ -55,30 +61,35 @@ function toolArgs(input) {
 }
 
 /**
- * Match a tool entry against a glob-style pattern.
+ * Derive a permission rule string from a tool call for the "allow similar"
+ * option.  Returns null when no meaningful rule can be derived (empty
+ * input, wildcard-only, etc.).
+ */
+export function derivePermissionRule(toolName, toolInput) {
+  const args = toolArgs(toolInput);
+  if (!args || args.trim() === '') return null;
+  // Never offer a bare wildcard as a reusable rule.
+  if (args === '*') return null;
+  return `${toolName}(${args})`;
+}
+
+/**
+ * Match a tool entry against a glob-style permission-rule pattern.
  *
- * Pattern syntax is Claude Code's: `*` matches any sequence, anchored at both
- * ends.  The `:*` trailing suffix is equivalent to ` *` (word-boundary
- * wildcard).  Colons elsewhere are literal.
- *
- * @param {string} entry - canonical tool entry, e.g. "Bash(git push origin main)"
- * @param {string} pattern - e.g. "Bash(git push*)"
- * @returns {boolean}
+ * Pattern syntax is Claude Code's: `*` matches any sequence, anchored at
+ * both ends.  The `:*` trailing suffix is equivalent to ` *`.  A bare
+ * tool name (no parens, no glob characters) matches all uses of that tool.
  */
 export function patternMatches(entry, pattern) {
-  // Normalise trailing `:*` to ` *` (Claude Code equivalence).
-  // Bash(ls:*) matches the same commands as Bash(ls *).
   let p = pattern;
+  // Normalise trailing `:*)` or `:*` to ` *)` / ` *`.
   if (p.endsWith(':*)')) p = p.slice(0, -3) + ' *)';
   else if (p.endsWith(':*')) p = p.slice(0, -2) + ' *';
 
-  // A bare tool name — no parentheses AND no glob characters — matches all
-  // uses of that tool.  "Read" matches Read, Read(file), Read(*) etc.
-  // If the pattern has * or ?, it is a glob and falls through to globToRegex.
+  // Bare tool name (no parens AND no glob chars) matches all uses.
   if (!p.includes('(') && !p.includes('*') && !p.includes('?')) {
     const escaped = p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const re = new RegExp('^' + escaped + '(\\(.*\\))?$');
-    return re.test(entry);
+    return new RegExp('^' + escaped + '(\\(.*\\))?$').test(entry);
   }
 
   const regex = globToRegex(p);
@@ -92,65 +103,48 @@ function globToRegex(pattern) {
     switch (ch) {
       case '*': re += '.*'; break;
       case '?': re += '.'; break;
-      // Escape regex metacharacters except * and ?
       case '(': case ')': case '[': case ']':
       case '{': case '}': case '\\': case '^':
       case '$': case '.': case '|': case '+':
-      case ':':  // colon is literal in the pattern (after :* normalisation)
+      case ':':
         re += '\\' + ch;
         break;
       default:
         re += ch;
     }
   }
-  return new RegExp(`^${re}$`);
+  return new RegExp('^' + re + '$');
 }
 
 /**
  * Check whether a tool call matches any hard-deny pattern.
- *
- * @param {string} toolName
- * @param {object} toolInput
- * @param {string[]} deniedPatterns
- * @returns {{ denied: boolean, matchedPattern?: string }}
  */
 export function checkHardDeny(toolName, toolInput, deniedPatterns) {
   if (!Array.isArray(deniedPatterns) || deniedPatterns.length === 0) {
     return { denied: false };
   }
-
   const entry = buildToolEntry(toolName, toolInput);
   if (!entry) return { denied: false };
-
   for (const pattern of deniedPatterns) {
     if (patternMatches(entry, pattern)) {
       return { denied: true, matchedPattern: pattern };
     }
   }
-
   return { denied: false };
 }
 
 /**
  * Check whether a tool call is covered by the static allowlist.
- *
- * @param {string} toolName
- * @param {object} toolInput
- * @param {string[]} allowedPatterns
- * @returns {boolean}
  */
 export function isAllowedByConfig(toolName, toolInput, allowedPatterns) {
   if (!Array.isArray(allowedPatterns) || allowedPatterns.length === 0) {
     return false;
   }
-
   const entry = buildToolEntry(toolName, toolInput);
   if (!entry) return false;
-
   for (const pattern of allowedPatterns) {
     if (patternMatches(entry, pattern)) return true;
   }
-
   return false;
 }
 
@@ -161,11 +155,6 @@ export function isAllowedByConfig(toolName, toolInput, allowedPatterns) {
 const REQUEST_FILE = '.agent/permission-request.json';
 const RESPONSE_FILE = '.agent/permission-response.json';
 
-/**
- * Read the hook input from stdin and return the parsed tool-call.
- *
- * @returns {Promise<object>}
- */
 function readHookInput() {
   return new Promise((resolve) => {
     let data = '';
@@ -178,114 +167,113 @@ function readHookInput() {
   });
 }
 
-/**
- * Write a JSON permission decision to stdout.
- *
- * Exit 0 + JSON body with `permissionDecision` → Claude Code blocks/allows
- * the call.  Exit 0 + no JSON → normal permission flow (auto-approve for
- * allowed-tools, deny otherwise).
- *
- * @param {{ decision?: string, reason?: string }} opts
- */
 function writeDecision({ decision, reason } = {}) {
-  if (!decision) {
-    // No decision → normal flow (already-allowed tools take this path).
-    process.exit(0);
-  }
-
+  if (!decision) { process.exit(0); }
   const output = {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
       permissionDecision: decision,
     },
   };
-  if (reason) {
-    output.hookSpecificOutput.permissionDecisionReason = reason;
-  }
+  if (reason) output.hookSpecificOutput.permissionDecisionReason = reason;
   process.stdout.write(JSON.stringify(output), 'utf8');
   process.exit(0);
 }
 
+function randomHex(len) {
+  const bytes = new Uint8Array(len);
+  try { crypto.getRandomValues(bytes); }
+  catch { for (let i = 0; i < len; i++) bytes[i] = Math.random() * 256 | 0; }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /**
- * Entry point for the hook helper script.
+ * Entry point for the hook helper script (runHook).
  *
- * Called as `node .agent/permission-hook.mjs`.  Reads the tool call from
- * stdin, applies ALCLI hard-deny and allowlist checks, and either exits
- * silently (already-allowed tools) or requests a decision from the
- * controller via the file relay.
- *
- * @param {string} repoRoot - repository root for file paths
- * @param {string[]} denyPatterns - hard-deny patterns (comma-separated env)
- * @param {string[]} allowPatterns - static allowed tools (comma-separated env)
+ * Used both by the stand-alone generated hook and by tests.
  */
 export async function runHook({ repoRoot, denyPatterns, allowPatterns }) {
   const input = await readHookInput();
-
-  if (!input || !input.tool_name) {
-    // Malformed input — exit silently, let normal flow handle it.
-    process.exit(0);
-  }
+  if (!input || !input.tool_name) { process.exit(0); }
 
   const toolName = input.tool_name;
   const toolInput = input.tool_input ?? {};
 
-  // 1. Hard-deny check — deny immediately, no relay needed.
+  // 1. Hard-deny — deny immediately, no file IPC.
   const hardCheck = checkHardDeny(toolName, toolInput, denyPatterns);
   if (hardCheck.denied) {
-    writeDecision({ decision: 'deny', reason: `Blocked by ALCLI hard-deny rule: ${hardCheck.matchedPattern}` });
+    writeDecision({
+      decision: 'deny',
+      reason: 'Blocked by ALCLI hard-deny rule: ' + hardCheck.matchedPattern,
+    });
   }
 
-  // 2. Static allowlist check — exit silently, normal flow auto-approves.
+  // 2. Static allowlist — exit silently, normal flow auto-approves.
   if (isAllowedByConfig(toolName, toolInput, allowPatterns)) {
     writeDecision();
   }
 
-  // 3. Relay to controller via file IPC.
+  // 3. Relay to controller via nonce-protected file IPC.
   const reqPath = path.join(repoRoot, REQUEST_FILE);
   const resPath = path.join(repoRoot, RESPONSE_FILE);
+  const nonce = randomHex(16);
 
   const request = {
     tool_name: toolName,
     tool_input: toolInput,
+    nonce,
     timestamp: Date.now(),
   };
+
+  // Delete any stale response BEFORE writing our request.
+  try { fs.unlinkSync(resPath); } catch { /* ok */ }
 
   try {
     fs.mkdirSync(path.dirname(reqPath), { recursive: true });
     fs.writeFileSync(reqPath, JSON.stringify(request), 'utf8');
   } catch {
-    // Cannot write — deny.
     writeDecision({ decision: 'deny', reason: 'Permission relay unavailable.' });
   }
 
-  // Poll for response (max 5 minutes, 200ms interval).
+  // Poll for a response carrying our nonce.
   const deadline = Date.now() + 300_000;
   while (Date.now() < deadline) {
     await sleep(200);
     try {
       if (!fs.existsSync(resPath)) continue;
       const raw = fs.readFileSync(resPath, 'utf8');
-      // Clean up both files.
+      const response = JSON.parse(raw);
+
+      // Nonce must match — reject stale / forged responses.
+      if (!response.nonce || response.nonce !== nonce) {
+        try { fs.unlinkSync(resPath); } catch { /* ok */ }
+        continue;
+      }
+
+      // Claim the response by deleting both files.
       try { fs.unlinkSync(reqPath); } catch { /* ok */ }
       try { fs.unlinkSync(resPath); } catch { /* ok */ }
 
-      const response = JSON.parse(raw);
       if (response.approved) {
         writeDecision({ decision: 'allow', reason: response.reason });
       } else {
-        writeDecision({ decision: 'deny', reason: response.reason ?? 'Permission denied by user.' });
+        writeDecision({
+          decision: 'deny',
+          reason: response.reason ?? 'Permission denied by user.',
+        });
       }
     } catch {
       // File may be partially written; keep polling.
     }
   }
 
-  // Timeout — deny.
+  // Timeout — deny and clean up.
+  try { fs.unlinkSync(reqPath); } catch { /* ok */ }
   writeDecision({ decision: 'deny', reason: 'Permission relay timed out.' });
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 /* ------------------------------------------------------------------ *
@@ -294,12 +282,6 @@ function sleep(ms) {
 
 /**
  * Write the Claude Code PreToolUse hook settings file and helper script.
- *
- * @param {string} repoRoot
- * @param {{
- *   denyPatterns?: string[],
- *   allowPatterns?: string[],
- * }} config
  */
 export function writeHookSettings(repoRoot, { denyPatterns = [], allowPatterns = [] } = {}) {
   const settingsPath = path.join(repoRoot, '.agent', 'hook-settings.json');
@@ -307,12 +289,9 @@ export function writeHookSettings(repoRoot, { denyPatterns = [], allowPatterns =
 
   fs.mkdirSync(path.dirname(hookScriptPath), { recursive: true });
 
-  // Write the hook helper script with the patterns embedded at generation
-  // time.  These are static for the lifetime of the controller invocation.
   const script = generateHookScript({ repoRoot, denyPatterns, allowPatterns });
   fs.writeFileSync(hookScriptPath, script, 'utf8');
 
-  // Write the settings file that configures the PreToolUse hook.
   const settings = {
     hooks: {
       PreToolUse: [
@@ -336,22 +315,7 @@ export function writeHookSettings(repoRoot, { denyPatterns = [], allowPatterns =
 }
 
 /**
- * Generate the hook helper script content with the given config embedded.
- *
- * @param {{ repoRoot: string, denyPatterns: string[], allowPatterns: string[] }} config
- * @returns {string}
- */
-function generateHookScript({ repoRoot, denyPatterns, allowPatterns }) {
-  return HOOK_SCRIPT_TEMPLATE
-    .replace('__REPO_ROOT__', JSON.stringify(repoRoot))
-    .replace('__DENY_PATTERNS__', JSON.stringify(denyPatterns))
-    .replace('__ALLOW_PATTERNS__', JSON.stringify(allowPatterns));
-}
-
-/**
- * Clean up the hook artefacts written by `writeHookSettings`.
- *
- * @param {string} repoRoot
+ * Clean up the hook artefacts.
  */
 export function removeHookSettings(repoRoot) {
   const files = [
@@ -366,18 +330,8 @@ export function removeHookSettings(repoRoot) {
 }
 
 /**
- * Permission-request watcher result.
- *
- * @typedef {{ request: object|null, stop: boolean }} WatchResult
- */
-
-/**
- * Poll for a permission-request file.  Returns the parsed request when found,
- * or `null` when the poll interval elapsed with nothing.
- *
- * @param {string} repoRoot
- * @param {number} timeoutMs - how long to wait before returning null
- * @returns {Promise<object|null>}
+ * Poll for a permission-request file.  Returns the parsed request when
+ * found, or `null` when the poll interval elapsed with nothing.
  */
 export async function pollForRequest(repoRoot, timeoutMs = 200) {
   const reqPath = path.join(repoRoot, REQUEST_FILE);
@@ -389,9 +343,7 @@ export async function pollForRequest(repoRoot, timeoutMs = 200) {
         const raw = fs.readFileSync(reqPath, 'utf8');
         return JSON.parse(raw);
       }
-    } catch {
-      // File appeared but isn't readable yet.
-    }
+    } catch { /* file not ready yet */ }
     await sleep(50);
   }
 
@@ -399,22 +351,20 @@ export async function pollForRequest(repoRoot, timeoutMs = 200) {
 }
 
 /**
- * Write a permission-response file.
- *
- * @param {string} repoRoot
- * @param {{ approved: boolean, reason?: string }} response
+ * Write a permission-response file with nonce correlation.
  */
 export function writeResponse(repoRoot, response) {
   const resPath = path.join(repoRoot, RESPONSE_FILE);
   fs.mkdirSync(path.dirname(resPath), { recursive: true });
+
+  // Clean any pre-existing stale response before writing ours.
+  try { fs.unlinkSync(resPath); } catch { /* ok */ }
+
   fs.writeFileSync(resPath, JSON.stringify(response), 'utf8');
 }
 
 /**
  * Format the permission-request prompt shown to the user.
- *
- * @param {{ toolName: string, toolInput: object, hasReusableRule: boolean, permissionRule?: string }} request
- * @returns {string}
  */
 export function formatPrompt(request) {
   const lines = [
@@ -423,15 +373,15 @@ export function formatPrompt(request) {
     '║  Claude requests permission                                 ║',
     '╠═══════════════════════════════════════════════════════════════╣',
     '',
-    `  Tool: ${request.toolName ?? '(unknown)'}`,
+    '  Tool: ' + (request.toolName ?? '(unknown)'),
   ];
 
   if (request.toolInput) {
     const cmd = toolArgs(request.toolInput);
-    if (cmd) lines.push(`  Action: ${cmd}`);
+    if (cmd) lines.push('  Action: ' + cmd);
     for (const [key, value] of Object.entries(request.toolInput)) {
       if (key === 'command') continue;
-      lines.push(`  ${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`);
+      lines.push('  ' + key + ': ' + (typeof value === 'string' ? value : JSON.stringify(value)));
     }
   }
 
@@ -439,7 +389,7 @@ export function formatPrompt(request) {
 
   if (request.hasReusableRule && request.permissionRule) {
     lines.push('  [1] Yes — allow once');
-    lines.push(`  [2] Yes — accept reusable permission: ${request.permissionRule}`);
+    lines.push('  [2] Yes — accept reusable permission: ' + request.permissionRule);
     lines.push('  [3] No — deny');
   } else {
     lines.push('  [1] Yes — allow once');
@@ -456,10 +406,6 @@ export function formatPrompt(request) {
 
 /**
  * Parse the user's terminal input.
- *
- * @param {string} input - raw input line
- * @param {{ hasReusableRule: boolean }} options
- * @returns {{ kind: 'allow-once' | 'allow-similar' | 'deny' | 'invalid', raw: string }}
  */
 export function parseChoice(input, { hasReusableRule = false } = {}) {
   const trimmed = String(input ?? '').trim();
@@ -490,9 +436,6 @@ export function parseChoice(input, { hasReusableRule = false } = {}) {
  *
  * Returns `null` when stdin is not a TTY (non-interactive); the caller must
  * deny in that case, never auto-approve.
- *
- * @param {object} request
- * @returns {Promise<{ kind: string, permissionRule?: string } | null>}
  */
 export function promptUser(request) {
   return new Promise((resolve) => {
@@ -511,8 +454,8 @@ export function promptUser(request) {
         const choice = parseChoice(answer, { hasReusableRule: hasReusable });
         if (choice.kind === 'invalid') {
           process.stdout.write(
-            `  Unrecognised choice "${answer.trim()}". ` +
-            `Please enter 1, ${hasReusable ? '2, 3' : 'or 2'}.\n`,
+            '  Unrecognised choice "' + answer.trim() + '". ' +
+            'Please enter 1, ' + (hasReusable ? '2, 3' : 'or 2') + '.\n',
           );
           ask();
           return;
@@ -531,20 +474,13 @@ export function promptUser(request) {
 }
 
 /* ------------------------------------------------------------------ *
- * Inline hook helper script                                            *
+ * Inline hook helper script template                                   *
+ *                                                                      *
+ * Written to `.agent/permission-hook.mjs` with __REPO_ROOT__,          *
+ * __DENY_PATTERNS__, and __ALLOW_PATTERNS__ replaced at generation     *
+ * time.  Zero dependencies outside Node.js built-ins.                  *
  * ------------------------------------------------------------------ */
 
-/**
- * The hook helper script template.
- *
- * Written to `.agent/permission-hook.mjs` before Claude is launched, with
- * `__REPO_ROOT__`, `__DENY_PATTERNS__`, and `__ALLOW_PATTERNS__` replaced
- * at generation time.  Runs as `node .agent/permission-hook.mjs` inside the
- * PreToolUse hook, receiving the hook input JSON on stdin.
- *
- * The utilities here are duplicated from the module's shared functions so
- * the hook script has zero dependencies outside Node.js built-ins.
- */
 const HOOK_SCRIPT_TEMPLATE = `// ALCLI permission-relay hook helper — PreToolUse integration.
 // Auto-generated; do not edit by hand.
 
@@ -558,12 +494,12 @@ const ALLOW_PATTERNS = __ALLOW_PATTERNS__;
 const REQUEST_FILE = '.agent/permission-request.json';
 const RESPONSE_FILE = '.agent/permission-response.json';
 
-/* ----- shared utilities (inlined from permission-relay.mjs) ----- */
+/* ----- shared utilities (inlined) ----- */
 
 function buildToolEntry(toolName, toolInput) {
   if (!toolName || typeof toolName !== 'string') return null;
-  const args = toolArgs(toolInput);
-  return args ? toolName + '(' + args + ')' : toolName;
+  var a = toolArgs(toolInput);
+  return a ? toolName + '(' + a + ')' : toolName;
 }
 
 function toolArgs(input) {
@@ -572,9 +508,9 @@ function toolArgs(input) {
   if (typeof input.file_path === 'string') return input.file_path;
   if (typeof input.pattern === 'string') return input.pattern;
   if (typeof input.url === 'string') return input.url;
-  const pairs = Object.entries(input)
-    .filter(function([, v]) { return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'; })
-    .map(function([k, v]) { return String(k) + '=' + String(v); })
+  var pairs = Object.entries(input)
+    .filter(function(e) { var v = e[1]; return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'; })
+    .map(function(e) { return String(e[0]) + '=' + String(e[1]); })
     .join(' ');
   return pairs || '';
 }
@@ -583,17 +519,16 @@ function patternMatches(entry, pattern) {
   var p = pattern;
   if (p.endsWith(':*)')) p = p.slice(0, -3) + ' *)';
   else if (p.endsWith(':*')) p = p.slice(0, -2) + ' *';
-  // Bare tool name (no parens, no glob chars) matches all uses of that tool.
   if (p.indexOf('(') === -1 && p.indexOf('*') === -1 && p.indexOf('?') === -1) {
-    var escaped = p.replace(/[.*+?^\${}()|[\]\\\\]/g, '\\\\$&');
-    return new RegExp('^' + escaped + '(\\\\(.*\\\\))?$').test(entry);
+    var esc = p.replace(/[.*+?^\\\${}()|[\\]\\\\\\\\]/g, '\\\\\\\\$&');
+    return new RegExp('^' + esc + '(\\\\\\\\(.*\\\\\\\\))?$').test(entry);
   }
   var re = '';
   for (var i = 0; i < p.length; i++) {
     var ch = p[i];
     if (ch === '*') re += '.*';
     else if (ch === '?') re += '.';
-    else if ('()[]{}\\\\^$.|+'.indexOf(ch) !== -1) re += '\\\\' + ch;
+    else if ('()[]{}\\\\\\\\^$.|+'.indexOf(ch) !== -1) re += '\\\\\\\\' + ch;
     else re += ch;
   }
   return new RegExp('^' + re + '$').test(entry);
@@ -621,108 +556,122 @@ function isAllowedByConfig(toolName, toolInput, allowedPatterns) {
   return false;
 }
 
+function randomHex(len) {
+  var bytes = new Uint8Array(len);
+  try { crypto.getRandomValues(bytes); } catch (e) { for (var i = 0; i < len; i++) bytes[i] = Math.random() * 256 | 0; }
+  var hex = '';
+  for (var j = 0; j < bytes.length; j++) hex += bytes[j].toString(16).padStart(2, '0');
+  return hex;
+}
+
 function sleep(ms) {
   return new Promise(function(r) { setTimeout(r, ms); });
+}
+
+function writeDecision(opts) {
+  if (!opts || !opts.decision) { process.exit(0); }
+  var out = {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: opts.decision,
+    },
+  };
+  if (opts.reason) out.hookSpecificOutput.permissionDecisionReason = opts.reason;
+  process.stdout.write(JSON.stringify(out), 'utf8');
+  process.exit(0);
 }
 
 /* ----- main ----- */
 
 async function main() {
-  // Read hook input from stdin.
   var data = '';
   process.stdin.setEncoding('utf8');
   for await (var chunk of process.stdin) { data += chunk; }
 
   var input;
   try { input = JSON.parse(data); } catch (e) { process.exit(0); }
-
   if (!input || !input.tool_name) { process.exit(0); }
 
   var toolName = input.tool_name;
   var toolInput = input.tool_input || {};
 
-  // 1. Hard-deny — deny immediately.
+  // 1. Hard-deny — deny immediately, no file IPC.
   var hardCheck = checkHardDeny(toolName, toolInput, DENY_PATTERNS);
   if (hardCheck.denied) {
-    var out = JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason: 'Blocked by ALCLI hard-deny rule: ' + hardCheck.matchedPattern,
-      },
+    writeDecision({
+      decision: 'deny',
+      reason: 'Blocked by ALCLI hard-deny rule: ' + hardCheck.matchedPattern,
     });
-    process.stdout.write(out, 'utf8');
-    process.exit(0);
   }
 
   // 2. Static allowlist — exit silently, normal flow auto-approves.
   if (isAllowedByConfig(toolName, toolInput, ALLOW_PATTERNS)) {
-    process.exit(0);
+    writeDecision();
   }
 
-  // 3. Relay to controller.
+  // 3. Relay to controller via nonce-protected file IPC.
   var reqPath = path.join(REPO_ROOT, REQUEST_FILE);
   var resPath = path.join(REPO_ROOT, RESPONSE_FILE);
+  var nonce = randomHex(16);
 
   var request = {
     tool_name: toolName,
     tool_input: toolInput,
+    nonce: nonce,
     timestamp: Date.now(),
   };
+
+  // Delete any stale response BEFORE writing our request.
+  try { fs.unlinkSync(resPath); } catch (e) {}
 
   try {
     fs.mkdirSync(path.dirname(reqPath), { recursive: true });
     fs.writeFileSync(reqPath, JSON.stringify(request), 'utf8');
   } catch (e) {
-    var denyOut = JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason: 'Permission relay unavailable.',
-      },
-    });
-    process.stdout.write(denyOut, 'utf8');
-    process.exit(0);
+    writeDecision({ decision: 'deny', reason: 'Permission relay unavailable.' });
   }
 
-  // Poll for response.
+  // Poll for a response carrying our nonce.
   var deadline = Date.now() + 300000;
   while (Date.now() < deadline) {
     await sleep(200);
     try {
       if (!fs.existsSync(resPath)) continue;
       var raw = fs.readFileSync(resPath, 'utf8');
+      var response = JSON.parse(raw);
+
+      // Nonce must match — reject stale / forged responses.
+      if (!response.nonce || response.nonce !== nonce) {
+        try { fs.unlinkSync(resPath); } catch (e) {}
+        continue;
+      }
+
+      // Claim the response by deleting both files.
       try { fs.unlinkSync(reqPath); } catch (e) {}
       try { fs.unlinkSync(resPath); } catch (e) {}
 
-      var response = JSON.parse(raw);
-      var decision = {
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          permissionDecision: response.approved ? 'allow' : 'deny',
-        },
-      };
-      if (response.reason) {
-        decision.hookSpecificOutput.permissionDecisionReason = response.reason;
+      if (response.approved) {
+        writeDecision({ decision: 'allow', reason: response.reason });
+      } else {
+        writeDecision({
+          decision: 'deny',
+          reason: response.reason || 'Permission denied by user.',
+        });
       }
-      process.stdout.write(JSON.stringify(decision), 'utf8');
-      process.exit(0);
-    } catch (e) {
-      // File not ready yet.
-    }
+    } catch (e) {}
   }
 
-  // Timeout.
-  var timeoutOut = JSON.stringify({
-    hookSpecificOutput: {
-      hookEventName: 'PreToolUse',
-      permissionDecision: 'deny',
-      permissionDecisionReason: 'Permission relay timed out.',
-    },
-  });
-  process.stdout.write(timeoutOut, 'utf8');
-  process.exit(0);
+  // Timeout — deny and clean up.
+  try { fs.unlinkSync(reqPath); } catch (e) {}
+  writeDecision({ decision: 'deny', reason: 'Permission relay timed out.' });
 }
 
 main();
 `;
+
+function generateHookScript({ repoRoot, denyPatterns, allowPatterns }) {
+  return HOOK_SCRIPT_TEMPLATE
+    .replace('__REPO_ROOT__', JSON.stringify(repoRoot))
+    .replace('__DENY_PATTERNS__', JSON.stringify(denyPatterns))
+    .replace('__ALLOW_PATTERNS__', JSON.stringify(allowPatterns));
+}

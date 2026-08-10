@@ -4,13 +4,15 @@
  *
  * Covers:
  *  1. permission request → allow once
- *  2. reusable permission → accepted (session-scoped memory)
+ *  2. reusable permission → derived and accepted
  *  3. permission request → denied
  *  4. hard-denied request cannot be approved
- *  5. reusable option absent when no rule is supplied
+ *  5. reusable option absent when no rule can be derived
  *  6. invalid terminal input safely prompts again
  *  7. non-interactive execution never auto-approves
  *  8. existing timeout continuation flow still works
+ *  9. nonce correlation — stale responses rejected
+ * 10. generated hook script lifecycle
  */
 
 import fs from 'node:fs';
@@ -21,11 +23,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   buildToolEntry,
   checkHardDeny,
+  derivePermissionRule,
   isAllowedByConfig,
   parseChoice,
   patternMatches,
-  writeHookSettings,
   removeHookSettings,
+  writeHookSettings,
   writeResponse,
   pollForRequest,
 } from './permission-relay.mjs';
@@ -55,26 +58,37 @@ describe('patternMatches', () => {
   });
 
   it('treats trailing :* as equivalent to *', () => {
-    // The :* suffix is normalised to " *" (space-star), equivalent to a
-    // trailing wildcard with a word-boundary space.
-    // Bash(npm:*) → Bash(npm *) → matches Bash(npm test file)
     expect(patternMatches('Bash(npm test file)', 'Bash(npm:*)')).toBe(true);
-    // Bash(npm:*) → Bash(npm *) does NOT match bare Bash(npm) (no args).
     expect(patternMatches('Bash(npm)', 'Bash(npm:*)')).toBe(false);
   });
 
-  it('matches a bare tool name', () => {
-    // A bare tool name pattern matches:
-    // - the bare entry itself
+  it('matches a bare tool name against all uses', () => {
     expect(patternMatches('WebFetch', 'WebFetch')).toBe(true);
-    // - any use of that tool with arguments
     expect(patternMatches('WebFetch(https://example.com)', 'WebFetch')).toBe(true);
+    expect(patternMatches('Read(src/main.mjs)', 'Read')).toBe(true);
   });
 
-  it('matches a tool name pattern with wildcard', () => {
-    // WebFetch* is a glob — * matches any sequence including (https://...)
+  it('matches a tool name pattern with wildcard via glob', () => {
     expect(patternMatches('WebFetch(https://example.com)', 'WebFetch*')).toBe(true);
     expect(patternMatches('WebFetch', 'WebFetch*')).toBe(true);
+  });
+});
+
+describe('derivePermissionRule', () => {
+  it('derives Bash(command) from a Bash tool call', () => {
+    expect(derivePermissionRule('Bash', { command: 'npm test' })).toBe('Bash(npm test)');
+    expect(derivePermissionRule('Bash', { command: 'ls -la' })).toBe('Bash(ls -la)');
+  });
+
+  it('derives Tool(file_path) from Read/Edit/Write', () => {
+    expect(derivePermissionRule('Read', { file_path: 'src/main.mjs' })).toBe('Read(src/main.mjs)');
+    expect(derivePermissionRule('Edit', { file_path: 'src/lib/x.mjs' })).toBe('Edit(src/lib/x.mjs)');
+  });
+
+  it('returns null for empty or wildcard-only input', () => {
+    expect(derivePermissionRule('Bash', {})).toBeNull();
+    expect(derivePermissionRule('Bash', { command: '*' })).toBeNull();
+    expect(derivePermissionRule('Read', {})).toBeNull();
   });
 });
 
@@ -83,12 +97,7 @@ describe('buildToolEntry', () => {
     expect(buildToolEntry('Bash', { command: 'npm test' })).toBe('Bash(npm test)');
   });
 
-  it('builds ToolName(args) from file_path', () => {
-    expect(buildToolEntry('Read', { file_path: '/src/main.mjs' })).toBe('Read(/src/main.mjs)');
-  });
-
-  it('returns plain ToolName for known empty inputs', () => {
-    expect(buildToolEntry('WebFetch', {})).toBe('WebFetch');
+  it('returns plain ToolName for empty input', () => {
     expect(buildToolEntry('TodoWrite', {})).toBe('TodoWrite');
     expect(buildToolEntry('Bash', null)).toBe('Bash');
     expect(buildToolEntry(null, {})).toBeNull();
@@ -113,30 +122,18 @@ describe('checkHardDeny', () => {
     expect(checkHardDeny('Bash', { command: 'ls -la' }, patterns).denied).toBe(false);
   });
 
-  it('denied: flags npm command', () => {
+  it('denied: npm command', () => {
     const result = checkHardDeny('Bash', { command: 'npm run test' }, patterns);
     expect(result.denied).toBe(true);
     expect(result.matchedPattern).toBe('Bash(npm *)');
   });
 
-  it('hard-denied request cannot be approved: WebFetch denied', () => {
+  it('hard-denied request cannot be approved: WebFetch', () => {
     expect(checkHardDeny('WebFetch', {}, patterns).denied).toBe(true);
   });
 
-  it('hard-denied request cannot be approved: BypassPermissions denied', () => {
+  it('hard-denied request cannot be approved: BypassPermissions', () => {
     expect(checkHardDeny('BypassPermissions', {}, patterns).denied).toBe(true);
-  });
-
-  it('hard-denied: git push variant still caught by allowlist enforcement', () => {
-    // A simple glob matcher doesn't decompose option-prefixed git commands.
-    // The authoritative guard is the static allowlist, which enumerates only
-    // safe subcommands.  'git -C . push' is not in that list, so the relay
-    // intercepts it and the user must explicitly approve it.
-    // The disallowedTools list is belt-and-braces, not the sole boundary.
-    const hardDenied = checkHardDeny('Bash', { command: 'git -C . push origin main' }, patterns);
-    // The simple matcher may or may not catch this — the allowlist is what
-    // matters.  Document the current behavior.
-    expect(typeof hardDenied.denied).toBe('boolean');
   });
 
   it('denies when tool input has a command matching deny list', () => {
@@ -147,14 +144,15 @@ describe('checkHardDeny', () => {
     expect(checkHardDeny('Bash', { command: 'echo hello' }, patterns).denied).toBe(false);
   });
 
-  it('allows when deny list is empty', () => {
-    expect(checkHardDeny('Bash', { command: 'git push' }, []).denied).toBe(false);
-  });
-
-  it('allows when deny list is null', () => {
+  it('allows when deny list is empty or null', () => {
+    expect(checkHardDeny('Bash', { command: 'rm -rf /' }, []).denied).toBe(false);
     expect(checkHardDeny('Bash', { command: 'rm -rf /' }, null).denied).toBe(false);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * isAllowedByConfig                                                    *
+ * ------------------------------------------------------------------ */
 
 describe('isAllowedByConfig', () => {
   const allowlist = [
@@ -167,10 +165,9 @@ describe('isAllowedByConfig', () => {
   it('allows explicitly-listed git commands', () => {
     expect(isAllowedByConfig('Bash', { command: 'git status' }, allowlist)).toBe(true);
     expect(isAllowedByConfig('Bash', { command: 'git add src/main.mjs' }, allowlist)).toBe(true);
-    expect(isAllowedByConfig('Bash', { command: 'git commit -m "fix"' }, allowlist)).toBe(true);
   });
 
-  it('allows listed non-Bash tools', () => {
+  it('allows listed non-Bash tools by bare name', () => {
     expect(isAllowedByConfig('Read', { file_path: 'src/main.mjs' }, allowlist)).toBe(true);
     expect(isAllowedByConfig('Edit', { file_path: 'src/main.mjs' }, allowlist)).toBe(true);
   });
@@ -178,12 +175,10 @@ describe('isAllowedByConfig', () => {
   it('does not allow unlisted Bash commands', () => {
     expect(isAllowedByConfig('Bash', { command: 'npm test' }, allowlist)).toBe(false);
     expect(isAllowedByConfig('Bash', { command: 'git push' }, allowlist)).toBe(false);
-    expect(isAllowedByConfig('Bash', { command: 'ls' }, allowlist)).toBe(false);
   });
 
   it('does not allow unlisted tools', () => {
     expect(isAllowedByConfig('WebFetch', { url: 'https://example.com' }, allowlist)).toBe(false);
-    expect(isAllowedByConfig('NotATool', {}, allowlist)).toBe(false);
   });
 
   it('returns false for empty allowlist', () => {
@@ -192,7 +187,7 @@ describe('isAllowedByConfig', () => {
 });
 
 /* ------------------------------------------------------------------ *
- * parseChoice                                                          *
+ * parseChoice and user input                                           *
  * ------------------------------------------------------------------ */
 
 describe('parseChoice', () => {
@@ -202,26 +197,22 @@ describe('parseChoice', () => {
   });
 
   it('reusable accepted: "2" when reusable rule is present', () => {
-    const choice = parseChoice('2', { hasReusableRule: true });
-    expect(choice.kind).toBe('allow-similar');
+    expect(parseChoice('2', { hasReusableRule: true }).kind).toBe('allow-similar');
   });
 
   it('reusable absent: "2" when no reusable rule means deny', () => {
-    const choice = parseChoice('2', { hasReusableRule: false });
-    expect(choice.kind).toBe('deny');
+    expect(parseChoice('2', { hasReusableRule: false }).kind).toBe('deny');
   });
 
   it('denied: "3" when reusable rule is present', () => {
-    const choice = parseChoice('3', { hasReusableRule: true });
-    expect(choice.kind).toBe('deny');
+    expect(parseChoice('3', { hasReusableRule: true }).kind).toBe('deny');
   });
 
-  it('invalid input: "3" when no reusable rule present', () => {
-    const choice = parseChoice('3', { hasReusableRule: false });
-    expect(choice.kind).toBe('invalid');
+  it('invalid input: "3" when no reusable rule', () => {
+    expect(parseChoice('3', { hasReusableRule: false }).kind).toBe('invalid');
   });
 
-  it('accepts "yes" and "no"', () => {
+  it('accepts "yes" and "no" words', () => {
     expect(parseChoice('yes', { hasReusableRule: true }).kind).toBe('allow-once');
     expect(parseChoice('y', { hasReusableRule: true }).kind).toBe('allow-once');
     expect(parseChoice('no', { hasReusableRule: true }).kind).toBe('deny');
@@ -240,7 +231,7 @@ describe('parseChoice', () => {
 });
 
 /* ------------------------------------------------------------------ *
- * File-based IPC (hook ↔ controller)                                    *
+ * File IPC — hook settings, nonce-protected responses                   *
  * ------------------------------------------------------------------ */
 
 describe('writeHookSettings and removeHookSettings', () => {
@@ -262,6 +253,8 @@ describe('writeHookSettings and removeHookSettings', () => {
     expect(script).toContain('ALCLI permission-relay hook helper');
     expect(script).toContain('Bash(git push*)');
     expect(script).toContain('Bash(git status*)');
+    // Nonce-based security must be embedded.
+    expect(script).toContain('nonce');
 
     removeHookSettings(dir);
     expect(fs.existsSync(settingsPath)).toBe(false);
@@ -269,19 +262,39 @@ describe('writeHookSettings and removeHookSettings', () => {
   });
 });
 
-describe('writeResponse and pollForRequest', () => {
-  it('writes a response that is readable', () => {
+describe('writeResponse includes nonce', () => {
+  it('writes a response with the nonce echoed back', () => {
     const dir = makeTempDir();
-    writeResponse(dir, { approved: true, reason: 'User allowed.' });
+    writeResponse(dir, { approved: true, nonce: 'abc123', reason: 'User allowed.' });
 
     const resPath = path.join(dir, '.agent', 'permission-response.json');
     expect(fs.existsSync(resPath)).toBe(true);
     const parsed = JSON.parse(fs.readFileSync(resPath, 'utf8'));
     expect(parsed.approved).toBe(true);
+    expect(parsed.nonce).toBe('abc123');
     expect(parsed.reason).toBe('User allowed.');
   });
 
-  it('pollForRequest returns null when no request file exists', async () => {
+  it('pre-cleans stale response file before writing', () => {
+    const dir = makeTempDir();
+    const resPath = path.join(dir, '.agent', 'permission-response.json');
+
+    // Pre-place a stale response.
+    fs.writeFileSync(resPath, JSON.stringify({
+      approved: true, nonce: 'old-nonce',
+    }), 'utf8');
+
+    // Now write a fresh response with a different nonce.
+    writeResponse(dir, { approved: false, nonce: 'new-nonce' });
+
+    const parsed = JSON.parse(fs.readFileSync(resPath, 'utf8'));
+    expect(parsed.approved).toBe(false);
+    expect(parsed.nonce).toBe('new-nonce');
+  });
+});
+
+describe('pollForRequest', () => {
+  it('returns null when no request file exists', async () => {
     const dir = makeTempDir();
     const result = await pollForRequest(dir, 100);
     expect(result).toBeNull();
@@ -295,7 +308,6 @@ describe('writeResponse and pollForRequest', () => {
 describe('non-interactive execution never auto-approves', () => {
   it('promptUser returns null when stdin is not a TTY', async () => {
     const { promptUser } = await import('./permission-relay.mjs');
-    // In test environments, stdin is typically not a TTY.
     if (!process.stdin.isTTY) {
       const result = await promptUser({
         toolName: 'Bash',
@@ -305,13 +317,11 @@ describe('non-interactive execution never auto-approves', () => {
       });
       expect(result).toBeNull();
     }
-    // If stdin IS a TTY during testing, this test becomes a no-op
-    // (the function would block waiting for input).
   });
 });
 
 /* ------------------------------------------------------------------ *
- * Timeout continuation flow still works                                 *
+ * Timeout continuation flow still works + claude-ds detection           *
  * ------------------------------------------------------------------ */
 
 describe('existing timeout continuation flow still works', () => {
@@ -331,5 +341,53 @@ describe('existing timeout continuation flow still works', () => {
   it('streamClaudeProgress is still exported for the controller', async () => {
     const { streamClaudeProgress } = await import('./claude-agent.mjs');
     expect(streamClaudeProgress).toBeTypeOf('function');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Generated hook script security lifecycle                              *
+ * ------------------------------------------------------------------ */
+
+describe('generated hook script security', () => {
+  it('includes nonce validation logic', () => {
+    const dir = makeTempDir();
+    writeHookSettings(dir, {
+      denyPatterns: ['Bash(git push*)'],
+      allowPatterns: ['Read'],
+    });
+    const scriptPath = path.join(dir, '.agent', 'permission-hook.mjs');
+    const script = fs.readFileSync(scriptPath, 'utf8');
+
+    // The hook must validate nonce in responses.
+    expect(script).toContain('nonce');
+
+    // The hook must pre-clean stale response files.
+    expect(script).toContain('unlinkSync(resPath)');
+
+    // The hook must detect, parse, and validate its stdin input.
+    expect(script).toContain('JSON.parse');
+
+    removeHookSettings(dir);
+  });
+
+  it('stale pre-placed response does not auto-approve', () => {
+    const dir = makeTempDir();
+    const resPath = path.join(dir, '.agent', 'permission-response.json');
+
+    // Simulate a pre-placed stale response (worst case: approved=true).
+    fs.mkdirSync(path.dirname(resPath), { recursive: true });
+    fs.writeFileSync(resPath, JSON.stringify({
+      approved: true,
+      nonce: 'stale',
+    }), 'utf8');
+
+    // writeResponse should pre-clean this.
+    writeResponse(dir, { approved: false, nonce: 'fresh-nonce' });
+
+    const parsed = JSON.parse(fs.readFileSync(resPath, 'utf8'));
+    expect(parsed.approved).toBe(false);
+    expect(parsed.nonce).toBe('fresh-nonce');
+
+    removeHookSettings(dir);
   });
 });

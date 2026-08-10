@@ -18,6 +18,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 
 import {
   CLAUDE_ALLOWED_TOOLS,
@@ -29,6 +30,7 @@ import {
 } from './config.mjs';
 import {
   checkHardDeny,
+  derivePermissionRule,
   isAllowedByConfig,
   pollForRequest,
   promptUser,
@@ -262,9 +264,18 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
   const session = sessionId ?? randomUUID();
   const args = buildClaudeArgs({ sessionId: session, resume });
 
-  // Only set up the permission relay when interactive and not disabled.
+  // Only set up the permission relay when:
+  //  1. stdin is a TTY (interactive)
+  //  2. not disabled via env
+  //  3. using standard `claude` binary (not claude-ds or custom override)
+  const isStandardClaude =
+    !process.env.AGENTLOOP_CLAUDE_BIN ||
+    path.basename(process.env.AGENTLOOP_CLAUDE_BIN) === 'claude' ||
+    path.basename(process.env.AGENTLOOP_CLAUDE_BIN) === 'claude.cmd';
+
   const relayEnabled =
     process.stdin.isTTY &&
+    isStandardClaude &&
     !process.env.AGENTLOOP_DISABLE_PERMISSION_RELAY;
 
   if (relayEnabled) {
@@ -274,9 +285,11 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
       allowPatterns: allowedList,
     });
 
-    // Add the hook settings to Claude's invocation.
+    // Add the hook settings to Claude's invocation (supported by Claude Code).
     args.push('--settings', '.agent/hook-settings.json');
     onLog?.('[claude-agent] PreToolUse permission relay enabled');
+  } else if (!isStandardClaude) {
+    onLog?.('[claude-agent] permission relay skipped (non-standard binary via AGENTLOOP_CLAUDE_BIN)');
   }
 
   onLog?.('[claude-agent] starting session');
@@ -284,7 +297,7 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
 
   // Spawn Claude.  The permission watcher runs concurrently.
   let watcherStop = false;
-  const acceptedRules = new Map(); // rule → true for session-scoped reuse
+  const acceptedRules = new Map(); // rule-string → true for session-scoped reuse
 
   const watcher = relayEnabled
     ? (async () => {
@@ -294,12 +307,14 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
 
           const toolName = request.tool_name;
           const toolInput = request.tool_input ?? {};
+          const nonce = typeof request.nonce === 'string' ? request.nonce : null;
 
           // Belt-and-braces hard-deny re-check.
           const hardCheck = checkHardDeny(toolName, toolInput, CLAUDE_HARD_DENY_PATTERNS);
           if (hardCheck.denied) {
             writeResponse(REPO_ROOT, {
               approved: false,
+              nonce,
               reason: `Blocked by ALCLI hard-deny rule: ${hardCheck.matchedPattern}`,
             });
             onLog?.(`[claude-agent] hard-denied: ${hardCheck.matchedPattern}`);
@@ -307,43 +322,46 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
           }
 
           // Check accepted reusable rules (session-scoped memory).
-          const entry = requireEntry(toolName, toolInput);
+          const entry = derivePermissionRule(toolName, toolInput);
           if (entry && acceptedRules.has(entry)) {
-            writeResponse(REPO_ROOT, { approved: true, reason: 'Previously accepted rule.' });
+            writeResponse(REPO_ROOT, { approved: true, nonce, reason: 'Previously accepted rule.' });
             onLog?.('[claude-agent] auto-approved via session-scoped reusable rule');
             continue;
           }
+
+          // Derive a permission rule for the "allow similar" option.
+          const permRule = derivePermissionRule(toolName, toolInput);
 
           // Prompt the user.
           const choice = await promptUser({
             toolName,
             toolInput,
-            hasReusableRule: false, // We don't get a permission_rule from hook input
-            permissionRule: null,
+            hasReusableRule: permRule !== null,
+            permissionRule: permRule,
           });
 
           if (choice === null) {
-            // Non-interactive fallback (shouldn't happen here, but be safe).
             writeResponse(REPO_ROOT, {
               approved: false,
+              nonce,
               reason: 'Permission denied (non-interactive).',
             });
             continue;
           }
 
           if (choice.kind === 'deny') {
-            writeResponse(REPO_ROOT, { approved: false, reason: 'Permission denied by user.' });
+            writeResponse(REPO_ROOT, { approved: false, nonce, reason: 'Permission denied by user.' });
             onLog?.('[claude-agent] permission denied by user');
             continue;
           }
 
-          // Allow once (or allow-similar).
+          // Allow once (or allow-similar with session-scoped memory).
           if (choice.kind === 'allow-similar' && choice.permissionRule) {
             acceptedRules.set(choice.permissionRule, true);
             onLog?.(`[claude-agent] accepted reusable rule: ${choice.permissionRule}`);
           }
 
-          writeResponse(REPO_ROOT, { approved: true });
+          writeResponse(REPO_ROOT, { approved: true, nonce });
           onLog?.('[claude-agent] permission approved');
         }
       })()
@@ -388,17 +406,4 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
   }
 
   return classified;
-}
-
-/** Helper for session-scoped rule matching. */
-function requireEntry(toolName, toolInput) {
-  if (!toolName || typeof toolName !== 'string') return null;
-  // Minimal buildToolEntry inlined to avoid re-export complexity.
-  let args = '';
-  const input = toolInput ?? {};
-  if (typeof input.command === 'string') args = input.command;
-  else if (typeof input.file_path === 'string') args = input.file_path;
-  else if (typeof input.pattern === 'string') args = input.pattern;
-  else if (typeof input.url === 'string') args = input.url;
-  return args ? `${toolName}(${args})` : toolName;
 }
