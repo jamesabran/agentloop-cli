@@ -806,14 +806,16 @@ export async function runSetup({
 } = {}) {
   const prompt = injectedPrompt || new TerminalPrompt();
   const configPath = path.join(projectRoot, CONFIG_FILE_NAME);
-  const tempPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.tmp`);
+  // Temporary name used to hold the old config aside during validation.
+  const swapPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.validating`);
 
   try {
-    // Load existing config
+    // Load existing config (for display defaults only — the actual
+    // "is this a reconfiguration" check looks at whether the file exists).
     const existing = loadExistingConfig(projectRoot);
-    const isReconfigure = Object.keys(existing).length > 0;
+    const oldFileExists = fs.existsSync(configPath);
 
-    if (isReconfigure) {
+    if (oldFileExists) {
       prompt.display('');
       prompt.display('  ═══════════════════════════════════════════════════════');
       prompt.display('  Existing configuration found — entering reconfiguration.');
@@ -853,52 +855,81 @@ export async function runSetup({
       return { saved: false, config, reason: 'User chose not to save.' };
     }
 
-    // Validate BEFORE touching the canonical file — write to a temp file,
-    // validate through the real config module, then atomically rename.
-    // Clean up any stale temp file from a previous interrupted run.
-    try { fs.unlinkSync(tempPath); } catch { /* didn't exist — fine */ }
+    // --- Validate by writing to the canonical path itself ---
+    //
+    // The config module always reads the file named `agentloop.config.json`
+    // at REPO_ROOT, so validation through it *must* exercise the real path.
+    // We temporarily move any existing file aside, write the candidate,
+    // validate, and then either restore the old file (on failure) or
+    // finalise the new one (on success).
 
-    saveConfig(config, projectRoot, tempPath);
-
-    const validation = validateConfig(projectRoot, { configPath: tempPath });
-    if (!validation.ok) {
-      // Validation failed — remove the temp file and leave the canonical
-      // config (if any) untouched.
-      try { fs.unlinkSync(tempPath); } catch { /* best-effort */ }
-      prompt.display('');
-      prompt.display('  ✖  Configuration validation failed — nothing was saved.');
-      prompt.display('  Errors:');
-      for (const err of validation.errors || []) {
-        prompt.display(`    ${err}`);
-      }
-      return {
-        saved: false,
-        config,
-        reason: 'Configuration validation failed — see errors above.',
-      };
+    // Phase 1: move old file aside so we can write the candidate to the
+    // canonical path that config.mjs will actually read.
+    const hadOldFile = fs.existsSync(configPath);
+    if (hadOldFile) {
+      fs.renameSync(configPath, swapPath);
     }
 
-    // Validation passed — back up the existing config (if any), then
-    // atomically rename the validated temp file into place.
-    if (isReconfigure) {
-      const backupPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.bak`);
-      try {
-        fs.copyFileSync(configPath, backupPath);
-        prompt.display(`  Backed up existing config to ${CONFIG_FILE_NAME}.bak`);
-      } catch {
-        // Non-fatal — proceed without backup
-      }
-    }
-
+    let validationPassed = false;
     try {
-      fs.renameSync(tempPath, configPath);
-    } catch {
-      // Rename failed — leave the temp file for recovery, do not touch
-      // the canonical file.
-      prompt.display('');
-      prompt.display('  ✖  Could not write the final configuration file.');
-      prompt.display(`  The validated config is at ${CONFIG_FILE_NAME}.tmp`);
-      return { saved: false, config, reason: 'File rename failed — temp file preserved.' };
+      saveConfig(config, projectRoot);
+
+      const validation = validateConfig(projectRoot);
+      if (!validation.ok) {
+        // Restore the old config — the candidate is invalid.
+        try { fs.unlinkSync(configPath); } catch { /* best-effort */ }
+        if (hadOldFile) {
+          fs.renameSync(swapPath, configPath);
+        }
+        prompt.display('');
+        prompt.display('  ✖  Configuration validation failed — nothing was saved.');
+        prompt.display('  Errors:');
+        for (const err of validation.errors || []) {
+          prompt.display(`    ${err}`);
+        }
+        return {
+          saved: false,
+          config,
+          reason: 'Configuration validation failed — see errors above.',
+        };
+      }
+
+      validationPassed = true;
+    } finally {
+      // If we wrote the candidate but validation failed before the restore
+      // handler above ran (or threw), make sure the old file is restored.
+      if (!validationPassed && hadOldFile && !fs.existsSync(configPath)) {
+        try { fs.renameSync(swapPath, configPath); } catch { /* best-effort */ }
+      }
+    }
+
+    // Phase 2: validation passed — the candidate at configPath is good.
+    // Turn the old file (at swapPath) into a .bak backup.
+    if (hadOldFile) {
+      const bakPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.bak`);
+
+      // If a .bak already exists, move it to a timestamped name so we
+      // never silently overwrite a previous backup.
+      if (fs.existsSync(bakPath)) {
+        const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const stampedPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.bak.${ts}`);
+        try {
+          fs.renameSync(bakPath, stampedPath);
+          prompt.display(`  Moved previous backup to ${path.basename(stampedPath)}`);
+        } catch {
+          // Could not move the old .bak — fall back to overwriting it.
+        }
+      }
+
+      try {
+        fs.renameSync(swapPath, bakPath);
+        prompt.display(`  Backed up previous config to ${CONFIG_FILE_NAME}.bak`);
+      } catch {
+        // Backup failed — discard the old file (the new config is already
+        // validated and written to the canonical path).
+        try { fs.unlinkSync(swapPath); } catch { /* best-effort */ }
+        prompt.display('  Warning: could not back up the previous config.');
+      }
     }
 
     prompt.display('');
