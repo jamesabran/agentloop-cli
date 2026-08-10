@@ -145,7 +145,7 @@ export function stripStringsAndComments(line) {
  * tree to collect line numbers of every `DebuggerStatement` node. The
  * parser correctly distinguishes regex literals from division operators,
  * template-literal text from interpolation code, comments, strings, and
- * all other syntactic constructs — so there is no risk of false positives
+ * all other syntactic constructs --- so there is no risk of false positives
  * from `/debugger/` regexes or false negatives from `debugger;` inside
  * `${...}` interpolation bodies.
  *
