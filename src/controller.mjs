@@ -83,6 +83,7 @@ import {
   recordAudit,
   recordFailure,
   recordImplementation,
+  recordImplementerRuntimeVerification,
   recordRuntimeVerification,
   requireRecovery,
   saveState,
@@ -531,6 +532,50 @@ async function runImplementerStep({ decision, context, options }) {
     );
   }
 
+  // Implementer-gate runtime verification: run before the handoff is accepted.
+  // A FAIL here means the implementer must fix the code; the handoff is
+  // rejected and the implementer session is discarded.
+  if (context.runtimeVerification && isRuntimeVerificationRequired(context.runtimeVerification)) {
+    const rvChecks = context.runtimeVerification.checks;
+    if (rvChecks.length === 0) {
+      // Required profile with no checks configured — fail safe.
+      stopClaudeTerminal(
+        context,
+        fixing ? 'fix runtime verification' : 'implementation runtime verification',
+        `Runtime verification is required (profile: ${context.runtimeVerification.profile}) but no checks are configured. ` +
+          'Add runtime verification checks to agentloop.config.json or the task configuration.',
+      );
+    }
+
+    log.info('Running implementer-gate runtime verification…');
+    const rvResult = await runRuntimeChecks({
+      checks: rvChecks,
+      onStart: (name) => log.info(`  ${name}`),
+    });
+    log.info(summariseRuntimeChecks(rvResult.results));
+
+    if (!rvResult.ok) {
+      const failedOutput = runtimeFailureExcerpt(rvResult.failed);
+      stopClaudeTerminal(
+        context,
+        fixing ? 'fix runtime verification' : 'implementation runtime verification',
+        `Implementer-gate runtime check "${rvResult.failed.name}" failed against ${short(head)}.\n\n${failedOutput}`,
+      );
+    }
+
+    // Record implementer-gate PASS so the auditor and publish gates can read it.
+    context.state = recordImplementerRuntimeVerification(context.state, {
+      head,
+      status: 'PASS',
+      output: 'Implementer-gate runtime verification passed.',
+    });
+  } else {
+    context.state = recordImplementerRuntimeVerification(context.state, {
+      head,
+      status: 'NOT_REQUIRED',
+    });
+  }
+
   context.state = clearFailures(recordImplementation(context.state, head));
   log.info(
     head === before
@@ -592,42 +637,56 @@ async function runAuditStep({ context, options }) {
     );
   }
 
-  // Runtime-verification gate: when required for this task, run the configured
-  // runtime checks against the current HEAD before starting the auditor.
-  // A failure here is a hard blocker — same as a deterministic check failure.
+  // Runtime-verification auditor gate: when required for this task, run the
+  // configured runtime checks independently against the current HEAD before
+  // starting the auditor.  A failure here is a hard blocker — same as a
+  // failed deterministic check.
   let runtimeChecksResult = null;
   if (context.runtimeVerification && isRuntimeVerificationRequired(context.runtimeVerification)) {
     const rvChecks = context.runtimeVerification.checks;
-    if (rvChecks.length > 0) {
-      log.info('Running runtime verification checks…');
-      runtimeChecksResult = await runRuntimeChecks({
-        checks: rvChecks,
-        onStart: (name) => log.info(`  ${name}`),
+    if (rvChecks.length === 0) {
+      // Required profile with no checks configured — fail safe.
+      context.state = recordRuntimeVerification(context.state, {
+        head,
+        status: 'FAIL',
+        output: `Runtime verification is required (profile: ${context.runtimeVerification.profile}) but no checks are configured.`,
+        required: true,
+        profile: context.runtimeVerification.profile,
       });
-      log.info(summariseRuntimeChecks(runtimeChecksResult.results));
+      throw new LoopStopped(
+        `Runtime verification is required (profile: ${context.runtimeVerification.profile}) but no checks are configured. ` +
+          'Add runtime verification checks to agentloop.config.json or the task configuration.',
+      );
+    }
 
-      if (!runtimeChecksResult.ok) {
-        const failedOutput = runtimeFailureExcerpt(runtimeChecksResult.failed);
-        // Persist the failure so the state reflects it for resume/report.
-        context.state = recordRuntimeVerification(context.state, {
-          head,
-          status: 'FAIL',
-          output: failedOutput,
-          required: true,
-          profile: context.runtimeVerification.profile,
-        });
-        throw new LoopStopped(
-          `The runtime verification check "${runtimeChecksResult.failed.name}" failed against ${short(head)}.\n\n` +
-            `${failedOutput}`,
-        );
-      }
+    log.info('Running auditor-gate runtime verification…');
+    runtimeChecksResult = await runRuntimeChecks({
+      checks: rvChecks,
+      onStart: (name) => log.info(`  ${name}`),
+    });
+    log.info(summariseRuntimeChecks(runtimeChecksResult.results));
+
+    if (!runtimeChecksResult.ok) {
+      const failedOutput = runtimeFailureExcerpt(runtimeChecksResult.failed);
+      // Persist the failure so the state reflects it for resume/report.
+      context.state = recordRuntimeVerification(context.state, {
+        head,
+        status: 'FAIL',
+        output: failedOutput,
+        required: true,
+        profile: context.runtimeVerification.profile,
+      });
+      throw new LoopStopped(
+        `The auditor-gate runtime check "${runtimeChecksResult.failed.name}" failed against ${short(head)}.\n\n` +
+          `${failedOutput}`,
+      );
     }
 
     // Persist the PASS result.
     context.state = recordRuntimeVerification(context.state, {
       head,
       status: 'PASS',
-      output: summariseRuntimeChecks(runtimeChecksResult ? runtimeChecksResult.results : []),
+      output: summariseRuntimeChecks(runtimeChecksResult.results),
       required: true,
       profile: context.runtimeVerification.profile,
     });
@@ -806,18 +865,26 @@ export async function runPublishStep({ context, options, _git, pushMode = PUBLIS
     );
   }
 
-  // Runtime-verification gate: a required runtime check must have passed for
-  // the exact commit that is about to be published or marked ready.
-  if (
-    state.runtimeVerificationRequired &&
-    (state.runtimeVerificationStatus !== 'PASS' || state.runtimeVerificationHead !== head)
-  ) {
-    throw new LoopStopped(
-      `Refusing to publish ${short(head)}: the required runtime verification gate is ` +
-        `not satisfied (status: ${state.runtimeVerificationStatus ?? 'not run'}, ` +
-        `verified head: ${short(state.runtimeVerificationHead)}). ` +
-        'The runtime checks must pass against the exact commit being published.',
-    );
+  // Runtime-verification gate: both the implementer gate and the auditor
+  // gate must be PASS for the exact commit being published or marked ready.
+  if (state.runtimeVerificationRequired) {
+    const auditorOk =
+      state.runtimeVerificationStatus === 'PASS' &&
+      state.runtimeVerificationHead === head;
+    const implementerOk =
+      state.implementerRuntimeVerificationStatus === 'PASS' &&
+      state.implementerRuntimeVerificationHead === head;
+
+    if (!auditorOk || !implementerOk) {
+      throw new LoopStopped(
+        `Refusing to publish ${short(head)}: required runtime verification gates are not satisfied. ` +
+          `Auditor gate: ${state.runtimeVerificationStatus ?? 'not run'} ` +
+          `(head: ${short(state.runtimeVerificationHead)}). ` +
+          `Implementer gate: ${state.implementerRuntimeVerificationStatus ?? 'not run'} ` +
+          `(head: ${short(state.implementerRuntimeVerificationHead)}). ` +
+          'Both gates must be PASS for the exact commit being published.',
+      );
+    }
   }
 
   if (options.dryRun) {
@@ -1160,8 +1227,16 @@ async function runLoop(options) {
         );
       }
     }
-  } catch {
-    // Task file missing or invalid — treat as no task-level config.
+  } catch (error) {
+    // Only ENOENT (task file not found) means "no task-level config".
+    // Any other error — malformed file, invalid config, failed validation —
+    // must propagate rather than silently treating runtime verification as
+    // NOT_REQUIRED.
+    if (error.code === 'ENOENT') {
+      // No task file — treat as no task-level config.
+    } else {
+      throw error;
+    }
   }
   const resolvedRv = resolveRuntimeVerification({
     project: PROJECT_RUNTIME_VERIFICATION,

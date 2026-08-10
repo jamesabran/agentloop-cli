@@ -122,20 +122,37 @@ export function decideLocal({ state, head, maxChangeRounds = MAX_CHANGE_ROUNDS, 
   }
 
   if (state.verdict === 'APPROVED') {
-    // Runtime-verification gate: an approval cannot override a missing or
-    // failed runtime gate.  The runtime verification result must be PASS for
-    // the exact commit that is about to be published.
-    if (
-      state.runtimeVerificationRequired &&
-      (state.runtimeVerificationStatus !== 'PASS' || state.runtimeVerificationHead !== head)
-    ) {
-      return step(
-        ACTIONS.STOP,
-        'Codex approved, but the required runtime verification gate is not satisfied ' +
-          `(status: ${state.runtimeVerificationStatus ?? 'not run'}, ` +
-          `head: ${short(state.runtimeVerificationHead)} vs ${short(head)}). ` +
-          'Run the runtime checks before publishing.',
-      );
+    // Runtime-verification gate: both the implementer gate and the auditor
+    // gate must be PASS for the exact commit that is about to be published.
+    if (state.runtimeVerificationRequired) {
+      const auditorOk =
+        state.runtimeVerificationStatus === 'PASS' &&
+        state.runtimeVerificationHead === head;
+      const implementerOk =
+        state.implementerRuntimeVerificationStatus === 'PASS' &&
+        state.implementerRuntimeVerificationHead === head;
+
+      if (!auditorOk || !implementerOk) {
+        const parts = [];
+        if (!auditorOk) {
+          parts.push(
+            `auditor gate: ${state.runtimeVerificationStatus ?? 'not run'} ` +
+              `(head: ${short(state.runtimeVerificationHead)} vs ${short(head)})`,
+          );
+        }
+        if (!implementerOk) {
+          parts.push(
+            `implementer gate: ${state.implementerRuntimeVerificationStatus ?? 'not run'} ` +
+              `(head: ${short(state.implementerRuntimeVerificationHead)} vs ${short(head)})`,
+          );
+        }
+        return step(
+          ACTIONS.STOP,
+          'Codex approved, but the required runtime verification gates are not satisfied: ' +
+            parts.join('; ') + '. ' +
+            'Both the implementer gate and the auditor gate must pass before publishing.',
+        );
+      }
     }
 
     return step(
@@ -267,8 +284,8 @@ export function formatLocalReport({
     `- Ready to publish (manual): ${state.readyToPublishHead ?? 'no'}`,
     `- Claude recovery required: ${state.recoveryRequired ? 'yes' : 'no'}`,
     `- Runtime verification: ${state.runtimeVerificationRequired ? 'required' : 'not required'}`,
-    `- Runtime verification status: ${state.runtimeVerificationStatus ?? '(not run)'}`,
-    `- Runtime verification head: ${state.runtimeVerificationHead ?? '(none)'}`,
+    `- Implementer RV gate: ${state.implementerRuntimeVerificationStatus ?? '(not run)'} (head: ${state.implementerRuntimeVerificationHead ?? 'none'})`,
+    `- Auditor RV gate: ${state.runtimeVerificationStatus ?? '(not run)'} (head: ${state.runtimeVerificationHead ?? 'none'})`,
   ];
 
   if (commits.length > 0) {

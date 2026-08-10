@@ -84,6 +84,14 @@ const SCHEMA = Object.freeze({
   /** The resolved runtime verification profile for the current task. */
   runtimeVerificationProfile: (value) =>
     value === null || (typeof value === 'string' && value.length <= 64),
+  /** Implementer-gate runtime verification status. */
+  implementerRuntimeVerificationStatus: (value) =>
+    value === null || RUNTIME_VERIFICATION_STATUSES.includes(value),
+  /** Commit SHA the implementer-gate runtime verification was run against. */
+  implementerRuntimeVerificationHead: (value) => value === null || SHA.test(String(value)),
+  /** Captured output from the implementer-gate runtime verification run. */
+  implementerRuntimeVerificationOutput: (value) =>
+    value === null || (typeof value === 'string' && value.length <= 100_000),
   claudeSessionId: (value) => value === null || isUuid(value),
   consecutiveFailures: (value) => Number.isInteger(value) && value >= 0 && value <= 1000,
   failingStep: (value) => value === null || (typeof value === 'string' && value.length <= 64),
@@ -124,6 +132,10 @@ export function emptyState() {
     runtimeVerificationOutput: null,
     runtimeVerificationRequired: false,
     runtimeVerificationProfile: null,
+    /** Implementer-gate runtime verification — run before implementer handoff is accepted. */
+    implementerRuntimeVerificationStatus: null,
+    implementerRuntimeVerificationHead: null,
+    implementerRuntimeVerificationOutput: null,
     claudeSessionId: null,
     consecutiveFailures: 0,
     failingStep: null,
@@ -226,6 +238,9 @@ export function recordImplementation(state, head) {
     runtimeVerificationStatus: null,
     runtimeVerificationHead: null,
     runtimeVerificationOutput: null,
+    implementerRuntimeVerificationStatus: null,
+    implementerRuntimeVerificationHead: null,
+    implementerRuntimeVerificationOutput: null,
   };
 }
 
@@ -266,6 +281,28 @@ export function recordRuntimeVerification(state, { head, status, output = null, 
     runtimeVerificationOutput: output,
     runtimeVerificationRequired: required,
     runtimeVerificationProfile: profile,
+  };
+}
+
+/**
+ * Record the outcome of the implementer-gate runtime verification run.
+ *
+ * This gate runs before the implementer's handoff is accepted. A FAIL here
+ * means the implementer must fix the code before the handoff is valid.
+ *
+ * @param {object} state
+ * @param {{
+ *   head: string,
+ *   status: 'PASS' | 'FAIL' | 'NOT_REQUIRED',
+ *   output?: string,
+ * }} result
+ */
+export function recordImplementerRuntimeVerification(state, { head, status, output = null }) {
+  return {
+    ...state,
+    implementerRuntimeVerificationStatus: status,
+    implementerRuntimeVerificationHead: head,
+    implementerRuntimeVerificationOutput: output,
   };
 }
 

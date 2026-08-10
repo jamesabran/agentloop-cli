@@ -23,6 +23,7 @@ import {
   emptyState,
   recordAudit,
   recordImplementation,
+  recordImplementerRuntimeVerification,
   recordRuntimeVerification,
 } from './state.mjs';
 
@@ -164,6 +165,7 @@ describe('normaliseTaskRuntimeVerification', () => {
 
 describe('resolveRuntimeVerification', () => {
   const projectStandard = { profile: 'standard', checks: [{ name: 'api', command: 'npm run test:api' }] };
+  const projectLightweight = { profile: 'lightweight', checks: [] };
   const taskIntegration = { profile: 'integration', checks: [{ name: 'e2e', command: 'npm run test:e2e' }] };
 
   it('returns null when neither project nor task config exists (legacy)', () => {
@@ -176,12 +178,23 @@ describe('resolveRuntimeVerification', () => {
     expect(resolved.profile).toBe('standard');
   });
 
-  it('returns null when task profile is "disabled"', () => {
-    const resolved = resolveRuntimeVerification({
-      project: projectStandard,
-      task: { profile: 'disabled', checks: [] },
-    });
-    expect(resolved).toBeNull();
+  // With project baseline requiring RV (standard), tasks may only escalate.
+  it('rejects "disabled" against a required project baseline', () => {
+    expect(() =>
+      resolveRuntimeVerification({
+        project: projectStandard,
+        task: { profile: 'disabled', checks: [] },
+      }),
+    ).toThrow(/cannot be "disabled"/);
+  });
+
+  it('rejects "lightweight" against a required project baseline', () => {
+    expect(() =>
+      resolveRuntimeVerification({
+        project: projectStandard,
+        task: { profile: 'lightweight', checks: [] },
+      }),
+    ).toThrow(/cannot be "lightweight"/);
   });
 
   it('returns project config when task profile is "inherit"', () => {
@@ -193,7 +206,7 @@ describe('resolveRuntimeVerification', () => {
     expect(resolved.checks).toHaveLength(1);
   });
 
-  it('task profile overrides project profile', () => {
+  it('task profile overrides project profile (escalation)', () => {
     const resolved = resolveRuntimeVerification({
       project: projectStandard,
       task: taskIntegration,
@@ -201,16 +214,17 @@ describe('resolveRuntimeVerification', () => {
     expect(resolved.profile).toBe('integration');
   });
 
-  it('task checks replace project checks when present', () => {
+  it('task checks APPEND to project checks when project baseline is required', () => {
     const resolved = resolveRuntimeVerification({
       project: projectStandard,
       task: taskIntegration,
     });
-    expect(resolved.checks).toHaveLength(1);
-    expect(resolved.checks[0].name).toBe('e2e');
+    expect(resolved.checks).toHaveLength(2);
+    expect(resolved.checks[0].name).toBe('api');    // project check first
+    expect(resolved.checks[1].name).toBe('e2e');    // task check appended
   });
 
-  it('project checks carry forward when task has no checks', () => {
+  it('project checks carry forward when task has no checks (required baseline)', () => {
     const resolved = resolveRuntimeVerification({
       project: projectStandard,
       task: { profile: 'integration', checks: [] },
@@ -218,6 +232,32 @@ describe('resolveRuntimeVerification', () => {
     expect(resolved.profile).toBe('integration');
     expect(resolved.checks).toHaveLength(1);
     expect(resolved.checks[0].name).toBe('api');
+  });
+
+  // With project baseline lightweight (not required) or absent, tasks have full flexibility.
+  it('allows "disabled" against a lightweight project baseline', () => {
+    const resolved = resolveRuntimeVerification({
+      project: projectLightweight,
+      task: { profile: 'disabled', checks: [] },
+    });
+    expect(resolved).toBeNull();
+  });
+
+  it('allows "disabled" when there is no project baseline', () => {
+    const resolved = resolveRuntimeVerification({
+      project: null,
+      task: { profile: 'disabled', checks: [] },
+    });
+    expect(resolved).toBeNull();
+  });
+
+  it('task checks replace project checks when project baseline is not required', () => {
+    const resolved = resolveRuntimeVerification({
+      project: projectLightweight,
+      task: taskIntegration,
+    });
+    expect(resolved.checks).toHaveLength(1);
+    expect(resolved.checks[0].name).toBe('e2e');
   });
 
   it('task with only profile and no project returns empty checks', () => {
@@ -325,6 +365,9 @@ describe('state — runtime verification', () => {
     expect(s.runtimeVerificationOutput).toBeNull();
     expect(s.runtimeVerificationRequired).toBe(false);
     expect(s.runtimeVerificationProfile).toBeNull();
+    expect(s.implementerRuntimeVerificationStatus).toBeNull();
+    expect(s.implementerRuntimeVerificationHead).toBeNull();
+    expect(s.implementerRuntimeVerificationOutput).toBeNull();
   });
 
   it('recordRuntimeVerification stores a PASS result', () => {
@@ -364,23 +407,50 @@ describe('state — runtime verification', () => {
     expect(s.runtimeVerificationRequired).toBe(false);
   });
 
-  it('recordImplementation invalidates runtime verification', () => {
-    const before = recordRuntimeVerification(task(), {
+  it('recordImplementerRuntimeVerification stores a PASS result', () => {
+    const s = recordImplementerRuntimeVerification(task(), {
+      head: A,
+      status: 'PASS',
+      output: 'implementer gate ok',
+    });
+    expect(s.implementerRuntimeVerificationStatus).toBe('PASS');
+    expect(s.implementerRuntimeVerificationHead).toBe(A);
+    expect(s.implementerRuntimeVerificationOutput).toBe('implementer gate ok');
+  });
+
+  it('recordImplementerRuntimeVerification stores a FAIL result', () => {
+    const s = recordImplementerRuntimeVerification(task(), {
+      head: A,
+      status: 'FAIL',
+      output: 'implementer gate failed',
+    });
+    expect(s.implementerRuntimeVerificationStatus).toBe('FAIL');
+    expect(s.implementerRuntimeVerificationOutput).toBe('implementer gate failed');
+  });
+
+  it('recordImplementation invalidates both runtime verification gates', () => {
+    let before = recordRuntimeVerification(task(), {
       head: A,
       status: 'PASS',
       required: true,
     });
+    before = recordImplementerRuntimeVerification(before, {
+      head: A,
+      status: 'PASS',
+    });
     expect(before.runtimeVerificationStatus).toBe('PASS');
+    expect(before.implementerRuntimeVerificationStatus).toBe('PASS');
 
     const after = recordImplementation(before, B);
     expect(after.runtimeVerificationStatus).toBeNull();
     expect(after.runtimeVerificationHead).toBeNull();
     expect(after.runtimeVerificationOutput).toBeNull();
+    expect(after.implementerRuntimeVerificationStatus).toBeNull();
+    expect(after.implementerRuntimeVerificationHead).toBeNull();
+    expect(after.implementerRuntimeVerificationOutput).toBeNull();
   });
 
   it('runtime verification survives state save/load round-trip', () => {
-    // We test the schema validation by constructing state with the runtime
-    // verification fields populated — the SCHEMA already includes them.
     const s = recordRuntimeVerification(task(), {
       head: A,
       status: 'PASS',
@@ -446,14 +516,13 @@ describe('decideLocal — runtime verification gates', () => {
     expect(decision.action).toBe(ACTIONS.AUDIT);
   });
 
-  it('PASS runtime gate allows publish to proceed', () => {
-    const state = recordRuntimeVerification(
-      recordAudit(
-        task({ implementationHead: A, lastAuditedHead: A, round: 1 }),
-        { head: A, verdict: 'APPROVED' },
-      ),
-      { head: A, status: 'PASS', required: true },
+  it('PASS runtime gate allows publish to proceed (both gates)', () => {
+    let state = recordAudit(
+      task({ implementationHead: A, lastAuditedHead: A, round: 1 }),
+      { head: A, verdict: 'APPROVED' },
     );
+    state = recordRuntimeVerification(state, { head: A, status: 'PASS', required: true });
+    state = recordImplementerRuntimeVerification(state, { head: A, status: 'PASS' });
     const decision = decideLocal({ state, head: A });
     expect(decision.action).toBe(ACTIONS.PUBLISH);
   });
@@ -471,13 +540,12 @@ describe('decideLocal — runtime verification gates', () => {
 
   // FAIL: required runtime verification failed — publish blocked.
   it('FAIL runtime gate blocks publish even with APPROVED verdict', () => {
-    const state = recordRuntimeVerification(
-      recordAudit(
-        task({ implementationHead: A, lastAuditedHead: A, round: 1 }),
-        { head: A, verdict: 'APPROVED' },
-      ),
-      { head: A, status: 'FAIL', output: 'broken', required: true },
+    let state = recordAudit(
+      task({ implementationHead: A, lastAuditedHead: A, round: 1 }),
+      { head: A, verdict: 'APPROVED' },
     );
+    state = recordRuntimeVerification(state, { head: A, status: 'FAIL', output: 'broken', required: true });
+    state = recordImplementerRuntimeVerification(state, { head: A, status: 'PASS' });
     const decision = decideLocal({ state, head: A });
     expect(decision.action).toBe(ACTIONS.STOP);
     // The earlier hard-blocker check (FAIL for current HEAD) fires before the
@@ -502,7 +570,7 @@ describe('decideLocal — runtime verification gates', () => {
     expect(decision.action).toBe(ACTIONS.AUDIT);
   });
 
-  it('missing runtime verification blocks publish', () => {
+  it('missing runtime verification blocks publish (both gates absent)', () => {
     const state = recordAudit(
       task({
         implementationHead: A,
@@ -511,6 +579,8 @@ describe('decideLocal — runtime verification gates', () => {
         runtimeVerificationRequired: true,
         runtimeVerificationStatus: null,
         runtimeVerificationHead: null,
+        implementerRuntimeVerificationStatus: null,
+        implementerRuntimeVerificationHead: null,
       }),
       { head: A, verdict: 'APPROVED' },
     );
@@ -529,13 +599,27 @@ describe('decideLocal — runtime verification gates', () => {
         round: 1,
         runtimeVerificationRequired: true,
         runtimeVerificationStatus: 'PASS',
-        runtimeVerificationHead: A, // verified against A, but HEAD is now B
+        runtimeVerificationHead: A, // auditor gate against A, but HEAD is now B
+        implementerRuntimeVerificationStatus: 'PASS',
+        implementerRuntimeVerificationHead: A, // implementer gate also against A
       }),
       { head: B, verdict: 'APPROVED' },
     );
     const decision = decideLocal({ state, head: B });
     expect(decision.action).toBe(ACTIONS.STOP);
     expect(decision.reason).toMatch(/runtime verification/i);
+  });
+
+  it('implementer gate missing but auditor gate PASS blocks publish', () => {
+    let state = recordAudit(
+      task({ implementationHead: A, lastAuditedHead: A, round: 1 }),
+      { head: A, verdict: 'APPROVED' },
+    );
+    state = recordRuntimeVerification(state, { head: A, status: 'PASS', required: true });
+    // Implementer gate not recorded
+    const decision = decideLocal({ state, head: A });
+    expect(decision.action).toBe(ACTIONS.STOP);
+    expect(decision.reason).toMatch(/implementer gate/);
   });
 
   // A new commit voids the runtime verification result — the state module

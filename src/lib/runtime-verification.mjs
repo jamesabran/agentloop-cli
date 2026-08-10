@@ -182,16 +182,31 @@ export function normaliseTaskRuntimeVerification(value, taskId) {
 }
 
 /**
+ * The project baseline profile, when set, establishes a floor that tasks may
+ * only escalate — never weaken.  "disabled" and "lightweight" are not
+ * permitted as task profiles when the project baseline requires runtime
+ * verification.
+ */
+const PROJECT_REQUIRED_PROFILES = new Set(['standard', 'integration', 'custom']);
+
+/**
  * Resolve the effective runtime-verification configuration for one task.
  *
  * Merge rules:
  *  1. No project config and no task config → null (NOT_REQUIRED).
- *  2. Task `profile: "disabled"` → null (NOT_REQUIRED).
- *  3. Task `profile: "inherit"` (or absent) → project config as-is.
- *  4. Task `profile` is a real profile → it overrides the project profile;
- *     task checks replace project checks when present, otherwise project
- *     checks carry forward unchanged.
- *  5. A task with no runtimeVerification in a project that also has none → null.
+ *  2. Project baseline is required (standard/integration/custom):
+ *     a. Task `"disabled"` is rejected — a task cannot opt out of a
+ *        required project baseline.
+ *     b. Task `"lightweight"` is rejected — cannot weaken a required
+ *        baseline.
+ *     c. Task `"inherit"` (or absent) → project config as-is.
+ *     d. Task checks APPEND to project checks — the baseline is a floor,
+ *        never replaced.
+ *  3. Project baseline is lightweight or absent:
+ *     a. Task `"disabled"` → null (NOT_REQUIRED).
+ *     b. Task `"inherit"` (or absent) → project config as-is (may be null).
+ *     c. Task explicit profile → use it; task checks replace when present.
+ *  4. A task with no runtimeVerification in a project that also has none → null.
  *
  * @param {{
  *   project: { profile: string, checks: { name: string, command: string }[] } | null,
@@ -202,6 +217,40 @@ export function normaliseTaskRuntimeVerification(value, taskId) {
 export function resolveRuntimeVerification({ project, task }) {
   // No config at either level → NOT_REQUIRED.
   if (!project && !task) return null;
+
+  const projectRequired =
+    project !== null && PROJECT_REQUIRED_PROFILES.has(project.profile);
+
+  if (projectRequired) {
+    // Project baseline requires runtime verification — tasks may only
+    // escalate, never weaken.
+
+    if (task && task.profile === DISABLED) {
+      throw new Error(
+        'Task runtimeVerification.profile cannot be "disabled" when the project ' +
+          `baseline requires runtime verification (profile: ${project.profile}). ` +
+          'A required project baseline is a floor — tasks may only escalate it.',
+      );
+    }
+
+    if (task && task.profile === 'lightweight') {
+      throw new Error(
+        'Task runtimeVerification.profile cannot be "lightweight" when the project ' +
+          `baseline requires runtime verification (profile: ${project.profile}). ` +
+          'Tasks may only maintain or escalate the project baseline.',
+      );
+    }
+
+    // Task inherits or is absent → project as-is.
+    if (!task || task.profile === INHERIT) return { ...project };
+
+    // Task sets an explicit profile → use it. Task checks APPEND to
+    // project checks — the baseline is a floor.
+    const checks = [...project.checks, ...task.checks];
+    return Object.freeze({ profile: task.profile, checks: Object.freeze(checks) });
+  }
+
+  // Project baseline is lightweight or absent — tasks have full flexibility.
 
   // Task explicitly disabled.
   if (task && task.profile === DISABLED) return null;
