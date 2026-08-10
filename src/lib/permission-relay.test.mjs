@@ -244,6 +244,25 @@ describe('tool_use_id-scoped file isolation', () => {
     expect(b.approved).toBe(false);
   });
 
+  it('pollForRequest claims ownership by deleting the request file', async () => {
+    const dir = makeWorkDir();
+    const reqPath = path.join(dir, 'perm-req-toolu_claim.json');
+    fs.writeFileSync(reqPath, JSON.stringify({
+      tool_name: 'Bash', tool_input: { command: 'ls' },
+      tool_use_id: 'toolu_claim', nonce: 'nc', timestamp: Date.now(),
+    }), 'utf8');
+
+    // First poll: should find and delete the request.
+    const first = await pollForRequest(dir, 200);
+    expect(first).not.toBeNull();
+    expect(first.tool_use_id).toBe('toolu_claim');
+    expect(fs.existsSync(reqPath)).toBe(false);
+
+    // Second poll: should NOT find it again.
+    const second = await pollForRequest(dir, 200);
+    expect(second).toBeNull();
+  });
+
   it('pollForRequest finds requests across all tool_use_ids', async () => {
     const dir = makeWorkDir();
     // Write a request file as a hook would.

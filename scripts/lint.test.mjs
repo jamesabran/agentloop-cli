@@ -157,7 +157,7 @@ describe('findDebuggerStatements', () => {
   });
 
   it('does not flag a property named debugger', () => {
-    // { debugger: false } is valid ES — debugger is a reserved word but
+    // { debugger: false } is valid ES --- debugger is a reserved word but
     // can appear as an unquoted property name in object literals.
     const result = findDebuggerStatements(
       'const config = { debugger: false };',
@@ -218,7 +218,7 @@ describe('findDebuggerStatements', () => {
 
   it('does not flag debugger in regex with braces', () => {
     // Regex literals can contain { } quantifiers and character classes
-    // with } — these must not be confused with interpolation braces.
+    // with } --- these must not be confused with interpolation braces.
     expect(findDebuggerStatements('const re = /a{2,4}/;')).toEqual([]);
     expect(findDebuggerStatements('const re = /[}]/;')).toEqual([]);
   });
@@ -241,7 +241,7 @@ describe('findDebuggerStatements', () => {
 
   it('finds debugger even when a // line appears inside a block comment', () => {
     // The `// */` inside the block comment must not hide the close marker
-    // from the scanner — if `//` is stripped before block-comment tracking,
+    // from the scanner --- if `//` is stripped before block-comment tracking,
     // the `*/` is lost and the genuine `debugger;` on line 3 is missed.
     const result = findDebuggerStatements('/* open\n// */\ndebugger;');
     expect(result).toEqual([3]);
@@ -292,7 +292,7 @@ describe('lint script self-test', () => {
   const allFiles = [];
   const baseDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-  // Collect all .mjs files the lint scanner would check — src/, bin/, scripts/
+  // Collect all .mjs files the lint scanner would check --- src/, bin/, scripts/
   function collect(dir) {
     let entries;
     try {
@@ -326,7 +326,7 @@ describe('lint script self-test', () => {
     // Every .mjs file under src/, bin/, and scripts/ must produce zero
     // false-positive debugger-statement reports. The word "debugger"
     // appears in comments, strings, regexes, and variable names
-    // throughout this project — none of those are genuine statements.
+    // throughout this project --- none of those are genuine statements.
     const falsePositives = [];
     for (const file of allFiles) {
       const source = fs.readFileSync(file, 'utf8');

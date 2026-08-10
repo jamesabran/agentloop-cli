@@ -319,7 +319,13 @@ export async function pollForRequest(workDir, timeoutMs = 200) {
         if (!name.startsWith('perm-req-') || !name.endsWith('.json')) continue;
         const p = path.join(workDir, name);
         const raw = fs.readFileSync(p, 'utf8');
-        return JSON.parse(raw);
+        const request = JSON.parse(raw);
+        // Claim ownership: delete the request file so a second poll cycle
+        // never re-reads and re-prompts for the same tool call.  The hook
+        // script also tries to delete it when it consumes the response;
+        // that is harmless (ENOENT in a try/catch).
+        try { fs.unlinkSync(p); } catch { /* ok */ }
+        return request;
       }
     } catch { /* directory may not exist yet */ }
     await _sleep(50);
