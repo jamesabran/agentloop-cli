@@ -1,0 +1,888 @@
+/**
+ * ALCLI interactive project setup / configuration.
+ *
+ * Walks through project identification, agent roles, verification, and
+ * controller defaults in a clean terminal prompt.  Every section has sensible
+ * defaults — press Enter to accept them.  Provider-specific settings (e.g.
+ * Claude permission mode) only appear when the provider is assigned to at
+ * least one role.
+ *
+ * The module is split into two layers so both the terminal UX and the
+ * configuration model are independently testable:
+ *
+ *   buildConfig(existingConfig, prompt) → new config object (no I/O)
+ *   runSetup()                          → full terminal flow (writes to disk)
+ *
+ * Reconfiguration reuses the same code path: when an existing
+ * `agentloop.config.json` is present its values become the defaults.
+ */
+
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import process from 'node:process';
+import { createInterface } from 'node:readline';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { LOGICAL_ROLES, PROVIDER_CAPABILITIES } from './roles.mjs';
+
+// Lazily imported so tests can set up the filesystem before config loads.
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const CONFIG_MODULE_URL = pathToFileURL(path.join(HERE, 'config.mjs')).href;
+
+/* ------------------------------------------------------------------ *
+ * Constants                                                            *
+ * ------------------------------------------------------------------ */
+
+const CONFIG_FILE_NAME = 'agentloop.config.json';
+
+const PUBLISH_MODES = Object.freeze(['manual', 'auto']);
+const CLAUDE_PERMISSION_MODES = Object.freeze([
+  'default',
+  'acceptEdits',
+  'bypassPermissions',
+  'plan',
+]);
+const CLAUDE_RELAY_MODES = Object.freeze(['interactive', 'auto']);
+
+const RV_PROFILE_CHOICES = Object.freeze([
+  { value: 'lightweight', label: 'Lightweight — runtime verification is NOT required' },
+  { value: 'standard', label: 'Standard — basic smoke / integration checks required' },
+  { value: 'integration', label: 'Integration — full integration suite required' },
+  { value: 'custom', label: 'Custom — project-defined verification commands' },
+]);
+
+const DEFAULT_CHECKS = Object.freeze([
+  { name: 'typecheck', script: 'typecheck' },
+  { name: 'lint', script: 'lint' },
+  { name: 'test', script: 'test' },
+  { name: 'build', script: 'build' },
+]);
+
+/* ------------------------------------------------------------------ *
+ * Prompt interface                                                     *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Terminal implementation of the prompt interface.  Uses `readline` for
+ * interactive input.  Instantiated once per `runSetup()` call.
+ */
+class TerminalPrompt {
+  #rl;
+
+  constructor() {
+    this.#rl = null;
+  }
+
+  _rl() {
+    if (!this.#rl) {
+      this.#rl = createInterface({ input: process.stdin, output: process.stdout });
+    }
+    return this.#rl;
+  }
+
+  close() {
+    if (this.#rl) {
+      this.#rl.close();
+      this.#rl = null;
+    }
+  }
+
+  async question(text) {
+    const rl = this._rl();
+    return new Promise((resolve) => rl.question(text, resolve));
+  }
+
+  display(text) {
+    process.stdout.write(`${text}\n`);
+  }
+
+  section(title) {
+    this.display(`\n${'─'.repeat(60)}`);
+    this.display(`  ${title}`);
+    this.display(`${'─'.repeat(60)}`);
+  }
+
+  async confirm(text, defaultValue = true) {
+    const hint = defaultValue ? '[Y/n]' : '[y/N]';
+    let answer = await this.question(`  ${text} ${hint} `);
+    answer = answer.trim().toLowerCase();
+    if (answer === '') return defaultValue;
+    return answer === 'y' || answer === 'yes';
+  }
+
+  async select(text, options, defaultValue) {
+    this.display(`  ${text}`);
+    let defaultIdx = -1;
+    for (let i = 0; i < options.length; i += 1) {
+      const marker = options[i].value === defaultValue ? ' ★' : '  ';
+      if (options[i].value === defaultValue) defaultIdx = i;
+      this.display(`    ${i + 1}. ${options[i].label}${marker}`);
+    }
+    const hint = defaultIdx >= 0 ? ` [${defaultIdx + 1}]` : '';
+    const raw = await this.question(`  Choose 1-${options.length}${hint}: `);
+    const trimmed = raw.trim();
+    if (trimmed === '' && defaultIdx >= 0) return defaultValue;
+    const idx = Number(trimmed) - 1;
+    if (Number.isInteger(idx) && idx >= 0 && idx < options.length) {
+      return options[idx].value;
+    }
+    this.display(`  Invalid choice. Using default: ${defaultValue}`);
+    return defaultValue;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Validation helpers                                                   *
+ * ------------------------------------------------------------------ */
+
+const CHECK_TOKEN = /^[A-Za-z0-9][A-Za-z0-9:_-]*$/;
+const COMMAND_TOKEN = /^[A-Za-z0-9][A-Za-z0-9:_\-\s./]*$/;
+
+function isValidCheckName(name) {
+  return CHECK_TOKEN.test(name);
+}
+
+function isValidCheckScript(script) {
+  return CHECK_TOKEN.test(script);
+}
+
+function isValidRvCommand(command) {
+  return COMMAND_TOKEN.test(command);
+}
+
+/**
+ * Validate a complete config object by loading it through the real config
+ * module in a subprocess.  Returns { ok: true } or { ok: false, errors: [...] }.
+ *
+ * We write the candidate config to the target path first so the subprocess
+ * reads the exact file we intend to save.  The original file (if any) is
+ * restored afterwards when `restoreOriginal` is provided.
+ */
+function validateAgainstConfigModule(configPath, { env } = {}) {
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `import(${JSON.stringify(CONFIG_MODULE_URL)}).then(() => process.exit(0), (e) => { process.stderr.write(e.message); process.exit(1); });`,
+    ],
+    {
+      cwd: path.dirname(configPath),
+      env: env ?? process.env,
+      encoding: 'utf8',
+      timeout: 15_000,
+    },
+  );
+
+  if (result.status === 0) return { ok: true };
+  return {
+    ok: false,
+    errors: (result.stderr || 'Unknown validation error')
+      .split(/\r?\n/)
+      .filter(Boolean),
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Section handlers                                                     *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Section 1 — Project identification.
+ *
+ * @param {object} existing — current config values (may be {})
+ * @param {object} prompt — prompt interface
+ * @returns {Promise<object>} config fragment
+ */
+async function sectionProject(existing, prompt) {
+  prompt.section('Project');
+
+  const repo = await prompt.question(
+    `  Repository (owner/repo) [${existing.repo || '(auto-detect from git remote)'}]: `,
+  );
+  const baseBranch = await prompt.question(
+    `  Base branch [${existing.baseBranch || 'main'}]: `,
+  );
+  const remote = await prompt.question(
+    `  Git remote [${existing.remote || 'origin'}]: `,
+  );
+  const tasksFile = await prompt.question(
+    `  Task-file path (relative to repo root) [${existing.tasksFile || 'agentloop.tasks.json'}]: `,
+  );
+
+  return {
+    ...(repo.trim() ? { repo: repo.trim() } : (existing.repo ? { repo: existing.repo } : {})),
+    ...(baseBranch.trim() ? { baseBranch: baseBranch.trim() } : (existing.baseBranch ? { baseBranch: existing.baseBranch } : {})),
+    ...(remote.trim() ? { remote: remote.trim() } : (existing.remote ? { remote: existing.remote } : {})),
+    ...(tasksFile.trim() ? { tasksFile: tasksFile.trim() } : (existing.tasksFile ? { tasksFile: existing.tasksFile } : {})),
+  };
+}
+
+/**
+ * Section 2 — Agent roles.
+ *
+ * Each logical role (planner, implementer, auditor) is mapped to a provider.
+ * The available providers are those that support the role.
+ *
+ * @param {object} existing — current config values
+ * @param {object} prompt — prompt interface
+ * @returns {Promise<object>} config fragment with `roles`
+ */
+async function sectionRoles(existing, prompt) {
+  prompt.section('Agent Roles');
+
+  const existingRoles = existing.roles || {};
+  const roles = {};
+
+  const ROLE_LABELS = {
+    planner: 'Planner — plans the implementation approach before coding starts',
+    implementer: 'Implementer — writes code and responds to audit findings',
+    auditor: 'Auditor — read-only review; finds defects, never writes code',
+  };
+
+  for (const role of LOGICAL_ROLES) {
+    const currentProvider =
+      (typeof existingRoles[role] === 'string' && existingRoles[role].trim()) ||
+      null;
+
+    // Which providers support this role?
+    const available = Object.entries(PROVIDER_CAPABILITIES)
+      .filter(([, caps]) => caps.includes(role))
+      .map(([provider]) => provider);
+
+    if (available.length === 0) {
+      prompt.display(`  ${role}: no providers available — skipping`);
+      continue;
+    }
+
+    if (available.length === 1) {
+      const only = available[0];
+      const marker = currentProvider === only ? ' (default)' : '';
+      prompt.display(`  ${role}: ${only}${marker} (only provider that supports this role)`);
+      roles[role] = only;
+      continue;
+    }
+
+    prompt.display(`  ${ROLE_LABELS[role]}`);
+    const options = available.map((p) => ({ value: p, label: p }));
+    const def = currentProvider || available[0];
+    roles[role] = await prompt.select('Provider:', options, def);
+    prompt.display('');
+  }
+
+  return { roles };
+}
+
+/**
+ * Section 3 — Verification.
+ *
+ * Deterministic checks (typecheck, lint, test, build) and runtime verification
+ * profile (lightweight, standard, integration, custom).
+ *
+ * @param {object} existing — current config values
+ * @param {object} prompt — prompt interface
+ * @returns {Promise<object>} config fragment
+ */
+async function sectionVerification(existing, prompt) {
+  prompt.section('Verification');
+
+  // --- Deterministic checks ---
+  const existingChecks = existing.checks || [];
+  const hasCustomChecks = existingChecks.length > 0;
+
+  prompt.display('  Deterministic checks (run before each audit):');
+  if (hasCustomChecks) {
+    prompt.display(`    Currently: ${existingChecks.map((c) => `${c.name}=${c.script}`).join(', ')}`);
+  } else {
+    prompt.display(`    Default: ${DEFAULT_CHECKS.map((c) => c.name).join(', ')}`);
+  }
+
+  const useDefaults = await prompt.confirm('Use default checks (typecheck, lint, test, build)?', !hasCustomChecks);
+
+  let checks;
+  if (useDefaults) {
+    checks = DEFAULT_CHECKS.map((c) => ({ ...c }));
+  } else {
+    checks = [];
+    prompt.display('  Enter checks one at a time (empty name to finish):');
+    let idx = 1;
+    while (true) {
+      const name = await prompt.question(`    Check #${idx} name: `);
+      if (!name.trim()) break;
+      if (!isValidCheckName(name.trim())) {
+        prompt.display(`    Invalid name — must match ${CHECK_TOKEN}. Skipping.`);
+        continue;
+      }
+      const script = await prompt.question(`    Check #${idx} script: `);
+      if (!script.trim()) break;
+      if (!isValidCheckScript(script.trim())) {
+        prompt.display(`    Invalid script — must match ${CHECK_TOKEN}. Skipping.`);
+        continue;
+      }
+      checks.push({ name: name.trim(), script: script.trim() });
+      idx += 1;
+    }
+    if (checks.length === 0) {
+      prompt.display('  No checks entered — using defaults.');
+      checks = DEFAULT_CHECKS.map((c) => ({ ...c }));
+    }
+  }
+
+  // --- Runtime verification ---
+  const existingRv = existing.runtimeVerification || {};
+  prompt.display('');
+  prompt.display('  Runtime verification profile:');
+
+  const currentProfile = existingRv.profile || 'lightweight';
+  const profile = await prompt.select(
+    'Select the baseline runtime verification requirement for this project:',
+    RV_PROFILE_CHOICES,
+    currentProfile,
+  );
+  prompt.display('');
+
+  let rvChecks = [];
+  if (profile !== 'lightweight') {
+    const existingRvChecks = existingRv.checks || [];
+    const hasRvChecks = existingRvChecks.length > 0;
+    if (hasRvChecks) {
+      prompt.display(`    Current checks: ${existingRvChecks.map((c) => c.name).join(', ')}`);
+    }
+    const configureRv = await prompt.confirm(
+      'Configure runtime verification commands?',
+      !hasRvChecks,
+    );
+    if (configureRv) {
+      prompt.display('    Enter runtime check commands one at a time (empty name to finish):');
+      let idx = 1;
+      while (true) {
+        const name = await prompt.question(`      Check #${idx} name: `);
+        if (!name.trim()) break;
+        if (!isValidCheckName(name.trim())) {
+          prompt.display(`      Invalid name — must match ${CHECK_TOKEN}. Skipping.`);
+          continue;
+        }
+        const command = await prompt.question(`      Check #${idx} command (e.g. "npm run test:integration"): `);
+        if (!command.trim()) break;
+        if (!isValidRvCommand(command.trim())) {
+          prompt.display(`      Invalid command — must match ${COMMAND_TOKEN}. Skipping.`);
+          continue;
+        }
+        rvChecks.push({ name: name.trim(), command: command.trim() });
+        idx += 1;
+      }
+    }
+    if (rvChecks.length === 0 && hasRvChecks) {
+      rvChecks = existingRvChecks.map((c) => ({ ...c }));
+    }
+    if (rvChecks.length === 0) {
+      prompt.display('    Warning: a runtime verification profile is set but no checks are configured.');
+      prompt.display('    Tasks requiring runtime checks will fail until checks are added.');
+    }
+  }
+
+  const result = {};
+  if (!useDefaults || hasCustomChecks) {
+    result.checks = checks;
+  }
+  if (profile !== 'lightweight' || rvChecks.length > 0 || existingRv.profile) {
+    result.runtimeVerification = {
+      ...(profile !== 'lightweight' ? { profile } : {}),
+      ...(rvChecks.length > 0 ? { checks: rvChecks } : {}),
+    };
+  }
+
+  return result;
+}
+
+/**
+ * Section 4 — Controller defaults.
+ *
+ * Publish behaviour and correction/retry limits.
+ *
+ * @param {object} existing — current config values
+ * @param {object} prompt — prompt interface
+ * @returns {Promise<object>} config fragment
+ */
+async function sectionController(existing, prompt) {
+  prompt.section('Controller Defaults');
+
+  // Publish mode
+  const currentPublish = PUBLISH_MODES.includes(existing.publishMode)
+    ? existing.publishMode
+    : 'manual';
+  const publishMode = await prompt.select(
+    'Publishing behaviour for approved commits:',
+    [
+      {
+        value: 'manual',
+        label: 'Manual — controller stops before pushing; you inspect and push',
+      },
+      {
+        value: 'auto',
+        label: 'Auto — controller pushes immediately after Codex approval',
+      },
+    ],
+    currentPublish,
+  );
+
+  // Max change rounds
+  const currentRounds =
+    Number.isInteger(existing.maxChangeRounds) && existing.maxChangeRounds > 0
+      ? String(existing.maxChangeRounds)
+      : '2';
+  const roundsRaw = await prompt.question(
+    `  Max correction/retry rounds per task [${currentRounds}]: `,
+  );
+  const maxChangeRounds = roundsRaw.trim()
+    ? Number(roundsRaw.trim())
+    : Number(currentRounds);
+
+  const result = {};
+  if (publishMode !== 'manual') result.publishMode = publishMode;
+  if (maxChangeRounds !== 2) result.maxChangeRounds = maxChangeRounds;
+
+  return result;
+}
+
+/**
+ * Section 5 — Provider-specific settings.
+ *
+ * Only shown for providers that are assigned to at least one role in the
+ * current mapping.  Claude permission mode and relay mode only appear when
+ * Claude is used.
+ *
+ * @param {object} existing — current config values
+ * @param {object} roles — the resolved role mapping ({ planner, implementer, auditor })
+ * @param {object} prompt — prompt interface
+ * @returns {Promise<object>} config fragment
+ */
+async function sectionProviderSettings(existing, prompt, roles) {
+  const usedProviders = new Set(Object.values(roles));
+
+  if (!usedProviders.has('claude')) return {};
+
+  prompt.section('Claude Provider Settings');
+
+  const existingClaude = (existing.claude && typeof existing.claude === 'object')
+    ? existing.claude
+    : {};
+
+  // Permission mode
+  const currentPerm = CLAUDE_PERMISSION_MODES.includes(existingClaude.permissionMode)
+    ? existingClaude.permissionMode
+    : 'acceptEdits';
+  const permissionMode = await prompt.select(
+    'Claude permission mode (--permission-mode flag):',
+    [
+      { value: 'default', label: 'default — prompt for each tool use' },
+      { value: 'acceptEdits', label: 'acceptEdits — auto-approve file edits (recommended)' },
+      { value: 'bypassPermissions', label: 'bypassPermissions — skip all permission prompts (not recommended)' },
+      { value: 'plan', label: 'plan — read-only mode, no edits' },
+    ],
+    currentPerm,
+  );
+  prompt.display('');
+
+  // Relay mode (ALCLI-specific)
+  const currentRelay = CLAUDE_RELAY_MODES.includes(existingClaude.relayMode)
+    ? existingClaude.relayMode
+    : 'interactive';
+  const relayMode = await prompt.select(
+    'ALCLI relay mode (permission requests outside the allowlist):',
+    [
+      {
+        value: 'interactive',
+        label: 'Interactive — relay to terminal for user approval (safe default)',
+      },
+      {
+        value: 'auto',
+        label: 'Auto — auto-approve after hard-deny checks (unattended operation)',
+      },
+    ],
+    currentRelay,
+  );
+
+  return {
+    claude: {
+      ...(permissionMode !== 'acceptEdits' ? { permissionMode } : {}),
+      ...(relayMode !== 'interactive' ? { relayMode } : {}),
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Config assembly & persistence                                        *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Build a complete `agentloop.config.json` object from the collected
+ * section fragments.  Only writes keys that differ from defaults.
+ *
+ * @param {object} fragments — collected section results
+ * @returns {object} config object suitable for JSON serialization
+ */
+export function assembleConfig(fragments) {
+  const {
+    project = {},
+    roles = {},
+    verification = {},
+    controller = {},
+    providerSettings = {},
+  } = fragments;
+
+  const config = {};
+
+  // Project
+  if (project.repo) config.repo = project.repo;
+  if (project.baseBranch) config.baseBranch = project.baseBranch;
+  if (project.remote) config.remote = project.remote;
+  if (project.tasksFile) config.tasksFile = project.tasksFile;
+
+  // Roles — only if non-default
+  const hasNonDefaultRoles = LOGICAL_ROLES.some((role) => {
+    const def = role === 'auditor' ? 'codex' : 'claude';
+    return (roles[role] || def) !== def;
+  });
+  if (hasNonDefaultRoles) {
+    config.roles = {};
+    for (const role of LOGICAL_ROLES) {
+      const def = role === 'auditor' ? 'codex' : 'claude';
+      if ((roles[role] || def) !== def) {
+        config.roles[role] = roles[role] || def;
+      }
+    }
+  }
+
+  // Deterministic checks
+  if (verification.checks && verification.checks.length > 0) {
+    config.checks = verification.checks.map((c) => ({ name: c.name, script: c.script }));
+  }
+
+  // Runtime verification
+  if (verification.runtimeVerification) {
+    const rv = {};
+    if (verification.runtimeVerification.profile) {
+      rv.profile = verification.runtimeVerification.profile;
+    }
+    if (verification.runtimeVerification.checks && verification.runtimeVerification.checks.length > 0) {
+      rv.checks = verification.runtimeVerification.checks.map((c) => ({
+        name: c.name,
+        command: c.command,
+      }));
+    }
+    if (Object.keys(rv).length > 0) config.runtimeVerification = rv;
+  }
+
+  // Controller — only write values that differ from defaults.
+  if (controller.publishMode && controller.publishMode !== 'manual') {
+    config.publishMode = controller.publishMode;
+  }
+  if (Number.isInteger(controller.maxChangeRounds) && controller.maxChangeRounds !== 2) {
+    config.maxChangeRounds = controller.maxChangeRounds;
+  }
+
+  // Provider settings — only write non-default values.
+  if (providerSettings.claude && typeof providerSettings.claude === 'object') {
+    const claude = {};
+    if (providerSettings.claude.permissionMode && providerSettings.claude.permissionMode !== 'acceptEdits') {
+      claude.permissionMode = providerSettings.claude.permissionMode;
+    }
+    if (providerSettings.claude.relayMode && providerSettings.claude.relayMode !== 'interactive') {
+      claude.relayMode = providerSettings.claude.relayMode;
+    }
+    if (Object.keys(claude).length > 0) config.claude = claude;
+  }
+
+  return config;
+}
+
+/**
+ * Write config to `agentloop.config.json` at the project root.
+ *
+ * Does NOT validate — call `validateConfig` first.
+ *
+ * @param {object} config — the config object to write
+ * @param {string} projectRoot — absolute path to the project root
+ */
+export function saveConfig(config, projectRoot) {
+  const file = path.join(projectRoot, CONFIG_FILE_NAME);
+  const json = JSON.stringify(config, null, 2) + '\n';
+  fs.writeFileSync(file, json, 'utf8');
+}
+
+/**
+ * Validate a config file by importing the real config module in a subprocess.
+ *
+ * @param {string} projectRoot — absolute path to the project root
+ * @param {object} [options]
+ * @param {object} [options.env] — environment variables for the subprocess
+ * @returns {{ ok: boolean, errors?: string[] }}
+ */
+export function validateConfig(projectRoot, options) {
+  return validateAgainstConfigModule(
+    path.join(projectRoot, CONFIG_FILE_NAME),
+    options,
+  );
+}
+
+/**
+ * Load the existing project config (if any) from `agentloop.config.json`.
+ *
+ * Returns an empty object when no config file exists.  Does NOT delegate to
+ * the config module — it reads the raw JSON so we can present values as
+ * defaults during reconfiguration.
+ *
+ * @param {string} projectRoot — absolute path to the project root
+ * @returns {object}
+ */
+export function loadExistingConfig(projectRoot) {
+  const file = path.join(projectRoot, CONFIG_FILE_NAME);
+  if (!fs.existsSync(file)) return {};
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    // Corrupt config — treat as empty; the validation step will catch it.
+    return {};
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {};
+  }
+  return parsed;
+}
+
+/* ------------------------------------------------------------------ *
+ * Summary formatting                                                   *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Return a human-readable summary of the config that will be saved.
+ *
+ * @param {object} config — the assembled config object
+ * @param {object} roles — the resolved role mapping
+ * @returns {string}
+ */
+export function formatSummary(config, roles) {
+  const lines = [];
+
+  lines.push('');
+  lines.push('═══════════════════════════════════════════════════════════');
+  lines.push('  Configuration Summary');
+  lines.push('═══════════════════════════════════════════════════════════');
+
+  // Project
+  lines.push('');
+  lines.push('  Project');
+  lines.push(`    Repository:    ${config.repo || '(auto-detect from git remote)'}`);
+  lines.push(`    Base branch:   ${config.baseBranch || 'main'}`);
+  lines.push(`    Remote:        ${config.remote || 'origin'}`);
+  lines.push(`    Task file:     ${config.tasksFile || 'agentloop.tasks.json'}`);
+
+  // Roles
+  lines.push('');
+  lines.push('  Agent Roles');
+  for (const role of LOGICAL_ROLES) {
+    const provider = roles[role] || (role === 'auditor' ? 'codex' : 'claude');
+    lines.push(`    ${role}: ${provider}`);
+  }
+
+  // Verification
+  lines.push('');
+  lines.push('  Verification');
+  const checks = config.checks || DEFAULT_CHECKS.map((c) => ({ name: c.name, script: c.script }));
+  lines.push(`    Checks:   ${checks.map((c) => c.name).join(', ')}`);
+  if (config.runtimeVerification) {
+    lines.push(`    Profile:  ${config.runtimeVerification.profile || 'lightweight'}`);
+    if (config.runtimeVerification.checks && config.runtimeVerification.checks.length > 0) {
+      for (const c of config.runtimeVerification.checks) {
+        lines.push(`              ${c.name}: ${c.command}`);
+      }
+    } else {
+      lines.push('              (no checks configured)');
+    }
+  } else {
+    lines.push('    Profile:  lightweight (runtime verification not required)');
+  }
+
+  // Controller
+  lines.push('');
+  lines.push('  Controller');
+  lines.push(`    Publish mode:       ${config.publishMode || 'manual'}`);
+  lines.push(`    Max change rounds:  ${config.maxChangeRounds ?? 2}`);
+
+  // Provider settings
+  if (config.claude) {
+    lines.push('');
+    lines.push('  Claude Provider Settings');
+    if (config.claude.permissionMode) {
+      lines.push(`    Permission mode:  ${config.claude.permissionMode}`);
+    } else {
+      lines.push('    Permission mode:  acceptEdits (default)');
+    }
+    if (config.claude.relayMode) {
+      lines.push(`    Relay mode:       ${config.claude.relayMode}`);
+    } else {
+      lines.push('    Relay mode:       interactive (default)');
+    }
+  }
+
+  lines.push('');
+  lines.push('═══════════════════════════════════════════════════════════');
+
+  return lines.join('\n');
+}
+
+/* ------------------------------------------------------------------ *
+ * Main entry point                                                     *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Run the full interactive setup flow against the terminal.
+ *
+ * 1. Detect existing configuration
+ * 2. Walk through each section
+ * 3. Show summary and confirm
+ * 4. Write `agentloop.config.json` (with validation)
+ *
+ * @param {object} [options]
+ * @param {string} [options.projectRoot] — project root directory (default: cwd)
+ * @param {object} [options.prompt] — prompt interface (default: TerminalPrompt)
+ * @returns {Promise<{ saved: boolean, config: object|null, reason: string }>}
+ */
+export async function runSetup({
+  projectRoot = process.cwd(),
+  prompt: injectedPrompt = null,
+} = {}) {
+  const prompt = injectedPrompt || new TerminalPrompt();
+
+  try {
+    // Check for git repo
+    const hasGit = fs.existsSync(path.join(projectRoot, '.git'));
+    if (!hasGit) {
+      prompt.display('');
+      prompt.display('  Warning: No .git directory found in this directory.');
+      prompt.display('  ALCLI is designed to run within a git repository.');
+      const proceed = await prompt.confirm('Continue anyway?', false);
+      if (!proceed) {
+        return { saved: false, config: null, reason: 'Not a git repository — setup cancelled.' };
+      }
+    }
+
+    // Load existing config
+    const existing = loadExistingConfig(projectRoot);
+    const isReconfigure = Object.keys(existing).length > 0;
+
+    if (isReconfigure) {
+      prompt.display('');
+      prompt.display('  ═══════════════════════════════════════════════════════');
+      prompt.display('  Existing configuration found — entering reconfiguration.');
+      prompt.display('  Current values are shown as defaults. Press Enter to keep them.');
+      prompt.display('  ═══════════════════════════════════════════════════════');
+    }
+
+    // Section 1: Project
+    const project = await sectionProject(existing, prompt);
+
+    // Section 2: Agent Roles
+    const { roles } = await sectionRoles(existing, prompt);
+
+    // Section 3: Verification
+    const verification = await sectionVerification(existing, prompt);
+
+    // Section 4: Controller
+    const controller = await sectionController(existing, prompt);
+
+    // Section 5: Provider-specific settings
+    const providerSettings = await sectionProviderSettings(existing, prompt, roles);
+
+    // Assemble
+    const config = assembleConfig({
+      project,
+      roles,
+      verification,
+      controller,
+      providerSettings,
+    });
+
+    // Summary
+    prompt.display(formatSummary(config, roles));
+
+    const confirmed = await prompt.confirm('Save this configuration?', true);
+    if (!confirmed) {
+      return { saved: false, config, reason: 'User chose not to save.' };
+    }
+
+    // Save
+    if (isReconfigure) {
+      // Backup the existing config before overwriting
+      const configPath = path.join(projectRoot, CONFIG_FILE_NAME);
+      const backupPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.bak`);
+      try {
+        fs.copyFileSync(configPath, backupPath);
+        prompt.display(`  Backed up existing config to ${CONFIG_FILE_NAME}.bak`);
+      } catch {
+        // Non-fatal — proceed without backup
+      }
+    }
+
+    saveConfig(config, projectRoot);
+
+    // Validate the newly written config
+    const validation = validateConfig(projectRoot);
+    if (!validation.ok) {
+      prompt.display('');
+      prompt.display('  ⚠  Warning: The saved configuration failed validation:');
+      for (const err of validation.errors || []) {
+        prompt.display(`    ${err}`);
+      }
+      prompt.display('  The configuration was saved but may not work correctly.');
+      prompt.display('  Run `agentloop --setup` again to fix it.');
+      return {
+        saved: true,
+        config,
+        reason: 'Configuration saved but validation failed — see errors above.',
+      };
+    }
+
+    prompt.display('');
+    prompt.display('  Configuration saved and validated successfully.');
+    prompt.display(`  File: ${path.join(projectRoot, CONFIG_FILE_NAME)}`);
+    prompt.display('  Run `agentloop --setup` anytime to reconfigure.');
+
+    return { saved: true, config, reason: 'Configuration saved and validated.' };
+  } finally {
+    if (!injectedPrompt) {
+      prompt.close();
+    }
+  }
+}
+
+/**
+ * Build config programmatically (no terminal interaction).
+ *
+ * Each section handler is called with the given prompt interface so tests can
+ * supply canned responses.  Returns the assembled config without writing to disk.
+ *
+ * @param {object} options
+ * @param {object} [options.existingConfig] — current config values (default: {})
+ * @param {object} options.prompt — prompt interface (must supply all methods)
+ * @returns {Promise<object>} the assembled config
+ */
+export async function buildConfig({ existingConfig = {}, prompt }) {
+  const project = await sectionProject(existingConfig, prompt);
+  const { roles } = await sectionRoles(existingConfig, prompt);
+  const verification = await sectionVerification(existingConfig, prompt);
+  const controller = await sectionController(existingConfig, prompt);
+  const providerSettings = await sectionProviderSettings(existingConfig, prompt, roles);
+
+  return assembleConfig({
+    project,
+    roles,
+    verification,
+    controller,
+    providerSettings,
+  });
+}

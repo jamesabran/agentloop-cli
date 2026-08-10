@@ -107,6 +107,7 @@ const USAGE = `AgentLoop workflow controller — local implement-and-review loop
 
   agentloop --task <id> [options]
   agentloop --next [--dry-run]
+  agentloop --setup
 
 Options:
   --task <id>       Task or issue identifier to work on (required the first time)
@@ -118,6 +119,7 @@ Options:
   --dry-run         Report the next local step, change nothing
   --recover         Explicitly clear a terminal implementer failure and start a new session
   --self-check      Offline demonstration of the loop; no agents, no network
+  --setup           Interactive first-run project setup and configuration
   --verbose         Include debug logging
   --help            Show this message
 
@@ -138,6 +140,7 @@ export function parseArgs(argv) {
     next: false,
     selfCheck: false,
     recover: false,
+    setup: false,
     verbose: false,
     help: false,
   };
@@ -156,6 +159,9 @@ export function parseArgs(argv) {
         break;
       case '--recover':
         options.recover = true;
+        break;
+      case '--setup':
+        options.setup = true;
         break;
       case '--verbose':
         options.verbose = true;
@@ -1403,12 +1409,18 @@ export async function main(argv = process.argv.slice(2)) {
 
   // Dry run and self-check write nothing at all — not even a log file. Their
   // contract is that the filesystem is identical afterwards.
-  const mutating = !options.dryRun && !options.selfCheck;
+  const mutating = !options.dryRun && !options.selfCheck && !options.setup;
   configureLogger({ verbose: options.verbose, toFile: mutating });
 
   if (options.selfCheck) {
     const { runSelfCheck } = await import('./self-check.mjs');
     return runSelfCheck();
+  }
+
+  if (options.setup) {
+    const { runSetup } = await import('./lib/setup.mjs');
+    const result = await runSetup();
+    return result.saved ? 0 : 0;
   }
 
   log.info(`AgentLoop workflow controller — local loop${options.dryRun ? ' (dry run)' : ''}`);
