@@ -887,6 +887,14 @@ export async function runSetup({
           if (!fs.existsSync(stampedPath)) break;
         }
       }
+      // If all suffixes are occupied the loop exits with the last
+      // candidate — which still exists.  Abort rather than overwrite.
+      if (fs.existsSync(stampedPath)) {
+        prompt.display('');
+        prompt.display('  ✖  Cannot create a unique recovery file name.');
+        prompt.display('  Too many recovery files exist — clean up old .pre-update.* files and try again.');
+        return { saved: false, config, reason: 'Cannot create unique recovery file name.' };
+      }
 
       try {
         fs.renameSync(snapshotPath, stampedPath);
@@ -901,6 +909,12 @@ export async function runSetup({
             snapshotPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}-${i}`);
             if (!fs.existsSync(snapshotPath)) break;
           }
+        }
+        if (fs.existsSync(snapshotPath)) {
+          prompt.display('');
+          prompt.display('  ✖  Cannot create a unique snapshot file name.');
+          prompt.display('  Too many recovery files exist — clean up old .pre-update.* files and try again.');
+          return { saved: false, config, reason: 'Cannot create unique snapshot file name.' };
         }
         prompt.display('  Warning: could not rotate the existing .pre-update recovery file.');
         prompt.display(`  Using ${path.basename(snapshotPath)} for this run instead.`);
