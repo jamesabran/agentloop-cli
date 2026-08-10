@@ -4,20 +4,25 @@ A small Node.js program that runs on your machine and carries one task through
 an implement-and-review loop **locally**, then publishes the branch once it has
 been approved.
 
-Point it at a task, leave it: Claude implements and makes a local checkpoint
-commit, your project's own deterministic checks run against that commit,
-Codex audits it read-only, findings go back to Claude as another local
-commit, and the re-audit sees only the new commits. Nothing is pushed until
-Codex approves the commit that is still `HEAD`.
+Point it at a task, leave it: the Implementer (Claude by default) makes a local
+checkpoint commit, your project's own verification checks run against that
+commit, the Auditor (Codex by default) reviews it read-only, findings go back
+to the Implementer as another local commit, and the re-audit sees only the new
+commits. Nothing is pushed until the Auditor approves the commit that is still
+`HEAD`.
+
+Planner, Implementer, and Auditor are **configurable logical roles** — each
+maps to a supported provider independently. Provider-specific settings stay
+attached to the provider, never to the role.
 
 ```text
-implement ──► checks ──► audit ──► publish
+implement ──► verify ──► audit ──► publish
     ▲                      │
     └──────── fix ◄────────┘   (at most twice)
 ```
 
-Everything before that push happens in this working copy. Claude and Codex do
-not talk to each other through GitHub: no labels, no comments, no draft pull
+Everything before that push happens in this working copy. The agents do not
+talk to each other through GitHub: no labels, no comments, no draft pull
 request, no polling. A task that never gets approved leaves no trace on GitHub
 at all.
 
@@ -59,10 +64,11 @@ bin directly):
 3. Checks out one local working branch for the task, creating it from the
    configured base branch.
 4. Decides the next step from the saved state and the live local `HEAD`.
-5. Runs Claude to implement or to fix, and records the commit it made.
-6. Runs the project's configured verification commands against that commit.
-7. Runs Codex read-only over `<base>..HEAD`, or `lastAuditedHead..HEAD` on a
-   re-audit, together with the findings still unresolved.
+5. Runs the Implementer to implement or to fix, and records the commit it made.
+6. Runs the project's configured deterministic and runtime verification
+   commands against that commit.
+7. Runs the Auditor read-only over `<base>..HEAD`, or `lastAuditedHead..HEAD`
+   on a re-audit, together with the findings still unresolved.
 8. On `APPROVED` for the commit that is still `HEAD`, pushes the branch.
 9. Writes `.agent/report.md` whenever it stops.
 
@@ -97,7 +103,27 @@ AgentLoop makes no assumptions about the project it runs in. It resolves the
 project root by walking up from the current directory to the nearest `.git`,
 and resolves the repository boundary from that project's own `origin` git
 remote. An optional `agentloop.config.json` at the project root lets you
-override any of that:
+override any of that.
+
+### Interactive setup
+
+The easiest way to configure a project is the interactive setup flow:
+
+```powershell
+npx agentloop --setup
+```
+
+It walks through project identification, agent roles, verification,
+controller defaults, and provider-specific settings — each with sensible
+defaults. Existing config values become defaults during reconfiguration.
+Validation runs before saving; an invalid config is never left in place.
+
+Run `agentloop --setup` anytime to reconfigure.
+
+### Configuration reference
+
+Every field is optional. Only values that differ from their defaults need to
+appear in the file.
 
 ```json
 {
@@ -105,6 +131,7 @@ override any of that:
   "remote": "origin",
   "repo": null,
   "maxChangeRounds": 2,
+  "publishMode": "manual",
   "tasksFile": "agentloop.tasks.json",
   "checks": [
     { "name": "typecheck", "script": "typecheck" },
@@ -112,26 +139,96 @@ override any of that:
     { "name": "test", "script": "test" },
     { "name": "build", "script": "build" }
   ],
+  "roles": {
+    "planner": "claude",
+    "implementer": "claude",
+    "auditor": "codex"
+  },
+  "runtimeVerification": {
+    "profile": "standard",
+    "checks": [
+      { "name": "api-smoke", "command": "npm run test:integration" }
+    ]
+  },
   "claude": {
-    "permissionMode": "acceptEdits"
+    "permissionMode": "acceptEdits",
+    "relayMode": "interactive"
   }
 }
 ```
 
-Every field is optional and defaults to the value shown above (`repo:
-null` means "resolve it from the git remote"). `checks` is the ordered list of
-`npm run <script>` commands the **controller** runs, through `checks.mjs`,
-before handing a commit to Codex; the default matches a typical
-`typecheck`/`lint`/`test`/`build` project. If your project uses different
-script names, or a different number of checks, list them here.
+| Field | Default | Purpose |
+|---|---|---|
+| `baseBranch` | `main` | Base branch task work is cut from |
+| `remote` | `origin` | Git remote for publishing |
+| `repo` | auto-detected | Repository boundary (`owner/repo`); `AGENTLOOP_REPO` may only assert, not redirect |
+| `maxChangeRounds` | `2` | `REQUEST_CHANGES` rounds before stopping |
+| `publishMode` | `manual` | `manual` (stop before push) or `auto` (push on approval) |
+| `tasksFile` | `agentloop.tasks.json` | Relative path to the committed roadmap file |
+| `checks` | typecheck, lint, test, build | Ordered `npm run <script>` commands the **controller** runs before audit |
+| `roles` | claude / claude / codex | Planner / Implementer / Auditor → provider mapping |
+| `runtimeVerification` | none | Baseline runtime verification profile and checks |
+| `claude` | see above | Provider-specific settings (permission mode, relay mode) |
 
-`tasksFile` is the path to the committed roadmap file, relative to the
-repository root. It must be a relative path inside the repository — absolute
-paths and traversal outside the repository are rejected. See
-[Task roadmap](#task-roadmap-agentlooptasksjson) below.
+### Agent roles
 
-Claude is never granted any of these commands, or any `npm`/`node`/`npx`
-command at all — see [Verification runs only in the
+The three logical roles — Planner, Implementer, Auditor — each map to a
+supported provider. The default mapping preserves the Claude-Implementer /
+Codex-Auditor workflow:
+
+```json
+{
+  "roles": {
+    "planner": "claude",
+    "implementer": "claude",
+    "auditor": "codex"
+  }
+}
+```
+
+Each provider supports specific roles (`claude`: planner, implementer;
+`codex`: auditor). An unsupported combination raises an error at config load.
+Unknown role keys (typos) are rejected rather than silently ignored.
+
+Provider-specific settings belong to the **provider**, not the role. The
+`claude` key holds Claude's permission mode and relay mode regardless of
+which roles Claude is filling. Changing which provider fills a role does not
+silently move settings between providers.
+
+### Runtime verification
+
+Beyond the deterministic checks above, the controller supports a configurable
+runtime verification gate. Four profiles:
+
+| Profile | Required | Purpose |
+|---|---|---|
+| `lightweight` | No | Runtime verification is not required (static checks suffice) |
+| `standard` | Yes | Basic smoke / integration checks |
+| `integration` | Yes | Full integration suite |
+| `custom` | Yes | Project-defined verification commands |
+
+Project-level config sets the baseline; tasks may inherit, disable (when the
+baseline is lightweight), or escalate it — never weaken it. Required profiles
+without checks are a hard failure at runtime.
+
+```json
+{
+  "runtimeVerification": {
+    "profile": "standard",
+    "checks": [
+      { "name": "api-smoke", "command": "npm run test:integration" },
+      { "name": "e2e-critical", "command": "npm run test:e2e:critical" }
+    ]
+  }
+}
+```
+
+The controller runs runtime checks at two gates: before accepting the
+Implementer's handoff, and before starting the Auditor. Both must pass for
+the exact commit being published.
+
+Claude is never granted any `npm`/`node`/`npx` command at all — see
+[Verification runs only in the
 controller](#verification-runs-only-in-the-controller) below.
 
 ## `AGENTS.md` is optional
@@ -367,6 +464,7 @@ All options:
 ```text
 agentloop --task <id> [options]
 agentloop --next [--dry-run]
+agentloop --setup
 
   --task <id>       Task or issue identifier (required the first time)
   --next            Select the next task from agentloop.tasks.json deterministically
@@ -376,8 +474,9 @@ agentloop --next [--dry-run]
   --push-mode <m>   Publish mode: "manual" (default) or "auto". Overrides
                     AGENTLOOP_PUBLISH_MODE and publishMode in config.
   --dry-run         Report the next local step, change nothing
-  --recover         Explicitly clear a terminal Claude failure; starts a new session
+  --recover         Explicitly clear a terminal implementer failure; starts a new session
   --self-check      Offline demonstration of the loop; no agents, no network
+  --setup           Interactive first-run project setup and configuration
   --verbose         Include debug logging
   --help            Show this message
 ```
@@ -430,17 +529,18 @@ the brief. It never labels, comments on, or closes it.
 |---|---|
 | Published | Open a pull request for the branch if you want one |
 | Two change rounds used | Read the report and the audit; decide the scope question yourself |
-| A deterministic check failed | Fix it, or run again — the report has the output |
-| Claude times out, exits non-zero, reaches a process limit, or has an invalid status | Inspect the report and worktree; rerun with `--recover` only when ready to start a new Claude session |
-| Codex reported `BLOCKED` | Resolve what it names, then run again |
+| A verification check failed | Fix it, or run again — the report has the output |
+| Implementer times out, exits non-zero, reaches a process limit, or has an invalid status | Inspect the report and worktree; rerun with `--recover` only when ready to start a new session |
+| Auditor reported `BLOCKED` | Resolve what it names, then run again |
 
 Exit code 0 means it reached a resting point the loop planned for. Exit code 1
 means something went wrong and the report is worth reading.
 
-Claude timeouts, non-zero exits, usage/process-limit exhaustion, and invalid
-handoffs are terminal for the current session. The controller writes its local
-report, discards the session ID, and refuses another Claude process until a
-human explicitly passes `--recover`. This prevents expensive automatic retries.
+Implementer timeouts, non-zero exits, usage/process-limit exhaustion, and
+invalid handoffs are terminal for the current session. The controller writes
+its local report, discards the session ID, and refuses another implementer
+process until a human explicitly passes `--recover`. This prevents expensive
+automatic retries.
 
 ## Files
 
@@ -463,6 +563,10 @@ agentloop-cli/
       status-block.mjs      AGENTLOOP_AGENT_STATUS parser (pure, no I/O)
       state.mjs             versioned local task state, validated as untrusted input
       checks.mjs             runs the configured verification commands
+      runtime-verification.mjs runtime & integration verification gate
+      roles.mjs               agent role and provider abstraction
+      agent-router.mjs        role → provider dispatch
+      setup.mjs               interactive first-run setup and project configuration
       git.mjs                local git, and the one publishing push
       git-url.mjs            GitHub remote URL parsing
       github.mjs             gh: read an issue brief, confirm access before pushing

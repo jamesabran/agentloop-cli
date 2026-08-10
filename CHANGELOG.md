@@ -6,6 +6,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/) —
 though it is pre-1.0, so minor versions may still include breaking changes.
 
+## [0.3.0] - 2026-08-11
+
+### Added
+
+- **Configurable agent roles via provider abstraction.** The three logical
+  roles — Planner, Implementer, Auditor — are now independently mapped to
+  supported providers (`claude`, `codex`) via `roles` in
+  `agentloop.config.json`. Provider-specific settings (Claude permission mode,
+  relay mode) stay attached to the provider, never to the role — changing which
+  provider fills a role does not silently move settings between providers.
+  Unknown role keys and unsupported role-provider combinations are rejected at
+  config load.
+- **Interactive first-run setup (`agentloop --setup`).** A guided terminal
+  flow configures project identification, agent roles, deterministic checks,
+  runtime verification profiles, controller defaults, and provider-specific
+  settings. Existing config values become defaults during reconfiguration.
+  Validation runs through the real config module before saving; a validated
+  config is never left in an invalid state. Crash-safe atomic write with
+  backup rotation protects existing configuration.
+- **Automated Runtime & Integration Verification Gate.** Configurable
+  per-project and per-task runtime verification with four profiles —
+  Lightweight (not required), Standard (basic smoke/integration),
+  Integration (full suite), Custom (project-defined commands). The controller
+  runs configured checks at both the implementer-handoff gate and the auditor
+  gate; task-level configuration may inherit, disable, or escalate the project
+  baseline. A required profile with no checks configured is a hard failure,
+  never a silent bypass.
+- **Claude permission relay with configurable mode.** Tool permission requests
+  outside the static allowlist are relayed to the terminal user
+  (`interactive` mode, the default) or auto-approved after hard-deny checks
+  (`auto` mode, for unattended operation). Hard-deny rules (git push, gh, npm,
+  node, npx, chmod, chown, WebFetch, BypassPermissions) are always enforced
+  regardless of mode. Configured via `claude.relayMode` in
+  `agentloop.config.json` or `AGENTLOOP_CLAUDE_RELAY_MODE`.
+- **Provider-specific Claude permission mode.** `claude.permissionMode` in
+  `agentloop.config.json` controls the Claude CLI `--permission-mode` flag
+  independently of the ALCLI relay mode.
+- **Dual-gate runtime verification.** The controller runs runtime checks at
+  both the implementer handoff (rejecting the handoff on failure) and the
+  auditor gate (blocking the audit on failure). Both gates must pass for the
+  exact commit being published. Profile ordering enforces that tasks may only
+  maintain or escalate the project baseline, never weaken it.
+
+### Changed
+
+- **Role-aware status blocks and prompts.** Status-block validation, fix
+  prompts, and implementation prompts use the resolved provider identity
+  rather than assuming Claude/Codex.
+- **Profile-ordered runtime verification.** Standard < Integration < Custom
+  ordering; tasks may only escalate, never weaken, the project baseline.
+- **Implementer-gate runtime verification runs before the handoff is
+  accepted.** A FAIL rejects the handoff and discards the implementer session.
+
+### Fixed
+
+- Implementer-gate runtime verification state is no longer erased by a
+  subsequent auditor-gate run.
+- Runtime verification state is recorded explicitly as `NOT_REQUIRED` when the
+  gate does not apply, so the publish step can distinguish "not run" from
+  "not required."
+- Unknown role keys in `agentloop.config.json` (e.g. `"audtor"`) are rejected
+  with a clear diagnostic rather than silently ignored.
+
 ## [0.2.1] - 2026-08-09
 
 ### Changed
