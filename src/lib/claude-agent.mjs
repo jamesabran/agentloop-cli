@@ -1,20 +1,20 @@
 /**
- * Claude agent runs — both non-interactive (print mode) and interactive
- * (stream-json protocol with permission relay).
+ * Claude agent runs — print mode with optional PreToolUse permission relay.
  *
  * Flags used here were checked against the installed `claude --help`
  * (2.1.221): `-p/--print`, `--output-format stream-json`, `--verbose`,
  * `--session-id`, `--resume`,
- * `--permission-mode`, `--allowedTools`, `--add-dir`, `--model`. The prompt is
- * supplied on stdin.
+ * `--permission-mode`, `--allowedTools`, `--add-dir`, `--model`,
+ * `--settings`. The prompt is supplied on stdin.
  *
  * Claude's progress stream is shown to the controller console as it arrives.
  * A process failure or usage limit is reported to the controller, which
  * records a terminal local report and requires explicit recovery.
  *
- * The interactive runner uses the stream-json protocol without `--print`,
- * keeping stdin open so permission requests can be relayed to the user and
- * their decisions written back to Claude without restarting the session.
+ * When an interactive terminal is available, a PreToolUse hook is
+ * configured so that permission requests for tools outside the static
+ * allowlist are relayed to the user via `.agent/permission-request.json`
+ * and `.agent/permission-response.json` file IPC.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -27,8 +27,16 @@ import {
   LIMITS,
   REPO_ROOT,
 } from './config.mjs';
-import { detectPermissionRequest, handlePermissionRequest } from './permission-relay.mjs';
-import { npmGlobalDirs, resolveExecutable, run, runInteractive } from './process.mjs';
+import {
+  checkHardDeny,
+  isAllowedByConfig,
+  pollForRequest,
+  promptUser,
+  removeHookSettings,
+  writeHookSettings,
+  writeResponse,
+} from './permission-relay.mjs';
+import { npmGlobalDirs, resolveExecutable, run } from './process.mjs';
 
 let claudePath = null;
 
@@ -58,7 +66,6 @@ export function detectUsageLimit(text, now = Date.now()) {
   const withReset = /usage limit reached\|(\d{9,13})/i.exec(haystack);
   if (withReset) {
     const raw = Number(withReset[1]);
-    // The CLI reports seconds; tolerate milliseconds.
     const resumeAtMs = raw > 1e12 ? raw : raw * 1000;
     return { limited: true, resumeAtMs, evidence: withReset[0] };
   }
@@ -114,12 +121,7 @@ export function buildClaudeArgs({ sessionId, resume }) {
     args.push('--model', process.env.AGENTLOOP_CLAUDE_MODEL);
   }
 
-  // One argument: the tool patterns contain spaces, so they cannot be split.
   args.push('--allowedTools', CLAUDE_ALLOWED_TOOLS);
-
-  // The disallow list is applied unconditionally and takes precedence over
-  // the allowlist inside Claude Code, so even a mistaken `--allowedTools`
-  // value cannot re-open `gh pr merge` or the `gh api` HTTP client.
   args.push('--disallowedTools', CLAUDE_DISALLOWED_TOOLS);
 
   return args;
@@ -130,7 +132,6 @@ export function parseClaudeResult(stdout) {
   const text = String(stdout ?? '').trim();
   if (text === '') return null;
 
-  // Normally a single JSON object; be tolerant of leading progress lines.
   const candidates = [text, ...text.split(/\r?\n/).reverse()];
   for (const candidate of candidates) {
     const trimmed = candidate.trim();
@@ -147,8 +148,6 @@ export function parseClaudeResult(stdout) {
 
 /**
  * Return human-readable progress from supported Claude stream-json events.
- * Unknown events stay private implementation detail rather than being dumped
- * as raw JSON into the controller log.
  */
 export function formatClaudeProgress(event) {
   if (!event || typeof event !== 'object') return null;
@@ -203,30 +202,10 @@ function firstNonEmpty(...candidates) {
 
 /**
  * Turn a completed Claude process outcome into the run's final result.
- *
- * Usage-limit text is only authoritative next to a genuine failure signal —
- * a non-zero exit or an explicit `result.is_error === true`. On a fully
- * successful run, the same phrases can appear legitimately in ordinary
- * transcript or tool content (Claude reading this file's tests, for
- * example), so detection is skipped entirely rather than risk a false
- * positive. The text searched is also kept narrow — stderr and an explicitly
- * parsed `result.result` string, never the raw stream-json stdout (which
- * carries the full transcript including tool output) even when it is the
- * only text available, such as when `result` failed to parse.
- *
- * @param {{
- *   outcome: { code: number|null, stdout: string, stderr: string, timedOut: boolean },
- *   result: { is_error?: boolean, result?: string, session_id?: string }|null,
- *   text: string,
- *   session: string,
- * }} args
  */
 export function classifyClaudeOutcome({ outcome, result, text, session }) {
   const failed = outcome.code !== 0 || result?.is_error === true;
 
-  // Quota evidence may only come from stderr and an explicitly parsed final
-  // result message — never the raw stdout. `text` falls back to that raw
-  // stdout when `result` failed to parse, so it is unsafe to reuse here.
   const parsedResultText = typeof result?.result === 'string' ? result.result : '';
   const usage = failed
     ? detectUsageLimit([outcome.stderr, parsedResultText].join('\n'))
@@ -237,7 +216,6 @@ export function classifyClaudeOutcome({ outcome, result, text, session }) {
       ok: false,
       usageLimited: true,
       resumeAtMs: usage.resumeAtMs,
-      // The session is kept precisely so the paused task can be resumed.
       sessionId: result?.session_id ?? session,
       text,
       raw: outcome.stdout,
@@ -245,10 +223,6 @@ export function classifyClaudeOutcome({ outcome, result, text, session }) {
     };
   }
 
-  // Not quota evidence, but still useful for the terminal report: prefer the
-  // parsed result, then stderr, then whatever raw diagnostic `text` carries
-  // (its own stdout fallback when `result` didn't parse), before giving up
-  // with a generic message rather than an empty string.
   const diagnostic =
     firstNonEmpty(result?.result, outcome.stderr, text) ?? `claude exited ${outcome.code}`;
 
@@ -264,13 +238,19 @@ export function classifyClaudeOutcome({ outcome, result, text, session }) {
 }
 
 /**
- * Run one Claude turn.
+ * Run one Claude turn, with optional interactive permission relay.
+ *
+ * When stdin is a TTY, a PreToolUse hook is configured so permission
+ * requests for tools outside the static `--allowedTools` list are relayed
+ * to the controller's terminal.  The hook is only set up when TTY is
+ * available and `AGENTLOOP_DISABLE_PERMISSION_RELAY` is not set.
  *
  * @param {{
  *   prompt: string,
  *   sessionId?: string|null,
  *   resume?: boolean,
  *   onStdout?: (chunk: string) => void,
+ *   onLog?: (line: string) => void,
  * }} options
  * @returns {Promise<{
  *   ok: boolean, usageLimited: boolean, resumeAtMs: number|null,
@@ -278,18 +258,115 @@ export function classifyClaudeOutcome({ outcome, result, text, session }) {
  *   timedOut?: boolean,
  * }>}
  */
-export async function runClaude({ prompt, sessionId = null, resume = false, onStdout }) {
+export async function runClaude({ prompt, sessionId = null, resume = false, onStdout, onLog }) {
   const session = sessionId ?? randomUUID();
   const args = buildClaudeArgs({ sessionId: session, resume });
 
-  // Claude runs on the host with the owner's credentials, as a trusted
-  // collaborator. That is a deliberate choice for this experimental phase.
-  const outcome = await run(claudeExecutable(), args, {
-    cwd: REPO_ROOT,
-    input: prompt,
-    timeoutMs: LIMITS.claudeTimeoutMs,
-    onStdout,
-  });
+  // Only set up the permission relay when interactive and not disabled.
+  const relayEnabled =
+    process.stdin.isTTY &&
+    !process.env.AGENTLOOP_DISABLE_PERMISSION_RELAY;
+
+  if (relayEnabled) {
+    const allowedList = CLAUDE_ALLOWED_TOOLS.split(',').map((s) => s.trim()).filter(Boolean);
+    writeHookSettings(REPO_ROOT, {
+      denyPatterns: [...CLAUDE_HARD_DENY_PATTERNS],
+      allowPatterns: allowedList,
+    });
+
+    // Add the hook settings to Claude's invocation.
+    args.push('--settings', '.agent/hook-settings.json');
+    onLog?.('[claude-agent] PreToolUse permission relay enabled');
+  }
+
+  onLog?.('[claude-agent] starting session');
+  onLog?.(`[claude-agent] session ${session}${resume ? ' (resume)' : ''}`);
+
+  // Spawn Claude.  The permission watcher runs concurrently.
+  let watcherStop = false;
+  const acceptedRules = new Map(); // rule → true for session-scoped reuse
+
+  const watcher = relayEnabled
+    ? (async () => {
+        while (!watcherStop) {
+          const request = await pollForRequest(REPO_ROOT, 500);
+          if (!request) continue;
+
+          const toolName = request.tool_name;
+          const toolInput = request.tool_input ?? {};
+
+          // Belt-and-braces hard-deny re-check.
+          const hardCheck = checkHardDeny(toolName, toolInput, CLAUDE_HARD_DENY_PATTERNS);
+          if (hardCheck.denied) {
+            writeResponse(REPO_ROOT, {
+              approved: false,
+              reason: `Blocked by ALCLI hard-deny rule: ${hardCheck.matchedPattern}`,
+            });
+            onLog?.(`[claude-agent] hard-denied: ${hardCheck.matchedPattern}`);
+            continue;
+          }
+
+          // Check accepted reusable rules (session-scoped memory).
+          const entry = requireEntry(toolName, toolInput);
+          if (entry && acceptedRules.has(entry)) {
+            writeResponse(REPO_ROOT, { approved: true, reason: 'Previously accepted rule.' });
+            onLog?.('[claude-agent] auto-approved via session-scoped reusable rule');
+            continue;
+          }
+
+          // Prompt the user.
+          const choice = await promptUser({
+            toolName,
+            toolInput,
+            hasReusableRule: false, // We don't get a permission_rule from hook input
+            permissionRule: null,
+          });
+
+          if (choice === null) {
+            // Non-interactive fallback (shouldn't happen here, but be safe).
+            writeResponse(REPO_ROOT, {
+              approved: false,
+              reason: 'Permission denied (non-interactive).',
+            });
+            continue;
+          }
+
+          if (choice.kind === 'deny') {
+            writeResponse(REPO_ROOT, { approved: false, reason: 'Permission denied by user.' });
+            onLog?.('[claude-agent] permission denied by user');
+            continue;
+          }
+
+          // Allow once (or allow-similar).
+          if (choice.kind === 'allow-similar' && choice.permissionRule) {
+            acceptedRules.set(choice.permissionRule, true);
+            onLog?.(`[claude-agent] accepted reusable rule: ${choice.permissionRule}`);
+          }
+
+          writeResponse(REPO_ROOT, { approved: true });
+          onLog?.('[claude-agent] permission approved');
+        }
+      })()
+    : Promise.resolve();
+
+  // Run Claude to completion.
+  let outcome;
+  try {
+    outcome = await run(claudeExecutable(), args, {
+      cwd: REPO_ROOT,
+      input: prompt,
+      timeoutMs: LIMITS.claudeTimeoutMs,
+      onStdout,
+    });
+  } finally {
+    // Stop the watcher and clean up hook artefacts.
+    watcherStop = true;
+    if (relayEnabled) {
+      // Give the watcher one tick to notice `watcherStop`.
+      await watcher;
+      removeHookSettings(REPO_ROOT);
+    }
+  }
 
   const result = parseClaudeResult(outcome.stdout);
   const text = typeof result?.result === 'string' ? result.result : outcome.stdout;
@@ -313,190 +390,15 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
   return classified;
 }
 
-/**
- * Build the argument list for an interactive Claude run (stream-json protocol
- * without `--print`).
- *
- * Same shape as `buildClaudeArgs`, but omits `--print` so Claude stays in
- * continuous-session mode.  The prompt is sent as a JSON user message on stdin.
- *
- * @param {{ sessionId: string|null, resume: boolean }} options
- * @returns {string[]}
- */
-export function buildClaudeInteractiveArgs({ sessionId, resume }) {
-  const args = [
-    '--output-format',
-    'stream-json',
-    '--verbose',
-    '--permission-mode',
-    CLAUDE_PERMISSION_MODE,
-    '--add-dir',
-    REPO_ROOT,
-  ];
-
-  if (resume && sessionId) {
-    args.push('--resume', sessionId);
-  } else if (sessionId) {
-    args.push('--session-id', sessionId);
-  }
-
-  if (process.env.AGENTLOOP_CLAUDE_MODEL) {
-    args.push('--model', process.env.AGENTLOOP_CLAUDE_MODEL);
-  }
-
-  args.push('--allowedTools', CLAUDE_ALLOWED_TOOLS);
-  args.push('--disallowedTools', CLAUDE_DISALLOWED_TOOLS);
-
-  return args;
-}
-
-/**
- * Format a prompt as a stream-json user message.
- *
- * @param {string} promptText
- * @returns {string} a JSON line
- */
-function formatUserMessage(promptText) {
-  return JSON.stringify({
-    type: 'user',
-    message: {
-      role: 'user',
-      content: promptText,
-    },
-  }) + '\n';
-}
-
-/**
- * Run one Claude turn interactively, relaying permission requests to the
- * caller's terminal.
- *
- * Uses the stream-json protocol without `--print`: the prompt is sent as a
- * JSON user message, and the controller keeps stdin open so it can write
- * permission decisions back mid-session.
- *
- * The `onProgress` callback receives human-readable progress lines exactly as
- * `streamClaudeProgress` would produce them.
- *
- * @param {{
- *   prompt: string,
- *   sessionId?: string|null,
- *   resume?: boolean,
- *   onProgress?: (text: string) => void,
- *   onLog?: (line: string) => void,
- * }} options
- * @returns {Promise<{
- *   ok: boolean, usageLimited: boolean, resumeAtMs: number|null,
- *   sessionId: string|null, text: string, raw: string, error: string|null,
- *   timedOut?: boolean,
- * }>}
- */
-export async function runClaudeInteractive({ prompt, sessionId = null, resume = false, onProgress, onLog }) {
-  const session = sessionId ?? randomUUID();
-  const args = buildClaudeInteractiveArgs({ sessionId: session, resume });
-  const executable = claudeExecutable();
-
-  onLog?.('[claude-agent] starting interactive session');
-  onLog?.(`[claude-agent] session ${session}${resume ? ' (resume)' : ''}`);
-
-  let resultText = '';
-  let resultRaw = '';
-  let permissionDenied = false;
-
-  const handle = runInteractive(executable, args, {
-    cwd: REPO_ROOT,
-    input: formatUserMessage(prompt),
-    timeoutMs: LIMITS.claudeTimeoutMs,
-    onEvent(event) {
-      // Relay recognised progress events to the controller console.
-      const progress = formatClaudeProgress(event);
-      if (progress) onProgress?.(progress);
-
-      // Capture the final result.
-      if (event.type === 'result') {
-        resultRaw = JSON.stringify(event);
-        if (typeof event.result === 'string') resultText = event.result;
-        // Close stdin to signal we're done — no more user input.
-        handle.closeStdin();
-        return;
-      }
-
-      // Detect permission requests and relay them.
-      const permReq = detectPermissionRequest(event);
-      if (permReq) {
-        onLog?.(`[claude-agent] permission requested: ${permReq.toolName ?? '(unknown)'}`);
-        // The handler will be called synchronously within this event handler.
-        // We use a synchronous pattern: queue the permission response.
-        handlePermissionRequest(permReq, CLAUDE_HARD_DENY_PATTERNS).then((result) => {
-          if (result.response) {
-            handle.writeStdin(result.response);
-          }
-          if (result.hardDenied) {
-            onLog?.(`[claude-agent] permission hard-denied (${permReq.toolName})`);
-          } else if (result.autoDenied) {
-            onLog?.(`[claude-agent] permission auto-denied (non-interactive): ${permReq.toolName}`);
-            permissionDenied = true;
-          } else {
-            onLog?.('[claude-agent] permission response sent');
-          }
-        });
-        return;
-      }
-    },
-  });
-
-  // Wait for the process to complete (or timeout).
-  const outcome = await handle.completion;
-
-  // If the process exited before we closed stdin, make sure it's closed.
-  try { handle.closeStdin(); } catch { /* already closed */ }
-
-  const text = resultText || outcome.stdout;
-  const parsedResult = resultRaw ? JSON.parse(resultRaw) : parseClaudeResult(outcome.stdout);
-
-  const sessionFromResult = parsedResult?.session_id ?? session;
-
-  // Check for usage limits in the combined output.
-  const parsedResultText = typeof parsedResult?.result === 'string' ? parsedResult.result : '';
-  const usage = detectUsageLimit([outcome.stderr, parsedResultText].join('\n'));
-  if (usage.limited) {
-    return {
-      ok: false,
-      usageLimited: true,
-      resumeAtMs: usage.resumeAtMs,
-      sessionId: sessionFromResult,
-      text,
-      raw: outcome.stdout,
-      error: `Temporary usage limit: ${usage.evidence}`,
-    };
-  }
-
-  if (outcome.timedOut) {
-    return {
-      ok: false,
-      usageLimited: false,
-      resumeAtMs: null,
-      sessionId: sessionFromResult,
-      text,
-      raw: outcome.stdout,
-      error: `Claude timed out after ${LIMITS.claudeTimeoutMs}ms.`,
-      timedOut: true,
-    };
-  }
-
-  const failed = outcome.code !== 0 || parsedResult?.is_error === true;
-  const diagnostic = firstNonEmpty(
-    parsedResult?.result,
-    outcome.stderr,
-    text,
-  ) ?? `claude exited ${outcome.code}`;
-
-  return {
-    ok: !failed,
-    usageLimited: false,
-    resumeAtMs: null,
-    sessionId: sessionFromResult,
-    text,
-    raw: outcome.stdout,
-    error: failed ? diagnostic.slice(0, 2000) : null,
-  };
+/** Helper for session-scoped rule matching. */
+function requireEntry(toolName, toolInput) {
+  if (!toolName || typeof toolName !== 'string') return null;
+  // Minimal buildToolEntry inlined to avoid re-export complexity.
+  let args = '';
+  const input = toolInput ?? {};
+  if (typeof input.command === 'string') args = input.command;
+  else if (typeof input.file_path === 'string') args = input.file_path;
+  else if (typeof input.pattern === 'string') args = input.pattern;
+  else if (typeof input.url === 'string') args = input.url;
+  return args ? `${toolName}(${args})` : toolName;
 }

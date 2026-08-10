@@ -37,7 +37,7 @@ import {
   REPO_ROOT,
   TASKS_FILE_RELATIVE,
 } from './lib/config.mjs';
-import { runClaudeInteractive } from './lib/claude-agent.mjs';
+import { runClaude, streamClaudeProgress } from './lib/claude-agent.mjs';
 import { runCodexAudit } from './lib/codex-agent.mjs';
 import { classifyAuditOutcome } from './lib/audit.mjs';
 import { failureExcerpt, runChecks, summariseChecks } from './lib/checks.mjs';
@@ -414,15 +414,15 @@ async function runClaudeStep({ decision, context, options }) {
   for (;;) {
     const resume = Boolean(context.state.claudeSessionId);
     try {
-      outcome = await runClaudeInteractive({
+      outcome = await runClaude({
         prompt,
         sessionId: resume ? context.state.claudeSessionId : null,
         resume,
-        onProgress: (progress) => {
+        onStdout: streamClaudeProgress((progress) => {
           for (const line of progress.split(/\r?\n/)) {
             if (line.trim() !== '') log.info(`Claude: ${line}`);
           }
-        },
+        }),
         onLog: (line) => log.debug(line),
       });
     } catch (error) {

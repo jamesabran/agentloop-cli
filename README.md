@@ -555,18 +555,15 @@ the commit, looping forever on a finding — not an agent trying to escape.
   task with a fresh timeout window before reaching the terminal failure path;
   CI and non-interactive runs stop immediately without prompting.
 - **Interactive permission relay.** When Claude requests a tool not covered by
-  the fixed allowlist (e.g. a new Bash command), the controller relays the
-  request to the same terminal: `[1] Yes — allow once`, `[2] Yes — accept
-  reusable permission rule`, or `[3] No — deny`. Option 2 is only shown when
-  Claude supplies a concrete reusable scope; the relay never invents or
-  broadens one. The Claude session is paused, not terminated, and resumes
-  immediately after the decision. Hard-deny rules (the existing
-  `--disallowedTools` patterns plus `Bash(chmod *)`, `Bash(chown *)`, and
-  `BypassPermissions`) are checked before any prompt — a denied request is
-  never offered for approval. In non-interactive environments, permission
-  requests are denied automatically; the relay never auto-approves. The
-  existing timeout continuation prompt continues to work alongside the
-  permission relay.
+  the fixed allowlist (e.g. a new Bash command), a PreToolUse hook intercepts
+  the call and the controller relays the request to the same terminal:
+  `[1] Yes — allow once`, `[2] Yes — accept reusable permission rule`, or
+  `[3] No — deny`.  The hook — a small auto-generated Node.js script — checks
+  hard-deny rules before any file IPC, so a denied request is never offered for
+  approval.  The relay is only active when the controller runs in an
+  interactive terminal; non-interactive runs deny every permission request
+  without prompting (never auto-approve).  Set `AGENTLOOP_DISABLE_PERMISSION_RELAY=1`
+  to disable the relay entirely and keep the existing auto-deny behaviour.
 - **Deterministic checks run before Codex, and only in the controller.** The
   controller runs the configured checks itself, through `checks.mjs`, against
   Claude's committed HEAD — independently of anything Claude reports. A
