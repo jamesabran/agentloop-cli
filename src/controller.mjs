@@ -35,6 +35,7 @@ import {
   DETERMINISTIC_CHECKS,
   LIMITS,
   MAX_CHANGE_ROUNDS,
+  PROJECT_RUNTIME_VERIFICATION,
   PUBLISH_MODE,
   REMOTE,
   REPO,
@@ -45,6 +46,14 @@ import {
 import { runImplementer, runAuditor, resolveRoleProvider, streamClaudeProgress } from './lib/agent-router.mjs';
 import { classifyAuditOutcome } from './lib/audit.mjs';
 import { failureExcerpt, runChecks, summariseChecks } from './lib/checks.mjs';
+import {
+  isRuntimeVerificationRequired,
+  normaliseTaskRuntimeVerification,
+  resolveRuntimeVerification,
+  runRuntimeChecks,
+  runtimeFailureExcerpt,
+  summariseRuntimeChecks,
+} from './lib/runtime-verification.mjs';
 import { checkAuth, getIssue } from './lib/github.mjs';
 import {
   assertRemoteMatchesRepo,
@@ -74,6 +83,7 @@ import {
   recordAudit,
   recordFailure,
   recordImplementation,
+  recordRuntimeVerification,
   requireRecovery,
   saveState,
   selectTask,
@@ -582,6 +592,55 @@ async function runAuditStep({ context, options }) {
     );
   }
 
+  // Runtime-verification gate: when required for this task, run the configured
+  // runtime checks against the current HEAD before starting the auditor.
+  // A failure here is a hard blocker — same as a deterministic check failure.
+  let runtimeChecksResult = null;
+  if (context.runtimeVerification && isRuntimeVerificationRequired(context.runtimeVerification)) {
+    const rvChecks = context.runtimeVerification.checks;
+    if (rvChecks.length > 0) {
+      log.info('Running runtime verification checks…');
+      runtimeChecksResult = await runRuntimeChecks({
+        checks: rvChecks,
+        onStart: (name) => log.info(`  ${name}`),
+      });
+      log.info(summariseRuntimeChecks(runtimeChecksResult.results));
+
+      if (!runtimeChecksResult.ok) {
+        const failedOutput = runtimeFailureExcerpt(runtimeChecksResult.failed);
+        // Persist the failure so the state reflects it for resume/report.
+        context.state = recordRuntimeVerification(context.state, {
+          head,
+          status: 'FAIL',
+          output: failedOutput,
+          required: true,
+          profile: context.runtimeVerification.profile,
+        });
+        throw new LoopStopped(
+          `The runtime verification check "${runtimeChecksResult.failed.name}" failed against ${short(head)}.\n\n` +
+            `${failedOutput}`,
+        );
+      }
+    }
+
+    // Persist the PASS result.
+    context.state = recordRuntimeVerification(context.state, {
+      head,
+      status: 'PASS',
+      output: summariseRuntimeChecks(runtimeChecksResult ? runtimeChecksResult.results : []),
+      required: true,
+      profile: context.runtimeVerification.profile,
+    });
+  } else {
+    // Runtime verification is not required — record that explicitly so the
+    // publish gate knows it does not apply.
+    context.state = recordRuntimeVerification(context.state, {
+      head,
+      status: 'NOT_REQUIRED',
+      required: false,
+    });
+  }
+
   log.info(`Starting auditor (${identity}, read-only) over ${scope.range}…`);
   const outcome = await runAuditor({
     prompt: auditPrompt({
@@ -591,6 +650,9 @@ async function runAuditStep({ context, options }) {
       scope,
       round: state.round + 1,
       checks: summariseChecks(checks.results),
+      runtimeVerification: runtimeChecksResult
+        ? summariseRuntimeChecks(runtimeChecksResult.results)
+        : null,
       role: identity,
     }),
   });
@@ -741,6 +803,20 @@ export async function runPublishStep({ context, options, _git, pushMode = PUBLIS
     throw new LoopStopped(
       `Refusing to publish: the working tree has ${tree.changes.length} uncommitted change(s), ` +
         'so HEAD is not the whole of the approved work.',
+    );
+  }
+
+  // Runtime-verification gate: a required runtime check must have passed for
+  // the exact commit that is about to be published or marked ready.
+  if (
+    state.runtimeVerificationRequired &&
+    (state.runtimeVerificationStatus !== 'PASS' || state.runtimeVerificationHead !== head)
+  ) {
+    throw new LoopStopped(
+      `Refusing to publish ${short(head)}: the required runtime verification gate is ` +
+        `not satisfied (status: ${state.runtimeVerificationStatus ?? 'not run'}, ` +
+        `verified head: ${short(state.runtimeVerificationHead)}). ` +
+        'The runtime checks must pass against the exact commit being published.',
     );
   }
 
@@ -909,11 +985,14 @@ function resolveNextTask({ loaded, options }) {
       }
 
       const deps = dependencyStatuses(activeTask, taskMap);
+      const taskRv = normaliseTaskRuntimeVerification(activeTask.runtimeVerification, activeTaskId);
+      const rv = resolveRuntimeVerification({ project: PROJECT_RUNTIME_VERIFICATION, task: taskRv });
       const brief = generateTaskBrief(
         activeTask,
         deps,
         DETERMINISTIC_CHECKS,
         MAX_CHANGE_ROUNDS,
+        rv,
       );
 
       if (options.dryRun) {
@@ -947,11 +1026,14 @@ function resolveNextTask({ loaded, options }) {
   }
 
   const deps = dependencyStatuses(nextTask, taskMap);
+  const taskRv = normaliseTaskRuntimeVerification(nextTask.runtimeVerification, nextTask.id);
+  const rv = resolveRuntimeVerification({ project: PROJECT_RUNTIME_VERIFICATION, task: taskRv });
   const brief = generateTaskBrief(
     nextTask,
     deps,
     DETERMINISTIC_CHECKS,
     MAX_CHANGE_ROUNDS,
+    rv,
   );
 
   if (options.dryRun) {
@@ -1059,7 +1141,51 @@ async function runLoop(options) {
   }
   const branch = chosen.branch;
   const selected = selectTask(loaded, { task, branch });
-  const context = { state: selected.state, checks: [], claudeProcessesStarted: 0 };
+
+  // Resolve runtime-verification config for this task.
+  // If the task file exists, look up the task-level config. For projects
+  // without a task file (legacy), the task-level config is null and only
+  // the project-level config matters.
+  let taskRuntimeVerification = null;
+  try {
+    const tasksFilePath = resolveTaskFilePath(TASKS_FILE_RELATIVE, REPO_ROOT);
+    if (fs.existsSync(tasksFilePath)) {
+      const taskData = loadTaskFile(tasksFilePath);
+      const validated = validateTaskFile(taskData, tasksFilePath);
+      const taskEntry = findTask(validated.tasks, task);
+      if (taskEntry) {
+        taskRuntimeVerification = normaliseTaskRuntimeVerification(
+          taskEntry.runtimeVerification,
+          taskEntry.id,
+        );
+      }
+    }
+  } catch {
+    // Task file missing or invalid — treat as no task-level config.
+  }
+  const resolvedRv = resolveRuntimeVerification({
+    project: PROJECT_RUNTIME_VERIFICATION,
+    task: taskRuntimeVerification,
+  });
+  const rvRequired = isRuntimeVerificationRequired(resolvedRv);
+
+  // Carry the runtime-verification requirement into the state so the decision
+  // engine and the publish step can read it without re-resolving config.
+  if (rvRequired !== selected.state.runtimeVerificationRequired ||
+      (resolvedRv ? resolvedRv.profile : null) !== selected.state.runtimeVerificationProfile) {
+    selected.state = {
+      ...selected.state,
+      runtimeVerificationRequired: rvRequired,
+      runtimeVerificationProfile: resolvedRv ? resolvedRv.profile : null,
+    };
+  }
+
+  const context = {
+    state: selected.state,
+    checks: [],
+    claudeProcessesStarted: 0,
+    runtimeVerification: resolvedRv,
+  };
 
   log.section(`Task ${task} — ${branch}`);
   log.info(selected.resumed ? 'Resuming the saved review position.' : 'Starting a fresh task.');

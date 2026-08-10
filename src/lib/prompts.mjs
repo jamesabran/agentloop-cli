@@ -138,7 +138,7 @@ ${reportContract({ task, role })}`;
  *   round: number, checks: string, role?: string,
  * }} context
  */
-export function auditPrompt({ task, brief, head, scope, round, checks, role = 'CODEX' }) {
+export function auditPrompt({ task, brief, head, scope, round, checks, runtimeVerification = null, role = 'CODEX' }) {
   const focus = scope.incremental
     ? `This is re-audit round ${round}. You have already audited ${scope.from}. Review **only the commits added since then** — the range ${scope.range} — together with the unresolved findings listed below. Do not re-litigate what you already accepted in the earlier rounds unless the new commits changed it.`
     : `This is the first audit of this task. Review everything the branch adds to ${BASE_BRANCH} — the range ${scope.range}.`;
@@ -175,7 +175,7 @@ ${unresolved}
 The controller ran these against ${head} before starting you, and all of them passed:
 
 ${checks}
-
+${runtimeVerification ? `\n## Runtime verification already run\n\nThe controller also ran these runtime checks against ${head}, and all of them passed:\n\n${runtimeVerification}\n` : ''}
 So do not spend the audit re-running them. Judge what they cannot: correctness, scope, coverage, and risk.
 
 ## What to assess

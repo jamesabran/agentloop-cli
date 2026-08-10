@@ -283,6 +283,30 @@ export function validateTaskFile(data, filePath) {
         }
       }
     }
+
+    // runtimeVerification (optional)
+    if (task.runtimeVerification !== undefined) {
+      if (task.runtimeVerification === null || typeof task.runtimeVerification !== 'object' || Array.isArray(task.runtimeVerification)) {
+        errors.push(`${prefix}: "runtimeVerification" must be an object when present.`);
+      } else {
+        const rv = task.runtimeVerification;
+        if (rv.profile !== undefined && typeof rv.profile !== 'string') {
+          errors.push(`${prefix}: runtimeVerification.profile must be a string.`);
+        }
+        if (rv.checks !== undefined) {
+          if (!Array.isArray(rv.checks)) {
+            errors.push(`${prefix}: runtimeVerification.checks must be an array.`);
+          } else {
+            for (let c = 0; c < rv.checks.length; c += 1) {
+              const chk = rv.checks[c];
+              if (!chk || typeof chk.name !== 'string' || typeof chk.command !== 'string') {
+                errors.push(`${prefix}: runtimeVerification.checks[${c}] must have string "name" and "command" fields.`);
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
   // Cross-task validation: dependencies must reference existing tasks
@@ -576,9 +600,10 @@ export function isLegacySafeTaskId(id) {
  * @param {{ id: string, status: string }[]} deps - dependency statuses
  * @param {{ name: string, script: string }[]} checks - configured verification commands
  * @param {number} maxChangeRounds - maximum correction rounds
+ * @param {{ profile: string, checks: { name: string, command: string }[] } | null} [runtimeVerification] - resolved runtime verification config
  * @returns {string} markdown brief
  */
-export function generateTaskBrief(task, deps, checks, maxChangeRounds) {
+export function generateTaskBrief(task, deps, checks, maxChangeRounds, runtimeVerification = null) {
   const lines = [
     `# Task ${task.id}: ${task.title}`,
     '',
@@ -619,6 +644,31 @@ export function generateTaskBrief(task, deps, checks, maxChangeRounds) {
     'The controller runs these deterministic checks before every Codex audit:',
     '',
     ...checks.map((c) => `- \`npm run ${c.script}\` (${c.name})`),
+  );
+
+  if (runtimeVerification && runtimeVerification.checks.length > 0) {
+    lines.push(
+      '',
+      '## Runtime Verification',
+      '',
+      `**Profile**: ${runtimeVerification.profile}`,
+      '',
+      'The controller runs these runtime checks before every audit:',
+      '',
+      ...runtimeVerification.checks.map((c) => `- \`${c.command}\` (${c.name})`),
+    );
+  } else if (runtimeVerification) {
+    lines.push(
+      '',
+      '## Runtime Verification',
+      '',
+      `**Profile**: ${runtimeVerification.profile}`,
+      '',
+      'Runtime verification is required but no checks are configured.',
+    );
+  }
+
+  lines.push(
     '',
     '## Constraints',
     '',

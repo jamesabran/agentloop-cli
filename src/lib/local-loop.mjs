@@ -85,6 +85,20 @@ export function decideLocal({ state, head, maxChangeRounds = MAX_CHANGE_ROUNDS, 
     );
   }
 
+  // Runtime-verification gate: a required check that failed against the
+  // current HEAD is a hard blocker — same as a failed deterministic check.
+  if (
+    state.runtimeVerificationRequired &&
+    state.runtimeVerificationStatus === 'FAIL' &&
+    state.runtimeVerificationHead === head
+  ) {
+    return step(
+      ACTIONS.STOP,
+      'Runtime verification is required and failed against the current HEAD. ' +
+        'Fix the failure before re-running.',
+    );
+  }
+
   // No commits on the branch yet: nothing has been implemented.
   if (!head || !state.implementationHead) {
     return step(ACTIONS.IMPLEMENT, 'No local checkpoint commit for this task yet.');
@@ -108,6 +122,22 @@ export function decideLocal({ state, head, maxChangeRounds = MAX_CHANGE_ROUNDS, 
   }
 
   if (state.verdict === 'APPROVED') {
+    // Runtime-verification gate: an approval cannot override a missing or
+    // failed runtime gate.  The runtime verification result must be PASS for
+    // the exact commit that is about to be published.
+    if (
+      state.runtimeVerificationRequired &&
+      (state.runtimeVerificationStatus !== 'PASS' || state.runtimeVerificationHead !== head)
+    ) {
+      return step(
+        ACTIONS.STOP,
+        'Codex approved, but the required runtime verification gate is not satisfied ' +
+          `(status: ${state.runtimeVerificationStatus ?? 'not run'}, ` +
+          `head: ${short(state.runtimeVerificationHead)} vs ${short(head)}). ` +
+          'Run the runtime checks before publishing.',
+      );
+    }
+
     return step(
       ACTIONS.PUBLISH,
       `Codex approved ${short(head)}, which is still HEAD. Publishing the branch.`,
@@ -236,6 +266,9 @@ export function formatLocalReport({
     `- Published: ${state.publishedHead ?? 'no'}`,
     `- Ready to publish (manual): ${state.readyToPublishHead ?? 'no'}`,
     `- Claude recovery required: ${state.recoveryRequired ? 'yes' : 'no'}`,
+    `- Runtime verification: ${state.runtimeVerificationRequired ? 'required' : 'not required'}`,
+    `- Runtime verification status: ${state.runtimeVerificationStatus ?? '(not run)'}`,
+    `- Runtime verification head: ${state.runtimeVerificationHead ?? '(none)'}`,
   ];
 
   if (commits.length > 0) {

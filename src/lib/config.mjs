@@ -22,6 +22,7 @@ import path from 'node:path';
 import process from 'node:process';
 
 import { parseGithubOwnerRepo } from './git-url.mjs';
+import { normaliseProjectRuntimeVerification } from './runtime-verification.mjs';
 import { defaultRoleMapping, LOGICAL_ROLES, resolveProvider } from './roles.mjs';
 
 /**
@@ -235,6 +236,22 @@ function normaliseChecks(value) {
  * any command derived from this list — see {@link CLAUDE_DEFAULT_ALLOWED}.
  */
 export const DETERMINISTIC_CHECKS = normaliseChecks(PROJECT_CONFIG.checks) ?? DEFAULT_CHECKS;
+
+/**
+ * Project-level runtime verification configuration.
+ *
+ * Parsed from `agentloop.config.json`'s `runtimeVerification` block. Null means
+ * the project has not configured runtime verification; every task inherits that
+ * absence and the runtime gate is NOT_REQUIRED.
+ *
+ * Task-level `runtimeVerification` may inherit, disable, or escalate this
+ * baseline (see `resolveRuntimeVerification` in runtime-verification.mjs).
+ *
+ * @type {{ profile: string, checks: { name: string, command: string }[] } | null}
+ */
+export const PROJECT_RUNTIME_VERIFICATION = normaliseProjectRuntimeVerification(
+  PROJECT_CONFIG.runtimeVerification,
+);
 
 /**
  * How many Codex `REQUEST_CHANGES` rounds the loop will work through before

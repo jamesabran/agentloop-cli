@@ -26,6 +26,13 @@ export const STATE_VERSION = 4;
 
 export const VERDICTS = Object.freeze(['APPROVED', 'REQUEST_CHANGES', 'BLOCKED']);
 
+/** Valid values for the runtime-verification status field. */
+export const RUNTIME_VERIFICATION_STATUSES = Object.freeze([
+  'PASS',
+  'FAIL',
+  'NOT_REQUIRED',
+]);
+
 const SHA = /^[0-9a-f]{40}$/i;
 /** Issue numbers, `#5`, and local slugs all qualify as a task identifier. */
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._\/#-]{0,127}$/;
@@ -64,6 +71,19 @@ const SCHEMA = Object.freeze({
   publishedHead: (value) => value === null || SHA.test(String(value)),
   /** Set when manual mode approves and gates pass but nothing is pushed. */
   readyToPublishHead: (value) => value === null || SHA.test(String(value)),
+  /** Runtime-verification gate status for the current task. */
+  runtimeVerificationStatus: (value) =>
+    value === null || RUNTIME_VERIFICATION_STATUSES.includes(value),
+  /** Commit SHA the runtime verification was last run against. */
+  runtimeVerificationHead: (value) => value === null || SHA.test(String(value)),
+  /** Captured output from the last runtime verification run. */
+  runtimeVerificationOutput: (value) =>
+    value === null || (typeof value === 'string' && value.length <= 100_000),
+  /** Whether runtime verification is required for the current task. */
+  runtimeVerificationRequired: (value) => typeof value === 'boolean',
+  /** The resolved runtime verification profile for the current task. */
+  runtimeVerificationProfile: (value) =>
+    value === null || (typeof value === 'string' && value.length <= 64),
   claudeSessionId: (value) => value === null || isUuid(value),
   consecutiveFailures: (value) => Number.isInteger(value) && value >= 0 && value <= 1000,
   failingStep: (value) => value === null || (typeof value === 'string' && value.length <= 64),
@@ -99,6 +119,11 @@ export function emptyState() {
     blockers: [],
     publishedHead: null,
     readyToPublishHead: null,
+    runtimeVerificationStatus: null,
+    runtimeVerificationHead: null,
+    runtimeVerificationOutput: null,
+    runtimeVerificationRequired: false,
+    runtimeVerificationProfile: null,
     claudeSessionId: null,
     consecutiveFailures: 0,
     failingStep: null,
@@ -196,6 +221,11 @@ export function recordImplementation(state, head) {
     // A new commit also invalidates any previous manual-readiness — the new
     // commit has not been audited or approved.
     readyToPublishHead: null,
+    // A new commit also invalidates any previous runtime-verification result:
+    // the runtime checks must be re-run against the code that is now at HEAD.
+    runtimeVerificationStatus: null,
+    runtimeVerificationHead: null,
+    runtimeVerificationOutput: null,
   };
 }
 
@@ -213,6 +243,29 @@ export function recordAudit(state, { head, verdict, blockers = [] }) {
     changeRounds: verdict === 'REQUEST_CHANGES' ? state.changeRounds + 1 : state.changeRounds,
     verdict,
     blockers: verdict === 'APPROVED' ? [] : blockers,
+  };
+}
+
+/**
+ * Record the outcome of a runtime verification run.
+ *
+ * @param {object} state
+ * @param {{
+ *   head: string,
+ *   status: 'PASS' | 'FAIL' | 'NOT_REQUIRED',
+ *   output?: string,
+ *   required?: boolean,
+ *   profile?: string,
+ * }} result
+ */
+export function recordRuntimeVerification(state, { head, status, output = null, required = false, profile = null }) {
+  return {
+    ...state,
+    runtimeVerificationStatus: status,
+    runtimeVerificationHead: head,
+    runtimeVerificationOutput: output,
+    runtimeVerificationRequired: required,
+    runtimeVerificationProfile: profile,
   };
 }
 
