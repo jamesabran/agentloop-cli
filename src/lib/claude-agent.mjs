@@ -22,6 +22,7 @@ import path from 'node:path';
 
 import {
   CLAUDE_ALLOWED_TOOLS,
+  CLAUDE_CLI_PERMISSION_MODE,
   CLAUDE_DISALLOWED_TOOLS,
   CLAUDE_HARD_DENY_PATTERNS,
   CLAUDE_PERMISSION_MODE,
@@ -108,7 +109,7 @@ export function buildClaudeArgs({ sessionId, resume }) {
     'stream-json',
     '--verbose',
     '--permission-mode',
-    CLAUDE_PERMISSION_MODE,
+    CLAUDE_CLI_PERMISSION_MODE,
     '--add-dir',
     REPO_ROOT,
   ];
@@ -271,6 +272,7 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
     path.basename(process.env.AGENTLOOP_CLAUDE_BIN) === 'claude.cmd';
 
   const relayEnabled =
+    CLAUDE_PERMISSION_MODE === 'interactive' &&
     process.stdin.isTTY &&
     isStandardClaude &&
     !process.env.AGENTLOOP_DISABLE_PERMISSION_RELAY;

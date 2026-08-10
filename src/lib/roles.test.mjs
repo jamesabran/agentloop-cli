@@ -54,6 +54,7 @@ function baseEnv(overrides = {}) {
   delete env.AGENTLOOP_REPO;
   delete env.AGENTLOOP_BASE_BRANCH;
   delete env.AGENTLOOP_CLAUDE_ALLOWED_TOOLS;
+  delete env.AGENTLOOP_CLAUDE_PERMISSION_MODE;
   delete env.AGENTLOOP_CLAUDE_TIMEOUT_MS;
   delete env.AGENTLOOP_PUBLISH_MODE;
   for (const [key, value] of Object.entries(overrides)) {
@@ -370,7 +371,7 @@ describe('ROLE_MAPPING from agentloop.config.json', () => {
 describe('getProviderConfig keeps settings attached to the provider', () => {
   it('returns claude config from the claude key', () => {
     const dir = makeProject({
-      config: { claude: { permissionMode: 'acceptEdits' } },
+      config: { claude: { permissionMode: 'auto' } },
     });
     // getProviderConfig is a function, not a value — import and call it as a
     // one-liner via spawn.
@@ -384,7 +385,7 @@ describe('getProviderConfig keeps settings attached to the provider', () => {
       { cwd: dir, env: baseEnv(), encoding: 'utf8' },
     );
     expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({ permissionMode: 'acceptEdits' });
+    expect(JSON.parse(result.stdout)).toEqual({ permissionMode: 'auto' });
   });
 
   it('returns empty object for a provider with no config', () => {
@@ -423,15 +424,6 @@ describe('getProviderConfig keeps settings attached to the provider', () => {
  * ------------------------------------------------------------------ */
 
 describe('provider-specific Claude config is preserved', () => {
-  it('CLAUDE_PERMISSION_MODE resolves from the claude provider config', () => {
-    const dir = makeProject({
-      config: { claude: { permissionMode: 'default' } },
-    });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
-    expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toBe('default');
-  });
-
   it('CLAUDE_ALLOWED_TOOLS still resolves as before', () => {
     const dir = makeProject();
     const result = importConfigField('CLAUDE_ALLOWED_TOOLS', { cwd: dir, env: baseEnv() });
@@ -441,6 +433,152 @@ describe('provider-specific Claude config is preserved', () => {
     expect(value).toContain('Read');
     expect(value).toContain('Bash(git status*)');
     expect(value).not.toMatch(/git push/i);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * CLAUDE_PERMISSION_MODE (ALCLI semantic mode)                        *
+ * ------------------------------------------------------------------ */
+
+describe('CLAUDE_PERMISSION_MODE', () => {
+  it('defaults to "interactive"', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('interactive');
+  });
+
+  it('CLAUDE_CLI_PERMISSION_MODE defaults to "acceptEdits" (from interactive)', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_CLI_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('acceptEdits');
+  });
+
+  it('resolves "interactive" from claude.permissionMode in config', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: 'interactive' } },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('interactive');
+  });
+
+  it('resolves "auto" from claude.permissionMode in config', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: 'auto' } },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('auto');
+  });
+
+  it('"auto" mode maps CLI_PERMISSION_MODE to "bypassPermissions"', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: 'auto' } },
+    });
+    const result = importConfigField('CLAUDE_CLI_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('bypassPermissions');
+  });
+
+  it('env var AGENTLOOP_CLAUDE_PERMISSION_MODE overrides config', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: 'interactive' } },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_PERMISSION_MODE: 'auto' }),
+    });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('auto');
+  });
+
+  it('rejects invalid mode "acceptEdits" (a CLI value, not an ALCLI mode)', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: 'acceptEdits' } },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
+  });
+
+  it('rejects invalid mode "bypassPermissions" in config', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: 'bypassPermissions' } },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
+  });
+
+  it('rejects invalid mode "default" in config', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: 'default' } },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
+  });
+
+  it('rejects invalid mode "plan" in config', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: 'plan' } },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
+  });
+
+  it('rejects empty string permissionMode', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: '' } },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
+  });
+
+  it('rejects invalid mode via env var', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', {
+      cwd: dir,
+      env: baseEnv({ AGENTLOOP_CLAUDE_PERMISSION_MODE: 'garbage' }),
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
+  });
+});
+
+describe('CLAUDE_PERMISSION_MODE works regardless of role mapping', () => {
+  it('"auto" mode works when claude is the implementer', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: 'auto' }, roles: { implementer: 'claude' } },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('auto');
+  });
+
+  it('"auto" mode works when claude is the planner', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: 'auto' }, roles: { planner: 'claude' } },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('auto');
+  });
+
+  it('"interactive" mode works when claude is both planner and implementer', () => {
+    const dir = makeProject({
+      config: {
+        claude: { permissionMode: 'interactive' },
+        roles: { planner: 'claude', implementer: 'claude', auditor: 'codex' },
+      },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('interactive');
   });
 });
 

@@ -284,11 +284,20 @@ describe('tool_use_id-scoped file isolation', () => {
  * ------------------------------------------------------------------ */
 
 describe('timeout continuation flow still works', () => {
-  it('buildClaudeArgs still produces --print', async () => {
+  it('buildClaudeArgs still produces --print and uses derived CLI permission mode', async () => {
     const { buildClaudeArgs } = await import('./claude-agent.mjs');
     const args = buildClaudeArgs({ sessionId: 't', resume: false });
     expect(args).toContain('--print');
     expect(args).toContain('stream-json');
+    // The --permission-mode flag carries the derived CLI value, not the ALCLI semantic mode.
+    expect(args).toContain('--permission-mode');
+    const idx = args.indexOf('--permission-mode');
+    const mode = args[idx + 1];
+    // Default ALCLI mode is 'interactive' → CLI flag is 'acceptEdits'.
+    expect(mode).toBe('acceptEdits');
+    // The ALCLI semantic mode 'interactive'/'auto' must NOT appear directly in the CLI args.
+    expect(mode).not.toBe('interactive');
+    expect(mode).not.toBe('auto');
   });
 
   it('runClaude is exported', async () => {

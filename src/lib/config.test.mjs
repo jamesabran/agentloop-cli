@@ -104,6 +104,7 @@ function baseEnv(overrides = {}) {
   delete env.AGENTLOOP_REPO;
   delete env.AGENTLOOP_BASE_BRANCH;
   delete env.AGENTLOOP_CLAUDE_ALLOWED_TOOLS;
+  delete env.AGENTLOOP_CLAUDE_PERMISSION_MODE;
   delete env.AGENTLOOP_CLAUDE_TIMEOUT_MS;
   for (const [key, value] of Object.entries(overrides)) {
     if (value === undefined) delete env[key];
