@@ -809,6 +809,26 @@ export async function runSetup({
   const tmpPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.tmp`);
   const preUpdateBackupPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update`);
 
+  // If a .pre-update file exists from a previous interrupted or
+  // partially-failed run, rotate it to a timestamped name before it gets
+  // overwritten by this run's snapshot.  .pre-update is deliberately
+  // retained as a recovery artifact — silently replacing it would
+  // destroy the only copy of the previous config.
+  if (fs.existsSync(preUpdateBackupPath)) {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const stampedPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}`);
+    try {
+      fs.renameSync(preUpdateBackupPath, stampedPath);
+      prompt.display(`  Rotated previous recovery file to ${path.basename(stampedPath)}`);
+    } catch {
+      // Rotation failed — the pre-update file stays in place and will be
+      // overwritten by the snapshot below.  This is a last-resort path;
+      // we cannot safely block the user from configuring their project.
+      prompt.display('  Warning: could not rotate the existing .pre-update recovery file.');
+      prompt.display('  It will be replaced by this run. Copy it elsewhere if you need it.');
+    }
+  }
+
   try {
     // Load existing config (for display defaults only — the actual
     // "is this a reconfiguration" check looks at whether the file exists).
