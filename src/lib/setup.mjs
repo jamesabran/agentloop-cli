@@ -809,18 +809,6 @@ export async function runSetup({
   const tmpPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.tmp`);
   const preUpdateBackupPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update`);
 
-  // Clean up debris from a previous interrupted run: leftover temp file
-  // or a pre-update backup that was never finalised.
-  try { fs.unlinkSync(tmpPath); } catch { /* didn't exist */ }
-  if (fs.existsSync(preUpdateBackupPath)) {
-    // A pre-update backup means the previous run was interrupted between
-    // writing the candidate and finalising.  The canonical file at this
-    // point is either the candidate (if the atomic rename completed) or
-    // the old config (if it did not).  Either way, the canonical file is
-    // the most recent complete state — discard the stale backup.
-    try { fs.unlinkSync(preUpdateBackupPath); } catch { /* best-effort */ }
-  }
-
   try {
     // Load existing config (for display defaults only — the actual
     // "is this a reconfiguration" check looks at whether the file exists).
@@ -884,10 +872,16 @@ export async function runSetup({
         fs.copyFileSync(configPath, preUpdateBackupPath);
         hadOldFile = true;
       } catch {
-        // Copy failed — the original is still intact at the canonical
-        // path.  Proceed without a backup; if validation fails the
-        // original was never touched so nothing needs restoring.
-        prompt.display('  Warning: could not snapshot the existing config — proceeding without a backup.');
+        // Copy failed — the original is still intact but we cannot
+        // safely replace it without a backup to roll back to.
+        prompt.display('');
+        prompt.display('  ✖  Could not create a backup of the existing configuration.');
+        prompt.display('  The existing config was not modified.');
+        return {
+          saved: false,
+          config,
+          reason: 'Could not snapshot the existing config — nothing was changed.',
+        };
       }
     }
 
@@ -918,12 +912,23 @@ export async function runSetup({
       // Validation failed — restore the old config from the pre-update
       // backup (if we have one), or remove the invalid candidate.
       if (hadOldFile) {
+        // Restore atomically: copy the backup to a temp file, then
+        // rename over the canonical path.  A direct copyFile over the
+        // canonical path could leave a partial file on failure.
+        let restored = false;
         try {
-          fs.copyFileSync(preUpdateBackupPath, configPath);
-          try { fs.unlinkSync(preUpdateBackupPath); } catch { /* best-effort */ }
+          fs.copyFileSync(preUpdateBackupPath, tmpPath);
+          fs.renameSync(tmpPath, configPath);
+          restored = true;
         } catch {
-          // Restore failed — the pre-update backup is still on disk so
-          // the user can recover manually.
+          // Restore failed.  Clean up the temp file if it exists, but
+          // leave .pre-update intact — it is the only good copy.
+          try { fs.unlinkSync(tmpPath); } catch { /* best-effort */ }
+        }
+
+        if (restored) {
+          try { fs.unlinkSync(preUpdateBackupPath); } catch { /* best-effort */ }
+        } else {
           prompt.display('');
           prompt.display('  ✖  Validation failed and the previous config could not be restored.');
           prompt.display(`  The previous config is at ${CONFIG_FILE_NAME}.pre-update`);
