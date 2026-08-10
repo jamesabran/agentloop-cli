@@ -22,6 +22,7 @@ import path from 'node:path';
 import process from 'node:process';
 
 import { parseGithubOwnerRepo } from './git-url.mjs';
+import { defaultRoleMapping, LOGICAL_ROLES, resolveProvider } from './roles.mjs';
 
 /**
  * Find the project AgentLoop is running in: the nearest ancestor of the
@@ -273,7 +274,71 @@ function validatePublishMode(value) {
   );
 }
 
-const CLAUDE_CONFIG = PROJECT_CONFIG.claude ?? {};
+/* ------------------------------------------------------------------ *
+ * Role → provider mapping                                              *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Which provider each logical role delegates to.
+ *
+ * Defaults to the existing Claude-implementer / Codex-auditor workflow so
+ * current users see no behavioural regression.  Configurable per project
+ * via `roles` in `agentloop.config.json`:
+ *
+ *   {
+ *     "roles": {
+ *       "planner": "claude",
+ *       "implementer": "claude",
+ *       "auditor": "codex"
+ *     }
+ *   }
+ *
+ * Each role must map to a supported provider, and the provider must support
+ * that role — an invalid combination raises an error at config load.
+ */
+function resolveRoleMapping(configValue) {
+  const defaults = defaultRoleMapping();
+  if (!configValue || typeof configValue !== 'object') return defaults;
+
+  const merged = { ...defaults };
+  for (const role of LOGICAL_ROLES) {
+    if (typeof configValue[role] === 'string' && configValue[role].trim() !== '') {
+      merged[role] = configValue[role].trim();
+    }
+  }
+
+  // Validate every mapping before returning — fail closed on any invalid entry.
+  for (const [role, provider] of Object.entries(merged)) {
+    resolveProvider(role, merged);
+  }
+
+  return Object.freeze(merged);
+}
+
+export const ROLE_MAPPING = resolveRoleMapping(PROJECT_CONFIG.roles);
+
+/**
+ * Provider-specific configuration from `agentloop.config.json`.
+ *
+ * Each provider key (e.g. `"claude"`, `"codex"`) holds settings that are
+ * specific to that provider — permission mode, tool lists, model, etc.
+ * Provider settings belong to the provider, never to a generic role, so
+ * changing which provider fills a role does not silently move settings
+ * between providers.
+ *
+ * The top-level `claude` key from older configs continues to work
+ * unchanged; it is the same object this returns for `"claude"`.
+ *
+ * @param {string} provider — provider name (e.g. "claude", "codex")
+ * @returns {Record<string, unknown>}
+ */
+export function getProviderConfig(provider) {
+  const cfg = PROJECT_CONFIG[provider];
+  if (cfg && typeof cfg === 'object' && !Array.isArray(cfg)) return cfg;
+  return {};
+}
+
+const CLAUDE_CONFIG = getProviderConfig('claude');
 
 /**
  * Claude tool permissions for unattended runs.

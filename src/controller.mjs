@@ -8,12 +8,17 @@
  *       ▲                    │
  *       └──────── fix ◄──────┘   (at most two rounds)
  *
- * Everything up to the push happens in this working copy. Claude implements
- * and makes a local checkpoint commit; the controller runs the deterministic
- * checks against that commit and hands it to Codex read-only; Codex's findings
- * come back to Claude as another local commit, and the re-audit sees only the
- * new commit range. Nothing is pushed, and nothing is posted to GitHub, until
- * Codex approves the exact commit that is still HEAD.
+ * Everything up to the push happens in this working copy. The implementer
+ * (default: Claude) makes a local checkpoint commit; the controller runs the
+ * deterministic checks against that commit and hands it to the auditor
+ * (default: Codex) read-only; the auditor's findings come back to the
+ * implementer as another local commit, and the re-audit sees only the new
+ * commit range. Nothing is pushed, and nothing is posted to GitHub, until
+ * the auditor approves the exact commit that is still HEAD.
+ *
+ * Agent roles (planner, implementer, auditor) are independently configurable
+ * via `roles` in agentloop.config.json. Each maps to a supported provider;
+ * the defaults preserve the existing Claude/Codex workflow.
  *
  * Usage: agentloop --task <id> [--dry-run] [...]
  */
@@ -37,8 +42,7 @@ import {
   REPO_ROOT,
   TASKS_FILE_RELATIVE,
 } from './lib/config.mjs';
-import { runClaude, streamClaudeProgress } from './lib/claude-agent.mjs';
-import { runCodexAudit } from './lib/codex-agent.mjs';
+import { runImplementer, runAuditor, resolveRoleProvider, streamClaudeProgress } from './lib/agent-router.mjs';
 import { classifyAuditOutcome } from './lib/audit.mjs';
 import { failureExcerpt, runChecks, summariseChecks } from './lib/checks.mjs';
 import { checkAuth, getIssue } from './lib/github.mjs';
@@ -101,13 +105,13 @@ Options:
   --push-mode <mode> Publish mode: "manual" (default) or "auto". Overrides
                      AGENTLOOP_PUBLISH_MODE and publishMode in config.
   --dry-run         Report the next local step, change nothing
-  --recover         Explicitly clear a terminal Claude failure and start a new session
+  --recover         Explicitly clear a terminal implementer failure and start a new session
   --self-check      Offline demonstration of the loop; no agents, no network
   --verbose         Include debug logging
   --help            Show this message
 
 Task selection with --next is deterministic and auditable: the controller owns
-the decision; Claude and Codex never choose which task comes next.
+the decision; the agents never choose which task comes next.
 
 Local state, logs, audit reports, and the final report live in .agent/.
 That directory is gitignored and never contains credentials.
@@ -328,7 +332,7 @@ async function resolveBrief({ task, options, generatedBrief }) {
  * Steps                                                               *
  * ------------------------------------------------------------------ */
 
-/** Claim this invocation's one permitted Claude process. */
+/** Claim this invocation's one permitted implementer process. */
 export function claimClaudeProcess(context) {
   if (context.claudeProcessesStarted >= 1) return false;
   context.claudeProcessesStarted += 1;
@@ -354,18 +358,21 @@ function promptContinue() {
   });
 }
 
-/** A terminal Claude failure discards its session and requires --recover. */
+/** A terminal implementer failure discards its session and requires --recover. */
 function stopClaudeTerminal(context, step, reason) {
-  const message = `Claude ${step} failed: ${reason}. ` +
-    'Its session was discarded; inspect the local report and rerun with --recover only when ready.';
+  const message = `${step} failed: ${reason}. ` +
+    'The implementer session was discarded; inspect the local report and rerun with --recover only when ready.';
   context.state = requireRecovery(context.state, message);
   throw new LoopStopped(message);
 }
 
-/** Start or resume Claude, and record the local commit it produced. */
-async function runClaudeStep({ decision, context, options }) {
+/** Start or resume the implementer, and record the local commit it produced. */
+async function runImplementerStep({ decision, context, options }) {
   const { state, brief } = context;
   const fixing = decision.action === ACTIONS.FIX;
+
+  // Resolve the provider identity for status-block validation and prompts.
+  const { identity } = resolveRoleProvider('implementer');
 
   const prompt = fixing
     ? fixPrompt({
@@ -374,17 +381,19 @@ async function runClaudeStep({ decision, context, options }) {
         findings: readAuditReport(state),
         auditedCommit: state.lastAuditedHead,
         round: state.changeRounds,
+        role: identity,
       })
     : implementationPrompt({
         task: state.task,
         branch: state.branch,
         brief,
         resumed: Boolean(state.claudeSessionId),
+        role: identity,
       });
 
   if (options.dryRun) {
     log.info(
-      `[dry-run] would ${fixing ? 'return Codex findings to' : 'start'} Claude on task ` +
+      `[dry-run] would ${fixing ? 'return audit findings to' : 'start'} implementer on task ` +
         `${state.task} (${prompt.length} character prompt)`,
     );
     return { continue: false, stopReason: 'Dry run: no agent was started.' };
@@ -394,7 +403,7 @@ async function runClaudeStep({ decision, context, options }) {
     stopClaudeTerminal(
       context,
       fixing ? 'fix' : 'implementation',
-      'the one-Claude-process limit for this controller invocation is exhausted',
+      'the one-implementer-process limit for this controller invocation is exhausted',
     );
   }
 
@@ -403,24 +412,24 @@ async function runClaudeStep({ decision, context, options }) {
     stopClaudeTerminal(
       context,
       fixing ? 'fix' : 'implementation',
-      `the working tree is dirty (${treeBefore.changes.length} change(s)); Claude was not started`,
+      `the working tree is dirty (${treeBefore.changes.length} change(s)); implementer was not started`,
     );
   }
 
   const before = await headCommit();
 
-  log.info(`${fixing ? 'Returning Codex findings to Claude' : 'Starting Claude'} on ${state.task}…`);
+  log.info(`${fixing ? 'Returning audit findings to' : 'Starting'} implementer (${identity}) on ${state.task}…`);
   let outcome;
   for (;;) {
     const resume = Boolean(context.state.claudeSessionId);
     try {
-      outcome = await runClaude({
+      outcome = await runImplementer({
         prompt,
         sessionId: resume ? context.state.claudeSessionId : null,
         resume,
         onStdout: streamClaudeProgress((progress) => {
           for (const line of progress.split(/\r?\n/)) {
-            if (line.trim() !== '') log.info(`Claude: ${line}`);
+            if (line.trim() !== '') log.info(`${identity}: ${line}`);
           }
         }),
         onLog: (line) => log.debug(line),
@@ -435,7 +444,7 @@ async function runClaudeStep({ decision, context, options }) {
       stopClaudeTerminal(
         context,
         fixing ? 'fix' : 'implementation',
-        `Claude process limit exhausted (${outcome.error ?? 'usage limit reached'})`,
+        `${identity} process limit exhausted (${outcome.error ?? 'usage limit reached'})`,
       );
     }
 
@@ -444,7 +453,7 @@ async function runClaudeStep({ decision, context, options }) {
       if (!process.stdin.isTTY) {
         stopClaudeTerminal(context, fixing ? 'fix' : 'implementation', outcome.error);
       }
-      log.warn(`Claude timed out after ${LIMITS.claudeTimeoutMs}ms.`);
+      log.warn(`${identity} timed out after ${LIMITS.claudeTimeoutMs}ms.`);
       const cont = await promptContinue();
       if (!cont) {
         stopClaudeTerminal(context, fixing ? 'fix' : 'implementation', 'User chose to stop after timeout.');
@@ -460,13 +469,13 @@ async function runClaudeStep({ decision, context, options }) {
     break;
   }
 
-  const read = readStatus(outcome.text, { role: 'CLAUDE' });
+  const read = readStatus(outcome.text, { role: identity });
   if (!read.ok) {
     const detail = read.errors.length > 0 ? ` Errors: ${read.errors.join('; ')}` : '';
     stopClaudeTerminal(
       context,
       fixing ? 'fix status' : 'implementation status',
-      `Claude finished without exactly one valid AGENTLOOP_AGENT_STATUS block.${detail}`,
+      `${identity} finished without exactly one valid AGENTLOOP_AGENT_STATUS block.${detail}`,
     );
   }
 
@@ -474,14 +483,14 @@ async function runClaudeStep({ decision, context, options }) {
 
   if (status.task !== state.task) {
     stopClaudeTerminal(context, fixing ? 'fix status' : 'implementation status',
-      `Claude reported TASK ${status.task} but the active task is ${state.task}.`,
+      `${identity} reported TASK ${status.task} but the active task is ${state.task}.`,
     );
   }
 
   if (status.status === 'BLOCKED') {
     context.state = { ...context.state, blockers: [status.reason ?? 'no reason given'] };
     stopClaudeTerminal(context, fixing ? 'fix' : 'implementation',
-      `Claude reported BLOCKED: ${status.reason ?? 'no reason given'}`);
+      `${identity} reported BLOCKED: ${status.reason ?? 'no reason given'}`);
   }
 
   // The checkpoint has to exist, be HEAD, and be the whole of the change.
@@ -490,52 +499,52 @@ async function runClaudeStep({ decision, context, options }) {
 
   if (!tree.clean) {
     stopClaudeTerminal(context, fixing ? 'fix status' : 'implementation status',
-      `Claude reported READY_FOR_AUDIT but the working tree has ${tree.changes.length} ` +
+      `${identity} reported READY_FOR_AUDIT but the working tree has ${tree.changes.length} ` +
         'uncommitted change(s). The commit under review must be the whole change.',
     );
   }
   if (status.head !== head) {
     stopClaudeTerminal(context, fixing ? 'fix status' : 'implementation status',
-      `Claude reported HEAD ${short(status.head)} but the branch is at ${short(head)}. ` +
+      `${identity} reported HEAD ${short(status.head)} but the branch is at ${short(head)}. ` +
         'A verdict is pinned to one commit, so the reported commit must be the real one.',
     );
   }
   // A no-change handoff — READY_FOR_AUDIT with HEAD exactly where it already
   // was — is only a valid checkpoint when every part of the contract holds for
   // that existing commit. The checks above already establish a clean tree and
-  // a matching reported HEAD, from a status this invocation's own Claude
+  // a matching reported HEAD, from a status this invocation's own implementer
   // process just produced; isValidNoChangeHandoff re-asserts the rest (PASS,
   // no blockers) so the gate is legible and testable on its own.
   if (head === before && !isValidNoChangeHandoff({ status, head, treeClean: tree.clean })) {
     stopClaudeTerminal(context, fixing ? 'fix status' : 'implementation status',
-      `Claude reported READY_FOR_AUDIT without adding a commit; HEAD is still ${short(head)}.`,
+      `${identity} reported READY_FOR_AUDIT without adding a commit; HEAD is still ${short(head)}.`,
     );
   }
 
   context.state = clearFailures(recordImplementation(context.state, head));
   log.info(
     head === before
-      ? `Claude reported a verified no-change handoff; local checkpoint ${short(head)} stands for task ${state.task}.`
+      ? `${identity} reported a verified no-change handoff; local checkpoint ${short(head)} stands for task ${state.task}.`
       : `Local checkpoint ${short(head)} recorded for task ${state.task}.`,
   );
-  // Deliberately end this invocation after a successful Claude process. A
+  // Deliberately end this invocation after a successful implementer process. A
   // later explicit controller invocation can run checks/audit or a fix, but
-  // no loop can silently launch a second Claude process in the same run.
+  // no loop can silently launch a second implementer process in the same run.
   return {
     continue: false,
-    stopReason: 'Claude handoff recorded. Run the controller again to continue with checks and Codex.',
+    stopReason: `${identity} handoff recorded. Run the controller again to continue with checks and audit.`,
   };
 }
 
-/** Run the deterministic checks, then Codex read-only, against the current HEAD. */
+/** Run the deterministic checks, then audit read-only, against the current HEAD. */
 async function runAuditStep({ context, options }) {
   const { state, brief } = context;
   const head = await headCommit();
 
   if (!hasValidImplementationHandoff(state, head)) {
     throw new LoopStopped(
-      `Refusing to start Codex: implementationHead ${short(state.implementationHead)} does not ` +
-        `match current HEAD ${short(head)} from a valid Claude handoff.`,
+      `Refusing to start audit: implementationHead ${short(state.implementationHead)} does not ` +
+        `match current HEAD ${short(head)} from a valid implementer handoff.`,
     );
   }
   const scope = auditScope({ state, head });
@@ -544,14 +553,17 @@ async function runAuditStep({ context, options }) {
   if (!tree.clean) {
     throw new LoopStopped(
       `The working tree has ${tree.changes.length} uncommitted change(s). ` +
-        'Codex audits a commit, so the tree must be clean before an audit starts.',
+        'The auditor reviews a commit, so the tree must be clean before an audit starts.',
     );
   }
 
+  // Resolve the provider identity for status-block validation.
+  const { identity } = resolveRoleProvider('auditor');
+
   if (options.dryRun) {
     log.info(
-      `[dry-run] would run ${describeChecks()} against ${short(head)}, then start Codex ` +
-        `read-only over ${scope.range}`,
+      `[dry-run] would run ${describeChecks()} against ${short(head)}, then start auditor ` +
+        `(${identity}) read-only over ${scope.range}`,
     );
     return { continue: false, stopReason: 'Dry run: no checks and no agent were run.' };
   }
@@ -562,16 +574,16 @@ async function runAuditStep({ context, options }) {
   log.info(summariseChecks(checks.results));
 
   if (!checks.ok) {
-    // Not a review round: this is not a matter of opinion, and Codex should
-    // not be spending an audit on something `tsc` or `vitest` already caught.
+    // Not a review round: this is not a matter of opinion, and the auditor
+    // should not be spending a review on something `tsc` or `vitest` already caught.
     throw new LoopStopped(
       `The deterministic check "${checks.failed.name}" failed against ${short(head)}.\n\n` +
         `${failureExcerpt(checks.failed)}`,
     );
   }
 
-  log.info(`Starting Codex (read-only) over ${scope.range}…`);
-  const outcome = await runCodexAudit({
+  log.info(`Starting auditor (${identity}, read-only) over ${scope.range}…`);
+  const outcome = await runAuditor({
     prompt: auditPrompt({
       task: state.task,
       brief,
@@ -579,10 +591,11 @@ async function runAuditStep({ context, options }) {
       scope,
       round: state.round + 1,
       checks: summariseChecks(checks.results),
+      role: identity,
     }),
   });
 
-  const classified = classifyAuditOutcome(outcome, readStatus(outcome.text, { role: 'CODEX' }));
+  const classified = classifyAuditOutcome(outcome, readStatus(outcome.text, { role: identity }));
 
   if (classified.kind === 'audit_failed') {
     return afterFailedStep(context, 'audit', classified.reason);
@@ -592,18 +605,18 @@ async function runAuditStep({ context, options }) {
     return afterFailedStep(
       context,
       'audit-status',
-      `Codex finished without exactly one valid AGENTLOOP_AGENT_STATUS block.${detail}`,
+      `${identity} finished without exactly one valid AGENTLOOP_AGENT_STATUS block.${detail}`,
     );
   }
 
   const status = classified.status;
 
   if (status.task !== state.task) {
-    throw new LoopStopped(`Codex reported TASK ${status.task} but the active task is ${state.task}.`);
+    throw new LoopStopped(`${identity} reported TASK ${status.task} but the active task is ${state.task}.`);
   }
   if (status.status !== 'BLOCKED' && status.head !== head) {
     // The verdict is only meaningful for the commit that was actually audited.
-    throw new LoopStopped(`Codex was asked to audit ${head} but reported on ${status.head}.`);
+    throw new LoopStopped(`${identity} was asked to audit ${head} but reported on ${status.head}.`);
   }
 
   const round = state.round + 1;
@@ -615,7 +628,7 @@ async function runAuditStep({ context, options }) {
       verdict: 'BLOCKED',
       blockers: [status.reason ?? 'no reason given'],
     });
-    throw new LoopStopped(`Codex reported BLOCKED: ${status.reason ?? 'no reason given'}`);
+    throw new LoopStopped(`${identity} reported BLOCKED: ${status.reason ?? 'no reason given'}`);
   }
 
   const blockers =
@@ -628,13 +641,13 @@ async function runAuditStep({ context, options }) {
   );
 
   log.info(
-    `Codex ${status.status} on ${short(head)} (round ${round}, ` +
+    `${identity} ${status.status} on ${short(head)} (round ${round}, ` +
       `${status.blockers ?? 0} blocker(s)). Report: ${auditReportPath(state, round)}`,
   );
   return { continue: true };
 }
 
-/** Codex may audit only the exact checkpoint named by Claude's valid handoff. */
+/** The auditor may review only the exact checkpoint produced by a valid implementer handoff. */
 export function hasValidImplementationHandoff(state, head) {
   return typeof head === 'string' &&
     state?.implementationHandoffValid === true &&
@@ -642,12 +655,12 @@ export function hasValidImplementationHandoff(state, head) {
 }
 
 /**
- * A no-change Claude handoff — READY_FOR_AUDIT reported without a new commit —
- * is a valid checkpoint only when every part of the READY_FOR_AUDIT contract
- * holds for the commit that is already HEAD: verification passed, no
+ * A no-change implementer handoff — READY_FOR_AUDIT reported without a new
+ * commit — is a valid checkpoint only when every part of the READY_FOR_AUDIT
+ * contract holds for the commit that is already HEAD: verification passed, no
  * blockers, the reported HEAD is exactly the real one, and the tree is clean.
  * Without this, "no commit" would otherwise always be treated as a terminal
- * failure, even when Claude correctly found nothing left to change.
+ * failure, even when the implementer correctly found nothing left to change.
  */
 export function isValidNoChangeHandoff({ status, head, treeClean }) {
   return (
@@ -807,7 +820,7 @@ function writeAuditReport(state, round, text) {
 }
 
 /**
- * The findings Claude has to answer.
+ * The findings the implementer has to answer.
  *
  * Read from disk rather than kept in memory so a fix round survives the
  * controller being restarted between the audit and the fix.
@@ -958,7 +971,7 @@ function resolveNextTask({ loaded, options }) {
  * Show detailed dry-run information for `--dry-run --next`.
  *
  * Dry-run must not create branches, switch branches, write files, create
- * `.agent/`, modify runtime state, invoke Claude, or invoke Codex.
+ * `.agent/`, modify runtime state, or invoke any agent.
  */
 function logDryRunNext({ task, deps, tasksFilePath, branch, isResume }) {
   log.info(`  Task ID: ${task.id}`);
@@ -1054,15 +1067,15 @@ async function runLoop(options) {
   if (context.state.recoveryRequired) {
     if (!options.recover) {
       return {
-        stopReason: `${context.state.recoveryReason ?? 'Claude recovery is required.'} Pass --recover to start a new session.`,
+        stopReason: `${context.state.recoveryReason ?? 'Implementer recovery is required.'} Pass --recover to start a new session.`,
         state: context.state,
         checks: context.checks,
-        decision: { action: ACTIONS.STOP, reason: 'Explicit Claude recovery required.' },
+        decision: { action: ACTIONS.STOP, reason: 'Explicit implementer recovery required.' },
         stopped: true,
       };
     }
     if (!options.dryRun) context.state = beginRecovery(context.state);
-    log.warn('Explicit Claude recovery accepted. The prior Claude session remains discarded.');
+    log.warn('Explicit implementer recovery accepted. The prior implementer session remains discarded.');
   }
 
   let stopReason = 'Reached the per-run step limit.';
@@ -1102,7 +1115,7 @@ async function runLoop(options) {
       switch (decision.action) {
         case ACTIONS.IMPLEMENT:
         case ACTIONS.FIX:
-          outcome = await runClaudeStep({ decision, context, options });
+          outcome = await runImplementerStep({ decision, context, options });
           break;
         case ACTIONS.AUDIT:
           outcome = await runAuditStep({ context, options });
