@@ -871,17 +871,37 @@ export async function runSetup({
     // rotate it to a timestamped name first.  If rotation fails, fall
     // back to a unique timestamped path so the previous recovery file
     // is never silently overwritten.
+    //
+    // Timestamps use second precision — add a counter suffix when the
+    // base name already exists so rapid re-runs never collide.
     let snapshotPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update`);
     if (fs.existsSync(snapshotPath)) {
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      const stampedPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}`);
+      const baseStamped = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}`);
+
+      // Find a free stamped name for the rotation target.
+      let stampedPath = baseStamped;
+      if (fs.existsSync(stampedPath)) {
+        for (let i = 1; i < 100; i += 1) {
+          stampedPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}-${i}`);
+          if (!fs.existsSync(stampedPath)) break;
+        }
+      }
+
       try {
         fs.renameSync(snapshotPath, stampedPath);
         prompt.display(`  Rotated previous recovery file to ${path.basename(stampedPath)}`);
       } catch {
-        // Could not rotate — use a fresh unique path instead so the
-        // existing .pre-update is not overwritten.
-        snapshotPath = stampedPath;
+        // Could not rotate — find a unique fallback name for this
+        // run's snapshot instead so the existing .pre-update is
+        // never overwritten.
+        snapshotPath = baseStamped;
+        if (fs.existsSync(snapshotPath)) {
+          for (let i = 1; i < 100; i += 1) {
+            snapshotPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}-${i}`);
+            if (!fs.existsSync(snapshotPath)) break;
+          }
+        }
         prompt.display('  Warning: could not rotate the existing .pre-update recovery file.');
         prompt.display(`  Using ${path.basename(snapshotPath)} for this run instead.`);
         prompt.display('  The existing .pre-update was not modified.');
