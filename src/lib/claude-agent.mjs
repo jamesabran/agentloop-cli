@@ -30,11 +30,11 @@ import {
 } from './config.mjs';
 import {
   checkHardDeny,
-  derivePermissionRule,
-  isAllowedByConfig,
+  cleanRelayFiles,
+  createRelayWorkDir,
   pollForRequest,
   promptUser,
-  removeHookSettings,
+  removeRelayWorkDir,
   writeHookSettings,
   writeResponse,
 } from './permission-relay.mjs';
@@ -264,10 +264,7 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
   const session = sessionId ?? randomUUID();
   const args = buildClaudeArgs({ sessionId: session, resume });
 
-  // Only set up the permission relay when:
-  //  1. stdin is a TTY (interactive)
-  //  2. not disabled via env
-  //  3. using standard `claude` binary (not claude-ds or custom override)
+  // Permission relay: only for standard `claude` binary in interactive mode.
   const isStandardClaude =
     !process.env.AGENTLOOP_CLAUDE_BIN ||
     path.basename(process.env.AGENTLOOP_CLAUDE_BIN) === 'claude' ||
@@ -278,70 +275,59 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
     isStandardClaude &&
     !process.env.AGENTLOOP_DISABLE_PERMISSION_RELAY;
 
+  // Temp directory OUTSIDE the repo — Claude's Write tool is restricted to
+  // REPO_ROOT, so it cannot reach the hook artefacts or forge a response.
+  let relayWorkDir = null;
+
   if (relayEnabled) {
+    relayWorkDir = createRelayWorkDir();
     const allowedList = CLAUDE_ALLOWED_TOOLS.split(',').map((s) => s.trim()).filter(Boolean);
-    writeHookSettings(REPO_ROOT, {
+    const { settingsPath } = writeHookSettings(relayWorkDir, {
       denyPatterns: [...CLAUDE_HARD_DENY_PATTERNS],
       allowPatterns: allowedList,
     });
 
-    // Add the hook settings to Claude's invocation (supported by Claude Code).
-    args.push('--settings', '.agent/hook-settings.json');
-    onLog?.('[claude-agent] PreToolUse permission relay enabled');
+    args.push('--settings', settingsPath);
+    onLog?.('[claude-agent] permission relay enabled (workDir: ' + relayWorkDir + ')');
   } else if (!isStandardClaude) {
-    onLog?.('[claude-agent] permission relay skipped (non-standard binary via AGENTLOOP_CLAUDE_BIN)');
+    onLog?.('[claude-agent] permission relay skipped (non-standard binary)');
   }
 
   onLog?.('[claude-agent] starting session');
   onLog?.(`[claude-agent] session ${session}${resume ? ' (resume)' : ''}`);
 
-  // Spawn Claude.  The permission watcher runs concurrently.
+  // Permission watcher runs concurrently with the Claude process.
   let watcherStop = false;
-  const acceptedRules = new Map(); // rule-string → true for session-scoped reuse
 
   const watcher = relayEnabled
     ? (async () => {
+        const wd = relayWorkDir;
         while (!watcherStop) {
-          const request = await pollForRequest(REPO_ROOT, 500);
+          const request = await pollForRequest(wd, 500);
           if (!request) continue;
 
           const toolName = request.tool_name;
           const toolInput = request.tool_input ?? {};
           const nonce = typeof request.nonce === 'string' ? request.nonce : null;
+          const toolUseId = typeof request.tool_use_id === 'string' ? request.tool_use_id : 'unknown';
 
           // Belt-and-braces hard-deny re-check.
           const hardCheck = checkHardDeny(toolName, toolInput, CLAUDE_HARD_DENY_PATTERNS);
           if (hardCheck.denied) {
-            writeResponse(REPO_ROOT, {
+            writeResponse(wd, toolUseId, {
               approved: false,
               nonce,
-              reason: `Blocked by ALCLI hard-deny rule: ${hardCheck.matchedPattern}`,
+              reason: 'Blocked by ALCLI hard-deny rule: ' + hardCheck.matchedPattern,
             });
-            onLog?.(`[claude-agent] hard-denied: ${hardCheck.matchedPattern}`);
+            onLog?.('[claude-agent] hard-denied: ' + hardCheck.matchedPattern);
             continue;
           }
-
-          // Check accepted reusable rules (session-scoped memory).
-          const entry = derivePermissionRule(toolName, toolInput);
-          if (entry && acceptedRules.has(entry)) {
-            writeResponse(REPO_ROOT, { approved: true, nonce, reason: 'Previously accepted rule.' });
-            onLog?.('[claude-agent] auto-approved via session-scoped reusable rule');
-            continue;
-          }
-
-          // Derive a permission rule for the "allow similar" option.
-          const permRule = derivePermissionRule(toolName, toolInput);
 
           // Prompt the user.
-          const choice = await promptUser({
-            toolName,
-            toolInput,
-            hasReusableRule: permRule !== null,
-            permissionRule: permRule,
-          });
+          const choice = await promptUser({ toolName, toolInput });
 
           if (choice === null) {
-            writeResponse(REPO_ROOT, {
+            writeResponse(wd, toolUseId, {
               approved: false,
               nonce,
               reason: 'Permission denied (non-interactive).',
@@ -350,18 +336,12 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
           }
 
           if (choice.kind === 'deny') {
-            writeResponse(REPO_ROOT, { approved: false, nonce, reason: 'Permission denied by user.' });
+            writeResponse(wd, toolUseId, { approved: false, nonce, reason: 'Permission denied by user.' });
             onLog?.('[claude-agent] permission denied by user');
             continue;
           }
 
-          // Allow once (or allow-similar with session-scoped memory).
-          if (choice.kind === 'allow-similar' && choice.permissionRule) {
-            acceptedRules.set(choice.permissionRule, true);
-            onLog?.(`[claude-agent] accepted reusable rule: ${choice.permissionRule}`);
-          }
-
-          writeResponse(REPO_ROOT, { approved: true, nonce });
+          writeResponse(wd, toolUseId, { approved: true, nonce });
           onLog?.('[claude-agent] permission approved');
         }
       })()
@@ -377,12 +357,11 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
       onStdout,
     });
   } finally {
-    // Stop the watcher and clean up hook artefacts.
+    // Stop the watcher and clean up the temp relay directory.
     watcherStop = true;
     if (relayEnabled) {
-      // Give the watcher one tick to notice `watcherStop`.
       await watcher;
-      removeHookSettings(REPO_ROOT);
+      removeRelayWorkDir(relayWorkDir);
     }
   }
 
