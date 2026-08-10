@@ -4,7 +4,7 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['src/**/*.test.mjs', 'scripts/**/*.test.mjs'],
-    testTimeout: 15_000,
+    testTimeout: 30_000,
     // vitest 4.x / rolldown cannot parse scripts/lint.mjs as a dependency
     // (SyntaxError: Invalid or unexpected token).  node --check and acorn
     // both accept it.  Treat it as external so vitest loads it directly

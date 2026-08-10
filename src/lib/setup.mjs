@@ -806,8 +806,20 @@ export async function runSetup({
 } = {}) {
   const prompt = injectedPrompt || new TerminalPrompt();
   const configPath = path.join(projectRoot, CONFIG_FILE_NAME);
-  // Temporary name used to hold the old config aside during validation.
-  const swapPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.validating`);
+  const tmpPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.tmp`);
+  const preUpdateBackupPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update`);
+
+  // Clean up debris from a previous interrupted run: leftover temp file
+  // or a pre-update backup that was never finalised.
+  try { fs.unlinkSync(tmpPath); } catch { /* didn't exist */ }
+  if (fs.existsSync(preUpdateBackupPath)) {
+    // A pre-update backup means the previous run was interrupted between
+    // writing the candidate and finalising.  The canonical file at this
+    // point is either the candidate (if the atomic rename completed) or
+    // the old config (if it did not).  Either way, the canonical file is
+    // the most recent complete state — discard the stale backup.
+    try { fs.unlinkSync(preUpdateBackupPath); } catch { /* best-effort */ }
+  }
 
   try {
     // Load existing config (for display defaults only — the actual
@@ -855,56 +867,92 @@ export async function runSetup({
       return { saved: false, config, reason: 'User chose not to save.' };
     }
 
-    // --- Validate by writing to the canonical path itself ---
+    // --- Crash-safe validate-then-commit ---
     //
-    // The config module always reads the file named `agentloop.config.json`
-    // at REPO_ROOT, so validation through it *must* exercise the real path.
-    // We temporarily move any existing file aside, write the candidate,
-    // validate, and then either restore the old file (on failure) or
-    // finalise the new one (on success).
+    // 1. Copy the old canonical file aside (copy, not move — the original
+    //    stays in place during the risky write).
+    // 2. Write the candidate to a temp file and atomically rename it over
+    //    the canonical path.
+    // 3. Validate the canonical file through the real config module.
+    // 4. On failure: copy the pre-update backup back to canonical (restore).
+    // 5. On success: promote the pre-update backup → .bak.
 
-    // Phase 1: move old file aside so we can write the candidate to the
-    // canonical path that config.mjs will actually read.
-    const hadOldFile = fs.existsSync(configPath);
-    if (hadOldFile) {
-      fs.renameSync(configPath, swapPath);
+    // Phase 1: snapshot the existing config (copy, not move).
+    let hadOldFile = false;
+    if (oldFileExists) {
+      try {
+        fs.copyFileSync(configPath, preUpdateBackupPath);
+        hadOldFile = true;
+      } catch {
+        // Copy failed — the original is still intact at the canonical
+        // path.  Proceed without a backup; if validation fails the
+        // original was never touched so nothing needs restoring.
+        prompt.display('  Warning: could not snapshot the existing config — proceeding without a backup.');
+      }
     }
 
-    let validationPassed = false;
+    // Phase 2: atomically write the candidate.
+    // Write to a temp file first, then rename (rename is atomic).
+    // If the process crashes before the rename, the temp file is cleaned
+    // up on the next invocation — canonical is untouched.
+    saveConfig(config, projectRoot, tmpPath);
     try {
-      saveConfig(config, projectRoot);
-
-      const validation = validateConfig(projectRoot);
-      if (!validation.ok) {
-        // Restore the old config — the candidate is invalid.
-        try { fs.unlinkSync(configPath); } catch { /* best-effort */ }
-        if (hadOldFile) {
-          fs.renameSync(swapPath, configPath);
-        }
-        prompt.display('');
-        prompt.display('  ✖  Configuration validation failed — nothing was saved.');
-        prompt.display('  Errors:');
-        for (const err of validation.errors || []) {
-          prompt.display(`    ${err}`);
-        }
-        return {
-          saved: false,
-          config,
-          reason: 'Configuration validation failed — see errors above.',
-        };
+      fs.renameSync(tmpPath, configPath);
+    } catch {
+      // Rename failed — the temp file still exists for recovery, and
+      // the canonical file (if any) is untouched.
+      try { fs.unlinkSync(tmpPath); } catch { /* best-effort */ }
+      prompt.display('');
+      prompt.display('  ✖  Could not write the configuration file.');
+      // Clean up the pre-update backup — the old config is still at
+      // the canonical path, untouched.
+      if (hadOldFile) {
+        try { fs.unlinkSync(preUpdateBackupPath); } catch { /* best-effort */ }
       }
-
-      validationPassed = true;
-    } finally {
-      // If we wrote the candidate but validation failed before the restore
-      // handler above ran (or threw), make sure the old file is restored.
-      if (!validationPassed && hadOldFile && !fs.existsSync(configPath)) {
-        try { fs.renameSync(swapPath, configPath); } catch { /* best-effort */ }
-      }
+      return { saved: false, config, reason: 'File write failed — nothing was changed.' };
     }
 
-    // Phase 2: validation passed — the candidate at configPath is good.
-    // Turn the old file (at swapPath) into a .bak backup.
+    // Phase 3: validate the newly written canonical file.
+    const validation = validateConfig(projectRoot);
+    if (!validation.ok) {
+      // Validation failed — restore the old config from the pre-update
+      // backup (if we have one), or remove the invalid candidate.
+      if (hadOldFile) {
+        try {
+          fs.copyFileSync(preUpdateBackupPath, configPath);
+          try { fs.unlinkSync(preUpdateBackupPath); } catch { /* best-effort */ }
+        } catch {
+          // Restore failed — the pre-update backup is still on disk so
+          // the user can recover manually.
+          prompt.display('');
+          prompt.display('  ✖  Validation failed and the previous config could not be restored.');
+          prompt.display(`  The previous config is at ${CONFIG_FILE_NAME}.pre-update`);
+          prompt.display('  Rename it back to agentloop.config.json to recover.');
+          return {
+            saved: false,
+            config,
+            reason: 'Validation failed and restore also failed — manual recovery required.',
+          };
+        }
+      } else {
+        // No old file — just remove the invalid candidate.
+        try { fs.unlinkSync(configPath); } catch { /* best-effort */ }
+      }
+
+      prompt.display('');
+      prompt.display('  ✖  Configuration validation failed — nothing was saved.');
+      prompt.display('  Errors:');
+      for (const err of validation.errors || []) {
+        prompt.display(`    ${err}`);
+      }
+      return {
+        saved: false,
+        config,
+        reason: 'Configuration validation failed — see errors above.',
+      };
+    }
+
+    // Phase 4: validation passed.  Promote the pre-update backup → .bak.
     if (hadOldFile) {
       const bakPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.bak`);
 
@@ -917,18 +965,29 @@ export async function runSetup({
           fs.renameSync(bakPath, stampedPath);
           prompt.display(`  Moved previous backup to ${path.basename(stampedPath)}`);
         } catch {
-          // Could not move the old .bak — fall back to overwriting it.
+          // Rotation failed — do NOT overwrite.  Keep the pre-update
+          // backup on disk and warn the user rather than risk losing
+          // either the old .bak or the old config.
+          prompt.display('  Warning: could not rotate the existing .bak file.');
+          prompt.display(`  The previous config is preserved at ${CONFIG_FILE_NAME}.pre-update`);
+          prompt.display('  You can remove it once you have a safe copy of the .bak file.');
+          // pre-update-backup stays on disk so nothing is lost.
+          return { saved: true, config, reason: 'Configuration saved but backup rotation failed — see warning above.' };
         }
       }
 
+      // Move the pre-update backup (the old config) to .bak.
       try {
-        fs.renameSync(swapPath, bakPath);
+        fs.renameSync(preUpdateBackupPath, bakPath);
         prompt.display(`  Backed up previous config to ${CONFIG_FILE_NAME}.bak`);
       } catch {
-        // Backup failed — discard the old file (the new config is already
-        // validated and written to the canonical path).
-        try { fs.unlinkSync(swapPath); } catch { /* best-effort */ }
+        // Backup rename failed — the pre-update backup stays on disk.
+        // The new config is already validated and in place, so this is
+        // non-fatal, but we must not silently discard the old config.
         prompt.display('  Warning: could not back up the previous config.');
+        prompt.display(`  The previous config is preserved at ${CONFIG_FILE_NAME}.pre-update`);
+        prompt.display('  Rename it to agentloop.config.json.bak to keep it as a backup,');
+        prompt.display('  or delete it once you are satisfied with the new configuration.');
       }
     }
 
