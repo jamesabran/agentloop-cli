@@ -233,14 +233,13 @@ export function recordImplementation(state, head) {
     // A new commit also invalidates any previous manual-readiness — the new
     // commit has not been audited or approved.
     readyToPublishHead: null,
-    // A new commit also invalidates any previous runtime-verification result:
-    // the runtime checks must be re-run against the code that is now at HEAD.
+    // A new commit invalidates the previous auditor-gate runtime-verification
+    // result: the auditor must re-verify against the code that is now at HEAD.
+    // The implementer-gate result is NOT cleared here — it was already recorded
+    // against the new commit and must persist so the publish gate can read it.
     runtimeVerificationStatus: null,
     runtimeVerificationHead: null,
     runtimeVerificationOutput: null,
-    implementerRuntimeVerificationStatus: null,
-    implementerRuntimeVerificationHead: null,
-    implementerRuntimeVerificationOutput: null,
   };
 }
 

@@ -268,6 +268,71 @@ describe('resolveRuntimeVerification', () => {
     expect(resolved.profile).toBe('custom');
     expect(resolved.checks).toHaveLength(0);
   });
+
+  // Profile strictness ordering: lightweight < standard < integration < custom
+  it('rejects standard task profile against integration project baseline', () => {
+    const projectIntegration = { profile: 'integration', checks: [] };
+    expect(() =>
+      resolveRuntimeVerification({
+        project: projectIntegration,
+        task: { profile: 'standard', checks: [] },
+      }),
+    ).toThrow(/cannot weaken/);
+  });
+
+  it('rejects standard task profile against custom project baseline', () => {
+    const projectCustom = { profile: 'custom', checks: [] };
+    expect(() =>
+      resolveRuntimeVerification({
+        project: projectCustom,
+        task: { profile: 'standard', checks: [] },
+      }),
+    ).toThrow(/cannot weaken/);
+  });
+
+  it('rejects integration task profile against custom project baseline', () => {
+    const projectCustom = { profile: 'custom', checks: [] };
+    expect(() =>
+      resolveRuntimeVerification({
+        project: projectCustom,
+        task: { profile: 'integration', checks: [] },
+      }),
+    ).toThrow(/cannot weaken/);
+  });
+
+  it('allows same-level profile (integration against integration)', () => {
+    const projectIntegration = { profile: 'integration', checks: [{ name: 'api', command: 'npm run test:api' }] };
+    const resolved = resolveRuntimeVerification({
+      project: projectIntegration,
+      task: { profile: 'integration', checks: [] },
+    });
+    expect(resolved.profile).toBe('integration');
+  });
+
+  it('allows escalation from standard to integration', () => {
+    const resolved = resolveRuntimeVerification({
+      project: projectStandard,
+      task: taskIntegration,
+    });
+    expect(resolved.profile).toBe('integration');
+  });
+
+  it('allows escalation from standard to custom', () => {
+    const resolved = resolveRuntimeVerification({
+      project: projectStandard,
+      task: { profile: 'custom', checks: [] },
+    });
+    expect(resolved.profile).toBe('custom');
+  });
+
+  it('allows escalation from integration to custom', () => {
+    const projectIntegration = { profile: 'integration', checks: [] };
+    const resolved = resolveRuntimeVerification({
+      project: projectIntegration,
+      task: { profile: 'custom', checks: [] },
+    });
+    expect(resolved.profile).toBe('custom');
+  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -428,7 +493,7 @@ describe('state — runtime verification', () => {
     expect(s.implementerRuntimeVerificationOutput).toBe('implementer gate failed');
   });
 
-  it('recordImplementation invalidates both runtime verification gates', () => {
+  it('recordImplementation invalidates auditor gate but preserves implementer gate', () => {
     let before = recordRuntimeVerification(task(), {
       head: A,
       status: 'PASS',
@@ -437,17 +502,35 @@ describe('state — runtime verification', () => {
     before = recordImplementerRuntimeVerification(before, {
       head: A,
       status: 'PASS',
+      output: 'implementer gate ok',
     });
     expect(before.runtimeVerificationStatus).toBe('PASS');
     expect(before.implementerRuntimeVerificationStatus).toBe('PASS');
 
     const after = recordImplementation(before, B);
+    // Auditor gate is invalidated — must be re-run against new HEAD.
     expect(after.runtimeVerificationStatus).toBeNull();
     expect(after.runtimeVerificationHead).toBeNull();
     expect(after.runtimeVerificationOutput).toBeNull();
-    expect(after.implementerRuntimeVerificationStatus).toBeNull();
-    expect(after.implementerRuntimeVerificationHead).toBeNull();
-    expect(after.implementerRuntimeVerificationOutput).toBeNull();
+    // Implementer gate PERSISTS — it was recorded against the new commit.
+    expect(after.implementerRuntimeVerificationStatus).toBe('PASS');
+    expect(after.implementerRuntimeVerificationHead).toBe(A);
+    expect(after.implementerRuntimeVerificationOutput).toBeTruthy();
+  });
+
+  it('controller ordering: implementer gate survives recordImplementation for same commit', () => {
+    // This simulates the actual controller flow:
+    // 1. Implementer produces commit A
+    // 2. Implementer-gate RV runs against A → recordImplementerRv(A, PASS)
+    // 3. recordImplementation(A) — must not clear the implementer gate
+    let state = task();
+    state = recordImplementerRuntimeVerification(state, { head: A, status: 'PASS' });
+    state = recordImplementation(state, A);
+    // Implementer gate persists — it was recorded against the new commit.
+    expect(state.implementerRuntimeVerificationStatus).toBe('PASS');
+    expect(state.implementerRuntimeVerificationHead).toBe(A);
+    // Auditor gate is cleared — must be re-run independently.
+    expect(state.runtimeVerificationStatus).toBeNull();
   });
 
   it('runtime verification survives state save/load round-trip', () => {

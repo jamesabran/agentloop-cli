@@ -182,6 +182,19 @@ export function normaliseTaskRuntimeVerification(value, taskId) {
 }
 
 /**
+ * Profile strictness ordering: a task may only select a profile at the same
+ * or higher strictness level as the project baseline.
+ *
+ *   lightweight (0) < standard (1) < integration (2) < custom (3)
+ */
+const PROFILE_ORDER = Object.freeze({
+  lightweight: 0,
+  standard: 1,
+  integration: 2,
+  custom: 3,
+});
+
+/**
  * The project baseline profile, when set, establishes a floor that tasks may
  * only escalate — never weaken.  "disabled" and "lightweight" are not
  * permitted as task profiles when the project baseline requires runtime
@@ -244,8 +257,29 @@ export function resolveRuntimeVerification({ project, task }) {
     // Task inherits or is absent → project as-is.
     if (!task || task.profile === INHERIT) return { ...project };
 
-    // Task sets an explicit profile → use it. Task checks APPEND to
-    // project checks — the baseline is a floor.
+    // Task sets an explicit profile → must be same or higher strictness.
+    const taskOrder = PROFILE_ORDER[task.profile];
+    const projectOrder = PROFILE_ORDER[project.profile];
+    if (taskOrder === undefined) {
+      throw new Error(
+        `Task runtimeVerification.profile ${JSON.stringify(task.profile)} is not a valid profile. ` +
+          `Valid profiles: ${Object.keys(PROFILE_ORDER).join(', ')}.`,
+      );
+    }
+    if (taskOrder < projectOrder) {
+      throw new Error(
+        `Task runtimeVerification.profile ${JSON.stringify(task.profile)} (level ${taskOrder}) ` +
+          `cannot weaken the project baseline ${JSON.stringify(project.profile)} (level ${projectOrder}). ` +
+          'Tasks may only maintain or escalate the project baseline. ' +
+          `Valid profiles at or above the baseline: ` +
+          Object.entries(PROFILE_ORDER)
+            .filter(([, o]) => o >= projectOrder)
+            .map(([p]) => p)
+            .join(', ') + '.',
+      );
+    }
+
+    // Task checks APPEND to project checks — the baseline is a floor.
     const checks = [...project.checks, ...task.checks];
     return Object.freeze({ profile: task.profile, checks: Object.freeze(checks) });
   }
