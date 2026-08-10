@@ -319,6 +319,48 @@ describe('ROLE_MAPPING from agentloop.config.json', () => {
     const mapping = JSON.parse(result.stdout);
     expect(mapping.auditor).toBe('codex');
   });
+
+  it('rejects an unknown role key — typo "audtor" is not silently ignored', () => {
+    const dir = makeProject({
+      config: { roles: { audtor: 'claude' } },
+    });
+    const result = importConfigField('ROLE_MAPPING', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/unknown role key/);
+    expect(result.stderr).toMatch(/"audtor"/);
+  });
+
+  it('rejects an unknown role key even when mixed with valid keys', () => {
+    const dir = makeProject({
+      config: { roles: { implementer: 'claude', audtor: 'codex' } },
+    });
+    const result = importConfigField('ROLE_MAPPING', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/unknown role key/);
+  });
+
+  it('rejects multiple unknown role keys at once', () => {
+    const dir = makeProject({
+      config: { roles: { implementor: 'claude', auditer: 'codex' } },
+    });
+    const result = importConfigField('ROLE_MAPPING', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/unknown role key/);
+  });
+
+  it('rejects a null value for a valid role key — empty string is fine, null is not', () => {
+    // null is not a string, so it won't be trimmed — but the key is valid
+    // and the null value is silently ignored by the typeof check.  This is
+    // acceptable: the role keeps its default.  What we must NOT do is crash
+    // on a null value inside a valid key.
+    const dir = makeProject({
+      config: { roles: { implementer: null } },
+    });
+    const result = importConfigField('ROLE_MAPPING', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    const mapping = JSON.parse(result.stdout);
+    expect(mapping.implementer).toBe('claude');
+  });
 });
 
 /* ------------------------------------------------------------------ *

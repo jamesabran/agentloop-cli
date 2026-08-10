@@ -300,6 +300,18 @@ function resolveRoleMapping(configValue) {
   const defaults = defaultRoleMapping();
   if (!configValue || typeof configValue !== 'object') return defaults;
 
+  // Reject unknown role keys — a typo such as "audtor" must not silently
+  // fall back to the default while the user believes it was accepted.
+  const known = new Set(LOGICAL_ROLES);
+  for (const key of Object.keys(configValue)) {
+    if (!known.has(key)) {
+      throw new Error(
+        `${CONFIG_FILE}: unknown role key ${JSON.stringify(key)} in "roles". ` +
+          `Valid roles are: ${LOGICAL_ROLES.join(', ')}.`,
+      );
+    }
+  }
+
   const merged = { ...defaults };
   for (const role of LOGICAL_ROLES) {
     if (typeof configValue[role] === 'string' && configValue[role].trim() !== '') {
