@@ -205,6 +205,130 @@ export function run(command, args = [], options = {}) {
 }
 
 /**
+ * Run a command interactively with bidirectional stdin/stdout.
+ *
+ * Like `run()`, but stdin stays open after the initial input so the caller
+ * can send additional data mid-flight (permission responses, for instance).
+ * Stdout is parsed as newline-delimited JSON and delivered to `onEvent`.
+ *
+ * The returned handle provides `writeStdin()`, `closeStdin()`, and a
+ * `completion` promise that resolves when the process exits.
+ *
+ * @param {string} command
+ * @param {string[]} args
+ * @param {{
+ *   cwd?: string, timeoutMs?: number, input?: string,
+ *   env?: Record<string,string>,
+ *   onEvent?: (event: object, line: string) => void,
+ * }} options
+ * @returns {{
+ *   writeStdin: (data: string) => void,
+ *   closeStdin: () => void,
+ *   completion: Promise<{ code: number|null, signal: string|null, stdout: string, stderr: string, timedOut: boolean, command: string }>,
+ *   child: import('child_process').ChildProcess,
+ * }}
+ */
+export function runInteractive(command, args = [], options = {}) {
+  const { cwd, timeoutMs = 0, input, env, onEvent } = options;
+
+  args.forEach(assertSafeArg);
+
+  const isWindowsShim = process.platform === 'win32' && /\.(cmd|bat)$/i.test(command);
+  let file = command;
+  let spawnArgs = args;
+  const spawnOptions = {
+    cwd,
+    env: { ...process.env, ...env },
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  };
+
+  if (isWindowsShim) {
+    const line = [command, ...args].map(quoteForCmd).join(' ');
+    file = process.env.ComSpec || 'cmd.exe';
+    spawnArgs = ['/d', '/s', '/c', `"${line}"`];
+    spawnOptions.windowsVerbatimArguments = true;
+  }
+
+  let child;
+  try {
+    child = spawn(file, spawnArgs, spawnOptions);
+  } catch (error) {
+    throw new CommandError(`Failed to start ${command}: ${error.message}`, { command });
+  }
+
+  let stdout = '';
+  let stderr = '';
+  let timedOut = false;
+  let timer = null;
+  let stdinClosed = false;
+
+  if (timeoutMs > 0) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      terminateProcessTree(child);
+    }, timeoutMs);
+  }
+
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+
+  let lineBuffer = '';
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk;
+    lineBuffer += String(chunk ?? '');
+    const lines = lineBuffer.split(/\r?\n/);
+    lineBuffer = lines.pop() ?? '';
+    for (const line of lines) {
+      if (line.trim() === '') continue;
+      try {
+        const event = JSON.parse(line);
+        onEvent?.(event, line);
+      } catch {
+        // Non-JSON lines are ignored in stream-json mode — untrusted output.
+      }
+    }
+  });
+
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+
+  const completion = new Promise((resolve, reject) => {
+    child.on('error', (error) => {
+      if (timer) clearTimeout(timer);
+      reject(new CommandError(`Failed to run ${command}: ${error.message}`, { command }));
+    });
+
+    child.on('close', (code, signal) => {
+      if (timer) clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr, timedOut, command });
+    });
+  });
+
+  if (input !== undefined) {
+    child.stdin.write(input, 'utf8');
+    // Do NOT end — the caller may write more.
+  }
+
+  return {
+    writeStdin(data) {
+      if (!stdinClosed && child.stdin.writable) {
+        child.stdin.write(data, 'utf8');
+      }
+    },
+    closeStdin() {
+      if (!stdinClosed) {
+        stdinClosed = true;
+        if (child.stdin.writable) child.stdin.end();
+      }
+    },
+    completion,
+    child,
+  };
+}
+
+/**
  * Run a command and throw unless it exits 0.
  * @returns {Promise<string>} trimmed stdout
  */

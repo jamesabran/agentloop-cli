@@ -369,6 +369,37 @@ export const CLAUDE_DISALLOWED_TOOLS = [
   'WebFetch',
 ].join(',');
 
+/**
+ * Hard-deny patterns for the interactive permission relay.
+ *
+ * These are the same patterns that make up `CLAUDE_DISALLOWED_TOOLS`, as a
+ * plain array so the relay can check each requested tool against them inline
+ * without joining, splitting, or re-parsing.  A match here is an automatic
+ * denial — the user is never offered an approval choice.
+ *
+ * Additional patterns beyond `CLAUDE_DISALLOWED_TOOLS` that must never be
+ * grantable through the relay:
+ *  - Any attempt to change the permission mode itself.
+ *  - `Bash(chmod *)` / `Bash(chown *)` — filesystem permission mutations.
+ *  - `BypassPermissions` — the tool that would skip subsequent permission checks.
+ */
+export const CLAUDE_HARD_DENY_PATTERNS = Object.freeze([
+  'Bash(git push*)',
+  'Bash(git push:*)',
+  'Bash(gh *)',
+  'Bash(gh:*)',
+  'Bash(node *)',
+  'Bash(node:*)',
+  'Bash(npm *)',
+  'Bash(npm:*)',
+  'Bash(npx *)',
+  'Bash(npx:*)',
+  'WebFetch',
+  'Bash(chmod *)',
+  'Bash(chown *)',
+  'BypassPermissions',
+]);
+
 /** Every entry in an allowedTools value, exactly as written, trimmed. */
 function splitToolList(value) {
   return value.split(',').map((entry) => entry.trim()).filter(Boolean);

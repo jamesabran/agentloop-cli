@@ -467,6 +467,7 @@ agentloop-cli/
       git-url.mjs            GitHub remote URL parsing
       github.mjs             gh: read an issue brief, confirm access before pushing
       claude-agent.mjs       non-interactive Claude runs and stream-json progress
+      permission-relay.mjs   interactive permission request relay
       codex-agent.mjs        read-only Codex audits
       prompts.mjs            what each agent is told
       tasks.mjs              committed task-file loading, validation, and selection
@@ -553,6 +554,19 @@ the commit, looping forever on a finding — not an agent trying to escape.
   In interactive terminal runs, a timeout prompts whether to continue the same
   task with a fresh timeout window before reaching the terminal failure path;
   CI and non-interactive runs stop immediately without prompting.
+- **Interactive permission relay.** When Claude requests a tool not covered by
+  the fixed allowlist (e.g. a new Bash command), the controller relays the
+  request to the same terminal: `[1] Yes — allow once`, `[2] Yes — accept
+  reusable permission rule`, or `[3] No — deny`. Option 2 is only shown when
+  Claude supplies a concrete reusable scope; the relay never invents or
+  broadens one. The Claude session is paused, not terminated, and resumes
+  immediately after the decision. Hard-deny rules (the existing
+  `--disallowedTools` patterns plus `Bash(chmod *)`, `Bash(chown *)`, and
+  `BypassPermissions`) are checked before any prompt — a denied request is
+  never offered for approval. In non-interactive environments, permission
+  requests are denied automatically; the relay never auto-approves. The
+  existing timeout continuation prompt continues to work alongside the
+  permission relay.
 - **Deterministic checks run before Codex, and only in the controller.** The
   controller runs the configured checks itself, through `checks.mjs`, against
   Claude's committed HEAD — independently of anything Claude reports. A

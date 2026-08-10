@@ -1,5 +1,6 @@
 /**
- * Non-interactive Claude runs.
+ * Claude agent runs — both non-interactive (print mode) and interactive
+ * (stream-json protocol with permission relay).
  *
  * Flags used here were checked against the installed `claude --help`
  * (2.1.221): `-p/--print`, `--output-format stream-json`, `--verbose`,
@@ -10,6 +11,10 @@
  * Claude's progress stream is shown to the controller console as it arrives.
  * A process failure or usage limit is reported to the controller, which
  * records a terminal local report and requires explicit recovery.
+ *
+ * The interactive runner uses the stream-json protocol without `--print`,
+ * keeping stdin open so permission requests can be relayed to the user and
+ * their decisions written back to Claude without restarting the session.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -17,11 +22,13 @@ import { randomUUID } from 'node:crypto';
 import {
   CLAUDE_ALLOWED_TOOLS,
   CLAUDE_DISALLOWED_TOOLS,
+  CLAUDE_HARD_DENY_PATTERNS,
   CLAUDE_PERMISSION_MODE,
   LIMITS,
   REPO_ROOT,
 } from './config.mjs';
-import { npmGlobalDirs, resolveExecutable, run } from './process.mjs';
+import { detectPermissionRequest, handlePermissionRequest } from './permission-relay.mjs';
+import { npmGlobalDirs, resolveExecutable, run, runInteractive } from './process.mjs';
 
 let claudePath = null;
 
@@ -304,4 +311,192 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
   }
 
   return classified;
+}
+
+/**
+ * Build the argument list for an interactive Claude run (stream-json protocol
+ * without `--print`).
+ *
+ * Same shape as `buildClaudeArgs`, but omits `--print` so Claude stays in
+ * continuous-session mode.  The prompt is sent as a JSON user message on stdin.
+ *
+ * @param {{ sessionId: string|null, resume: boolean }} options
+ * @returns {string[]}
+ */
+export function buildClaudeInteractiveArgs({ sessionId, resume }) {
+  const args = [
+    '--output-format',
+    'stream-json',
+    '--verbose',
+    '--permission-mode',
+    CLAUDE_PERMISSION_MODE,
+    '--add-dir',
+    REPO_ROOT,
+  ];
+
+  if (resume && sessionId) {
+    args.push('--resume', sessionId);
+  } else if (sessionId) {
+    args.push('--session-id', sessionId);
+  }
+
+  if (process.env.AGENTLOOP_CLAUDE_MODEL) {
+    args.push('--model', process.env.AGENTLOOP_CLAUDE_MODEL);
+  }
+
+  args.push('--allowedTools', CLAUDE_ALLOWED_TOOLS);
+  args.push('--disallowedTools', CLAUDE_DISALLOWED_TOOLS);
+
+  return args;
+}
+
+/**
+ * Format a prompt as a stream-json user message.
+ *
+ * @param {string} promptText
+ * @returns {string} a JSON line
+ */
+function formatUserMessage(promptText) {
+  return JSON.stringify({
+    type: 'user',
+    message: {
+      role: 'user',
+      content: promptText,
+    },
+  }) + '\n';
+}
+
+/**
+ * Run one Claude turn interactively, relaying permission requests to the
+ * caller's terminal.
+ *
+ * Uses the stream-json protocol without `--print`: the prompt is sent as a
+ * JSON user message, and the controller keeps stdin open so it can write
+ * permission decisions back mid-session.
+ *
+ * The `onProgress` callback receives human-readable progress lines exactly as
+ * `streamClaudeProgress` would produce them.
+ *
+ * @param {{
+ *   prompt: string,
+ *   sessionId?: string|null,
+ *   resume?: boolean,
+ *   onProgress?: (text: string) => void,
+ *   onLog?: (line: string) => void,
+ * }} options
+ * @returns {Promise<{
+ *   ok: boolean, usageLimited: boolean, resumeAtMs: number|null,
+ *   sessionId: string|null, text: string, raw: string, error: string|null,
+ *   timedOut?: boolean,
+ * }>}
+ */
+export async function runClaudeInteractive({ prompt, sessionId = null, resume = false, onProgress, onLog }) {
+  const session = sessionId ?? randomUUID();
+  const args = buildClaudeInteractiveArgs({ sessionId: session, resume });
+  const executable = claudeExecutable();
+
+  onLog?.('[claude-agent] starting interactive session');
+  onLog?.(`[claude-agent] session ${session}${resume ? ' (resume)' : ''}`);
+
+  let resultText = '';
+  let resultRaw = '';
+  let permissionDenied = false;
+
+  const handle = runInteractive(executable, args, {
+    cwd: REPO_ROOT,
+    input: formatUserMessage(prompt),
+    timeoutMs: LIMITS.claudeTimeoutMs,
+    onEvent(event) {
+      // Relay recognised progress events to the controller console.
+      const progress = formatClaudeProgress(event);
+      if (progress) onProgress?.(progress);
+
+      // Capture the final result.
+      if (event.type === 'result') {
+        resultRaw = JSON.stringify(event);
+        if (typeof event.result === 'string') resultText = event.result;
+        // Close stdin to signal we're done — no more user input.
+        handle.closeStdin();
+        return;
+      }
+
+      // Detect permission requests and relay them.
+      const permReq = detectPermissionRequest(event);
+      if (permReq) {
+        onLog?.(`[claude-agent] permission requested: ${permReq.toolName ?? '(unknown)'}`);
+        // The handler will be called synchronously within this event handler.
+        // We use a synchronous pattern: queue the permission response.
+        handlePermissionRequest(permReq, CLAUDE_HARD_DENY_PATTERNS).then((result) => {
+          if (result.response) {
+            handle.writeStdin(result.response);
+          }
+          if (result.hardDenied) {
+            onLog?.(`[claude-agent] permission hard-denied (${permReq.toolName})`);
+          } else if (result.autoDenied) {
+            onLog?.(`[claude-agent] permission auto-denied (non-interactive): ${permReq.toolName}`);
+            permissionDenied = true;
+          } else {
+            onLog?.('[claude-agent] permission response sent');
+          }
+        });
+        return;
+      }
+    },
+  });
+
+  // Wait for the process to complete (or timeout).
+  const outcome = await handle.completion;
+
+  // If the process exited before we closed stdin, make sure it's closed.
+  try { handle.closeStdin(); } catch { /* already closed */ }
+
+  const text = resultText || outcome.stdout;
+  const parsedResult = resultRaw ? JSON.parse(resultRaw) : parseClaudeResult(outcome.stdout);
+
+  const sessionFromResult = parsedResult?.session_id ?? session;
+
+  // Check for usage limits in the combined output.
+  const parsedResultText = typeof parsedResult?.result === 'string' ? parsedResult.result : '';
+  const usage = detectUsageLimit([outcome.stderr, parsedResultText].join('\n'));
+  if (usage.limited) {
+    return {
+      ok: false,
+      usageLimited: true,
+      resumeAtMs: usage.resumeAtMs,
+      sessionId: sessionFromResult,
+      text,
+      raw: outcome.stdout,
+      error: `Temporary usage limit: ${usage.evidence}`,
+    };
+  }
+
+  if (outcome.timedOut) {
+    return {
+      ok: false,
+      usageLimited: false,
+      resumeAtMs: null,
+      sessionId: sessionFromResult,
+      text,
+      raw: outcome.stdout,
+      error: `Claude timed out after ${LIMITS.claudeTimeoutMs}ms.`,
+      timedOut: true,
+    };
+  }
+
+  const failed = outcome.code !== 0 || parsedResult?.is_error === true;
+  const diagnostic = firstNonEmpty(
+    parsedResult?.result,
+    outcome.stderr,
+    text,
+  ) ?? `claude exited ${outcome.code}`;
+
+  return {
+    ok: !failed,
+    usageLimited: false,
+    resumeAtMs: null,
+    sessionId: sessionFromResult,
+    text,
+    raw: outcome.stdout,
+    error: failed ? diagnostic.slice(0, 2000) : null,
+  };
 }
