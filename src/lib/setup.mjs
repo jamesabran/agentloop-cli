@@ -807,27 +807,6 @@ export async function runSetup({
   const prompt = injectedPrompt || new TerminalPrompt();
   const configPath = path.join(projectRoot, CONFIG_FILE_NAME);
   const tmpPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.tmp`);
-  const preUpdateBackupPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update`);
-
-  // If a .pre-update file exists from a previous interrupted or
-  // partially-failed run, rotate it to a timestamped name before it gets
-  // overwritten by this run's snapshot.  .pre-update is deliberately
-  // retained as a recovery artifact — silently replacing it would
-  // destroy the only copy of the previous config.
-  if (fs.existsSync(preUpdateBackupPath)) {
-    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    const stampedPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}`);
-    try {
-      fs.renameSync(preUpdateBackupPath, stampedPath);
-      prompt.display(`  Rotated previous recovery file to ${path.basename(stampedPath)}`);
-    } catch {
-      // Rotation failed — the pre-update file stays in place and will be
-      // overwritten by the snapshot below.  This is a last-resort path;
-      // we cannot safely block the user from configuring their project.
-      prompt.display('  Warning: could not rotate the existing .pre-update recovery file.');
-      prompt.display('  It will be replaced by this run. Copy it elsewhere if you need it.');
-    }
-  }
 
   try {
     // Load existing config (for display defaults only — the actual
@@ -886,10 +865,33 @@ export async function runSetup({
     // 5. On success: promote the pre-update backup → .bak.
 
     // Phase 1: snapshot the existing config (copy, not move).
+    //
+    // Use .pre-update as the snapshot target, but if a file already
+    // exists at that path (retained from a previous interrupted run),
+    // rotate it to a timestamped name first.  If rotation fails, fall
+    // back to a unique timestamped path so the previous recovery file
+    // is never silently overwritten.
+    let snapshotPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update`);
+    if (fs.existsSync(snapshotPath)) {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const stampedPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}`);
+      try {
+        fs.renameSync(snapshotPath, stampedPath);
+        prompt.display(`  Rotated previous recovery file to ${path.basename(stampedPath)}`);
+      } catch {
+        // Could not rotate — use a fresh unique path instead so the
+        // existing .pre-update is not overwritten.
+        snapshotPath = stampedPath;
+        prompt.display('  Warning: could not rotate the existing .pre-update recovery file.');
+        prompt.display(`  Using ${path.basename(snapshotPath)} for this run instead.`);
+        prompt.display('  The existing .pre-update was not modified.');
+      }
+    }
+
     let hadOldFile = false;
     if (oldFileExists) {
       try {
-        fs.copyFileSync(configPath, preUpdateBackupPath);
+        fs.copyFileSync(configPath, snapshotPath);
         hadOldFile = true;
       } catch {
         // Copy failed — the original is still intact but we cannot
@@ -921,7 +923,7 @@ export async function runSetup({
       // Clean up the pre-update backup — the old config is still at
       // the canonical path, untouched.
       if (hadOldFile) {
-        try { fs.unlinkSync(preUpdateBackupPath); } catch { /* best-effort */ }
+        try { fs.unlinkSync(snapshotPath); } catch { /* best-effort */ }
       }
       return { saved: false, config, reason: 'File write failed — nothing was changed.' };
     }
@@ -937,7 +939,7 @@ export async function runSetup({
         // canonical path could leave a partial file on failure.
         let restored = false;
         try {
-          fs.copyFileSync(preUpdateBackupPath, tmpPath);
+          fs.copyFileSync(snapshotPath, tmpPath);
           fs.renameSync(tmpPath, configPath);
           restored = true;
         } catch {
@@ -947,7 +949,7 @@ export async function runSetup({
         }
 
         if (restored) {
-          try { fs.unlinkSync(preUpdateBackupPath); } catch { /* best-effort */ }
+          try { fs.unlinkSync(snapshotPath); } catch { /* best-effort */ }
         } else {
           prompt.display('');
           prompt.display('  ✖  Validation failed and the previous config could not be restored.');
@@ -1003,7 +1005,7 @@ export async function runSetup({
 
       // Move the pre-update backup (the old config) to .bak.
       try {
-        fs.renameSync(preUpdateBackupPath, bakPath);
+        fs.renameSync(snapshotPath, bakPath);
         prompt.display(`  Backed up previous config to ${CONFIG_FILE_NAME}.bak`);
       } catch {
         // Backup rename failed — the pre-update backup stays on disk.
