@@ -105,6 +105,7 @@ function baseEnv(overrides = {}) {
   delete env.AGENTLOOP_BASE_BRANCH;
   delete env.AGENTLOOP_CLAUDE_ALLOWED_TOOLS;
   delete env.AGENTLOOP_CLAUDE_PERMISSION_MODE;
+  delete env.AGENTLOOP_CLAUDE_RELAY_MODE;
   delete env.AGENTLOOP_CLAUDE_TIMEOUT_MS;
   for (const [key, value] of Object.entries(overrides)) {
     if (value === undefined) delete env[key];
@@ -761,6 +762,10 @@ describe('modifying package.json gives Claude no path to run git push or gh', ()
     expect(value).toMatch(/Bash\(npx \*\)/);
     expect(value).toMatch(/Bash\(git push\*\)/);
     expect(value).toMatch(/Bash\(gh \*\)/);
+    // chmod/chown are also in CLAUDE_DISALLOWED_TOOLS so they are blocked even
+    // when the relay hook is not active (belt-and-braces alongside HARD_DENY_PATTERNS).
+    expect(value).toMatch(/Bash\(chmod \*\)/);
+    expect(value).toMatch(/Bash\(chown \*\)/);
   });
 });
 

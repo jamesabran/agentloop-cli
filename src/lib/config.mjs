@@ -274,15 +274,15 @@ function validatePublishMode(value) {
   );
 }
 
-const VALID_CLAUDE_PERMISSION_MODES = Object.freeze(['interactive', 'auto']);
+const VALID_CLAUDE_RELAY_MODES = Object.freeze(['interactive', 'auto']);
 
-function validateClaudePermissionMode(value) {
+function validateClaudeRelayMode(value) {
   if (value === undefined || value === null) return 'interactive';
   const normalized = String(value).trim();
-  if (!VALID_CLAUDE_PERMISSION_MODES.includes(normalized)) {
+  if (!VALID_CLAUDE_RELAY_MODES.includes(normalized)) {
     throw new Error(
-      `Invalid Claude permission mode ${JSON.stringify(normalized)}. ` +
-        `Valid values are: ${VALID_CLAUDE_PERMISSION_MODES.join(', ')}.`,
+      `Invalid Claude relay mode ${JSON.stringify(normalized)}. ` +
+        `Valid values are: ${VALID_CLAUDE_RELAY_MODES.join(', ')}.`,
     );
   }
   return normalized;
@@ -367,32 +367,40 @@ export function getProviderConfig(provider) {
 const CLAUDE_CONFIG = getProviderConfig('claude');
 
 /**
- * ALCLI Claude permission mode — controls whether tool permission requests
- * are relayed to the terminal user ("interactive") or auto-approved ("auto").
+ * Claude tool permissions for unattended runs.
  *
- * Set via `claude.permissionMode` in agentloop.config.json or the
- * `AGENTLOOP_CLAUDE_PERMISSION_MODE` environment variable. An unrecognised
- * value raises an error at startup rather than silently defaulting.
+ * `acceptEdits` plus a scoped tool allowlist is the least-privilege default
+ * that still lets Claude implement and commit. Verification is not among
+ * Claude's tools — see {@link CLAUDE_DEFAULT_ALLOWED} — and nothing here can
+ * reach the network: the local loop must not push, and must not talk to
+ * GitHub at all. Publishing is the controller's job, and only after Codex
+ * approves the exact local HEAD.
+ */
+export const CLAUDE_PERMISSION_MODE =
+  process.env.AGENTLOOP_CLAUDE_PERMISSION_MODE ?? CLAUDE_CONFIG.permissionMode ?? 'acceptEdits';
+
+/**
+ * ALCLI Claude relay mode — controls whether tool permission requests that
+ * fall outside the static allowlist are relayed to the terminal user
+ * ("interactive") or auto-approved after hard-deny checks ("auto").
  *
- * The value passed to the Claude CLI `--permission-mode` flag is derived from
- * this setting — see {@link CLAUDE_CLI_PERMISSION_MODE}.
+ * Hard-deny rules are always enforced regardless of mode — the relay hook
+ * runs in both modes so that non-negotiable blocks (git push, gh, npm, node,
+ * npx, chmod, chown, WebFetch, BypassPermissions) can never be approved.
+ *
+ * Set via `claude.relayMode` in agentloop.config.json or the
+ * `AGENTLOOP_CLAUDE_RELAY_MODE` environment variable. An unrecognised value
+ * raises an error at startup rather than silently defaulting.
+ *
+ * This is independent of {@link CLAUDE_PERMISSION_MODE} (the Claude CLI
+ * `--permission-mode` flag).  Existing `claude.permissionMode` values
+ * continue to work unchanged.
  *
  * @type {'interactive' | 'auto'}
  */
-export const CLAUDE_PERMISSION_MODE = validateClaudePermissionMode(
-  process.env.AGENTLOOP_CLAUDE_PERMISSION_MODE ?? CLAUDE_CONFIG.permissionMode,
+export const CLAUDE_RELAY_MODE = validateClaudeRelayMode(
+  process.env.AGENTLOOP_CLAUDE_RELAY_MODE ?? CLAUDE_CONFIG.relayMode,
 );
-
-/**
- * The Claude CLI `--permission-mode` flag value, derived from the ALCLI mode.
- *
- * 'interactive' → 'acceptEdits'  (relay handles further permission decisions)
- * 'auto'         → 'bypassPermissions' (Claude auto-approves, no relay needed)
- *
- * @type {string}
- */
-export const CLAUDE_CLI_PERMISSION_MODE =
-  CLAUDE_PERMISSION_MODE === 'auto' ? 'bypassPermissions' : 'acceptEdits';
 
 /**
  * The exact local git operations Claude needs: inspecting the working tree
@@ -472,6 +480,8 @@ export const CLAUDE_DISALLOWED_TOOLS = [
   'Bash(npm:*)',
   'Bash(npx *)',
   'Bash(npx:*)',
+  'Bash(chmod *)',
+  'Bash(chown *)',
   'WebFetch',
 ].join(',');
 

@@ -55,6 +55,7 @@ function baseEnv(overrides = {}) {
   delete env.AGENTLOOP_BASE_BRANCH;
   delete env.AGENTLOOP_CLAUDE_ALLOWED_TOOLS;
   delete env.AGENTLOOP_CLAUDE_PERMISSION_MODE;
+  delete env.AGENTLOOP_CLAUDE_RELAY_MODE;
   delete env.AGENTLOOP_CLAUDE_TIMEOUT_MS;
   delete env.AGENTLOOP_PUBLISH_MODE;
   for (const [key, value] of Object.entries(overrides)) {
@@ -371,7 +372,7 @@ describe('ROLE_MAPPING from agentloop.config.json', () => {
 describe('getProviderConfig keeps settings attached to the provider', () => {
   it('returns claude config from the claude key', () => {
     const dir = makeProject({
-      config: { claude: { permissionMode: 'auto' } },
+      config: { claude: { permissionMode: 'acceptEdits' } },
     });
     // getProviderConfig is a function, not a value — import and call it as a
     // one-liner via spawn.
@@ -385,7 +386,7 @@ describe('getProviderConfig keeps settings attached to the provider', () => {
       { cwd: dir, env: baseEnv(), encoding: 'utf8' },
     );
     expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({ permissionMode: 'auto' });
+    expect(JSON.parse(result.stdout)).toEqual({ permissionMode: 'acceptEdits' });
   });
 
   it('returns empty object for a provider with no config', () => {
@@ -437,134 +438,116 @@ describe('provider-specific Claude config is preserved', () => {
 });
 
 /* ------------------------------------------------------------------ *
- * CLAUDE_PERMISSION_MODE (ALCLI semantic mode)                        *
+ * CLAUDE_RELAY_MODE (ALCLI permission relay mode)                     *
  * ------------------------------------------------------------------ */
 
-describe('CLAUDE_PERMISSION_MODE', () => {
+describe('CLAUDE_RELAY_MODE', () => {
   it('defaults to "interactive"', () => {
     const dir = makeProject();
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const result = importConfigField('CLAUDE_RELAY_MODE', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toBe('interactive');
   });
 
-  it('CLAUDE_CLI_PERMISSION_MODE defaults to "acceptEdits" (from interactive)', () => {
+  it('CLAUDE_PERMISSION_MODE is unchanged — defaults to "acceptEdits"', () => {
     const dir = makeProject();
-    const result = importConfigField('CLAUDE_CLI_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toBe('acceptEdits');
   });
 
-  it('resolves "interactive" from claude.permissionMode in config', () => {
+  it('resolves "interactive" from claude.relayMode in config', () => {
     const dir = makeProject({
-      config: { claude: { permissionMode: 'interactive' } },
+      config: { claude: { relayMode: 'interactive' } },
     });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const result = importConfigField('CLAUDE_RELAY_MODE', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toBe('interactive');
   });
 
-  it('resolves "auto" from claude.permissionMode in config', () => {
+  it('resolves "auto" from claude.relayMode in config', () => {
     const dir = makeProject({
-      config: { claude: { permissionMode: 'auto' } },
+      config: { claude: { relayMode: 'auto' } },
     });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const result = importConfigField('CLAUDE_RELAY_MODE', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toBe('auto');
   });
 
-  it('"auto" mode maps CLI_PERMISSION_MODE to "bypassPermissions"', () => {
+  it('env var AGENTLOOP_CLAUDE_RELAY_MODE overrides config', () => {
     const dir = makeProject({
-      config: { claude: { permissionMode: 'auto' } },
+      config: { claude: { relayMode: 'interactive' } },
     });
-    const result = importConfigField('CLAUDE_CLI_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
-    expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toBe('bypassPermissions');
-  });
-
-  it('env var AGENTLOOP_CLAUDE_PERMISSION_MODE overrides config', () => {
-    const dir = makeProject({
-      config: { claude: { permissionMode: 'interactive' } },
-    });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', {
+    const result = importConfigField('CLAUDE_RELAY_MODE', {
       cwd: dir,
-      env: baseEnv({ AGENTLOOP_CLAUDE_PERMISSION_MODE: 'auto' }),
+      env: baseEnv({ AGENTLOOP_CLAUDE_RELAY_MODE: 'auto' }),
     });
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toBe('auto');
   });
 
-  it('rejects invalid mode "acceptEdits" (a CLI value, not an ALCLI mode)', () => {
+  it('rejects invalid mode "acceptEdits" (a CLI value, not a relay mode)', () => {
     const dir = makeProject({
-      config: { claude: { permissionMode: 'acceptEdits' } },
+      config: { claude: { relayMode: 'acceptEdits' } },
     });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const result = importConfigField('CLAUDE_RELAY_MODE', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
+    expect(result.stderr).toMatch(/Invalid Claude relay mode/);
   });
 
   it('rejects invalid mode "bypassPermissions" in config', () => {
     const dir = makeProject({
-      config: { claude: { permissionMode: 'bypassPermissions' } },
+      config: { claude: { relayMode: 'bypassPermissions' } },
     });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const result = importConfigField('CLAUDE_RELAY_MODE', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
+    expect(result.stderr).toMatch(/Invalid Claude relay mode/);
   });
 
   it('rejects invalid mode "default" in config', () => {
     const dir = makeProject({
-      config: { claude: { permissionMode: 'default' } },
+      config: { claude: { relayMode: 'default' } },
     });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const result = importConfigField('CLAUDE_RELAY_MODE', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
+    expect(result.stderr).toMatch(/Invalid Claude relay mode/);
   });
 
-  it('rejects invalid mode "plan" in config', () => {
+  it('rejects empty string relayMode', () => {
     const dir = makeProject({
-      config: { claude: { permissionMode: 'plan' } },
+      config: { claude: { relayMode: '' } },
     });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const result = importConfigField('CLAUDE_RELAY_MODE', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
-  });
-
-  it('rejects empty string permissionMode', () => {
-    const dir = makeProject({
-      config: { claude: { permissionMode: '' } },
-    });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
-    expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
+    expect(result.stderr).toMatch(/Invalid Claude relay mode/);
   });
 
   it('rejects invalid mode via env var', () => {
     const dir = makeProject();
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', {
+    const result = importConfigField('CLAUDE_RELAY_MODE', {
       cwd: dir,
-      env: baseEnv({ AGENTLOOP_CLAUDE_PERMISSION_MODE: 'garbage' }),
+      env: baseEnv({ AGENTLOOP_CLAUDE_RELAY_MODE: 'garbage' }),
     });
     expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/Invalid Claude permission mode/);
+    expect(result.stderr).toMatch(/Invalid Claude relay mode/);
   });
 });
 
-describe('CLAUDE_PERMISSION_MODE works regardless of role mapping', () => {
+describe('CLAUDE_RELAY_MODE works regardless of role mapping', () => {
   it('"auto" mode works when claude is the implementer', () => {
     const dir = makeProject({
-      config: { claude: { permissionMode: 'auto' }, roles: { implementer: 'claude' } },
+      config: { claude: { relayMode: 'auto' }, roles: { implementer: 'claude' } },
     });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const result = importConfigField('CLAUDE_RELAY_MODE', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toBe('auto');
   });
 
   it('"auto" mode works when claude is the planner', () => {
     const dir = makeProject({
-      config: { claude: { permissionMode: 'auto' }, roles: { planner: 'claude' } },
+      config: { claude: { relayMode: 'auto' }, roles: { planner: 'claude' } },
     });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const result = importConfigField('CLAUDE_RELAY_MODE', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toBe('auto');
   });
@@ -572,13 +555,43 @@ describe('CLAUDE_PERMISSION_MODE works regardless of role mapping', () => {
   it('"interactive" mode works when claude is both planner and implementer', () => {
     const dir = makeProject({
       config: {
-        claude: { permissionMode: 'interactive' },
+        claude: { relayMode: 'interactive' },
         roles: { planner: 'claude', implementer: 'claude', auditor: 'codex' },
       },
     });
-    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const result = importConfigField('CLAUDE_RELAY_MODE', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toBe('interactive');
+  });
+});
+
+describe('existing CLAUDE_PERMISSION_MODE still works as before', () => {
+  it('CLAUDE_PERMISSION_MODE resolves from the claude provider config', () => {
+    const dir = makeProject({
+      config: { claude: { permissionMode: 'default' } },
+    });
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('default');
+  });
+
+  it('CLAUDE_PERMISSION_MODE defaults to "acceptEdits" when unconfigured', () => {
+    const dir = makeProject();
+    const result = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toBe('acceptEdits');
+  });
+
+  it('relayMode does not affect CLAUDE_PERMISSION_MODE', () => {
+    const dir = makeProject({
+      config: { claude: { relayMode: 'auto' } },
+    });
+    const perm = importConfigField('CLAUDE_PERMISSION_MODE', { cwd: dir, env: baseEnv() });
+    const relay = importConfigField('CLAUDE_RELAY_MODE', { cwd: dir, env: baseEnv() });
+    expect(perm.status).toBe(0);
+    expect(relay.status).toBe(0);
+    expect(JSON.parse(perm.stdout)).toBe('acceptEdits');
+    expect(JSON.parse(relay.stdout)).toBe('auto');
   });
 });
 

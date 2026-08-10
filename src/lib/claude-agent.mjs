@@ -22,14 +22,15 @@ import path from 'node:path';
 
 import {
   CLAUDE_ALLOWED_TOOLS,
-  CLAUDE_CLI_PERMISSION_MODE,
   CLAUDE_DISALLOWED_TOOLS,
   CLAUDE_HARD_DENY_PATTERNS,
   CLAUDE_PERMISSION_MODE,
+  CLAUDE_RELAY_MODE,
   LIMITS,
   REPO_ROOT,
 } from './config.mjs';
 import {
+  buildToolEntry,
   checkHardDeny,
   cleanRelayFiles,
   createRelayWorkDir,
@@ -109,7 +110,7 @@ export function buildClaudeArgs({ sessionId, resume }) {
     'stream-json',
     '--verbose',
     '--permission-mode',
-    CLAUDE_CLI_PERMISSION_MODE,
+    CLAUDE_PERMISSION_MODE,
     '--add-dir',
     REPO_ROOT,
   ];
@@ -265,17 +266,24 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
   const session = sessionId ?? randomUUID();
   const args = buildClaudeArgs({ sessionId: session, resume });
 
-  // Permission relay: only for standard `claude` binary in interactive mode.
+  // Permission relay: only for standard `claude` binary.  The relay hook is
+  // always set up when the binary supports it so hard-deny rules are enforced
+  // in every mode.  Whether the watcher prompts the user or auto-approves
+  // depends on CLAUDE_RELAY_MODE.
   const isStandardClaude =
     !process.env.AGENTLOOP_CLAUDE_BIN ||
     path.basename(process.env.AGENTLOOP_CLAUDE_BIN) === 'claude' ||
     path.basename(process.env.AGENTLOOP_CLAUDE_BIN) === 'claude.cmd';
 
+  // Relay is enabled when the binary supports hooks, the relay is not
+  // explicitly disabled, and either a TTY is available (interactive prompting)
+  // or the mode is 'auto' (no TTY needed — the watcher auto-approves).
   const relayEnabled =
-    CLAUDE_PERMISSION_MODE === 'interactive' &&
-    process.stdin.isTTY &&
     isStandardClaude &&
-    !process.env.AGENTLOOP_DISABLE_PERMISSION_RELAY;
+    !process.env.AGENTLOOP_DISABLE_PERMISSION_RELAY &&
+    (process.stdin.isTTY || CLAUDE_RELAY_MODE === 'auto');
+
+  const relayAuto = CLAUDE_RELAY_MODE === 'auto';
 
   // Temp directory OUTSIDE the repo — Claude's Write tool is restricted to
   // REPO_ROOT, so it cannot reach the hook artefacts or forge a response.
@@ -290,7 +298,10 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
     });
 
     args.push('--settings', settingsPath);
-    onLog?.('[claude-agent] permission relay enabled (workDir: ' + relayWorkDir + ')');
+    onLog?.(
+      '[claude-agent] permission relay enabled (mode: ' + CLAUDE_RELAY_MODE +
+      ', workDir: ' + relayWorkDir + ')',
+    );
   } else if (!isStandardClaude) {
     onLog?.('[claude-agent] permission relay skipped (non-standard binary)');
   }
@@ -313,7 +324,7 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
           const nonce = typeof request.nonce === 'string' ? request.nonce : null;
           const toolUseId = typeof request.tool_use_id === 'string' ? request.tool_use_id : 'unknown';
 
-          // Belt-and-braces hard-deny re-check.
+          // Belt-and-braces hard-deny re-check — enforced in every mode.
           const hardCheck = checkHardDeny(toolName, toolInput, CLAUDE_HARD_DENY_PATTERNS);
           if (hardCheck.denied) {
             writeResponse(wd, toolUseId, {
@@ -325,7 +336,14 @@ export async function runClaude({ prompt, sessionId = null, resume = false, onSt
             continue;
           }
 
-          // Prompt the user.
+          // Auto mode: approve after hard-deny check, no user prompt.
+          if (relayAuto) {
+            writeResponse(wd, toolUseId, { approved: true, nonce });
+            onLog?.('[claude-agent] auto-approved: ' + (buildToolEntry(toolName, toolInput) ?? toolName));
+            continue;
+          }
+
+          // Interactive mode: prompt the user.
           const choice = await promptUser({ toolName, toolInput });
 
           if (choice === null) {
