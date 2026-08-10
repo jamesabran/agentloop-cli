@@ -25,10 +25,27 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { LOGICAL_ROLES, PROVIDER_CAPABILITIES } from './roles.mjs';
-
-// Lazily imported so tests can set up the filesystem before config loads.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_MODULE_URL = pathToFileURL(path.join(HERE, 'config.mjs')).href;
+
+/**
+ * Find the nearest ancestor directory that contains a `.git` directory.
+ * Falls back to `startDir` itself — same logic as config.mjs's
+ * `findProjectRoot`, duplicated so setup.mjs can resolve the project
+ * root without importing the config module (which has load-time side effects).
+ *
+ * @param {string} startDir
+ * @returns {string}
+ */
+function findProjectRoot(startDir) {
+  let dir = path.resolve(startDir);
+  for (;;) {
+    if (fs.existsSync(path.join(dir, '.git'))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return path.resolve(startDir);
+    dir = parent;
+  }
+}
 
 /* ------------------------------------------------------------------ *
  * Constants                                                            *
@@ -346,14 +363,39 @@ async function sectionVerification(existing, prompt) {
   if (profile !== 'lightweight') {
     const existingRvChecks = existingRv.checks || [];
     const hasRvChecks = existingRvChecks.length > 0;
-    if (hasRvChecks) {
-      prompt.display(`    Current checks: ${existingRvChecks.map((c) => c.name).join(', ')}`);
-    }
-    const configureRv = await prompt.confirm(
-      'Configure runtime verification commands?',
-      !hasRvChecks,
-    );
-    if (configureRv) {
+
+    // Required profiles (standard / integration / custom) need at least one
+    // check so the runtime gate is not silently bypassed.  Loop until the
+    // user provides at least one, up to a safety limit.
+    const MAX_RV_ATTEMPTS = 5;
+    let firstPass = true;
+    let attempts = 0;
+    while (rvChecks.length === 0 && attempts < MAX_RV_ATTEMPTS) {
+      attempts += 1;
+      if (!firstPass) {
+        prompt.display('');
+        prompt.display('    At least one runtime check is required for this profile.');
+        prompt.display('    Without checks, every task that requires runtime verification will fail.');
+      }
+      firstPass = false;
+
+      if (hasRvChecks) {
+        prompt.display(`    Current checks: ${existingRvChecks.map((c) => c.name).join(', ')}`);
+      }
+      const configureRv = await prompt.confirm(
+        'Configure runtime verification commands?',
+        !hasRvChecks || rvChecks.length === 0,
+      );
+      if (!configureRv && hasRvChecks && rvChecks.length === 0) {
+        // Carry forward existing checks rather than leaving the list empty.
+        rvChecks = existingRvChecks.map((c) => ({ ...c }));
+        break;
+      }
+      if (!configureRv) {
+        // No existing checks and user declined to add any — keep looping.
+        continue;
+      }
+
       prompt.display('    Enter runtime check commands one at a time (empty name to finish):');
       let idx = 1;
       while (true) {
@@ -373,22 +415,30 @@ async function sectionVerification(existing, prompt) {
         idx += 1;
       }
     }
-    if (rvChecks.length === 0 && hasRvChecks) {
-      rvChecks = existingRvChecks.map((c) => ({ ...c }));
-    }
+
     if (rvChecks.length === 0) {
-      prompt.display('    Warning: a runtime verification profile is set but no checks are configured.');
-      prompt.display('    Tasks requiring runtime checks will fail until checks are added.');
+      // User declined to add checks — downgrade to lightweight so the
+      // config does not silently create a required gate with no checks.
+      prompt.display('');
+      prompt.display('    No runtime checks configured — the profile will be set to lightweight.');
+      prompt.display('    Run `agentloop --setup` again to add checks and upgrade the profile.');
     }
   }
+
+  // If a required profile was selected but no checks were configured,
+  // downgrade to lightweight so the config is never saved in a state
+  // where required verification would always fail.
+  const effectiveProfile = (profile !== 'lightweight' && rvChecks.length === 0)
+    ? 'lightweight'
+    : profile;
 
   const result = {};
   if (!useDefaults || hasCustomChecks) {
     result.checks = checks;
   }
-  if (profile !== 'lightweight' || rvChecks.length > 0 || existingRv.profile) {
+  if (effectiveProfile !== 'lightweight' || rvChecks.length > 0 || existingRv.profile) {
     result.runtimeVerification = {
-      ...(profile !== 'lightweight' ? { profile } : {}),
+      ...(effectiveProfile !== 'lightweight' ? { profile: effectiveProfile } : {}),
       ...(rvChecks.length > 0 ? { checks: rvChecks } : {}),
     };
   }
@@ -606,8 +656,8 @@ export function assembleConfig(fragments) {
  * @param {object} config — the config object to write
  * @param {string} projectRoot — absolute path to the project root
  */
-export function saveConfig(config, projectRoot) {
-  const file = path.join(projectRoot, CONFIG_FILE_NAME);
+export function saveConfig(config, projectRoot, filePath = null) {
+  const file = filePath || path.join(projectRoot, CONFIG_FILE_NAME);
   const json = JSON.stringify(config, null, 2) + '\n';
   fs.writeFileSync(file, json, 'utf8');
 }
@@ -620,11 +670,9 @@ export function saveConfig(config, projectRoot) {
  * @param {object} [options.env] — environment variables for the subprocess
  * @returns {{ ok: boolean, errors?: string[] }}
  */
-export function validateConfig(projectRoot, options) {
-  return validateAgainstConfigModule(
-    path.join(projectRoot, CONFIG_FILE_NAME),
-    options,
-  );
+export function validateConfig(projectRoot, { configPath, env } = {}) {
+  const target = configPath || path.join(projectRoot, CONFIG_FILE_NAME);
+  return validateAgainstConfigModule(target, { env });
 }
 
 /**
@@ -753,24 +801,14 @@ export function formatSummary(config, roles) {
  * @returns {Promise<{ saved: boolean, config: object|null, reason: string }>}
  */
 export async function runSetup({
-  projectRoot = process.cwd(),
+  projectRoot = findProjectRoot(process.cwd()),
   prompt: injectedPrompt = null,
 } = {}) {
   const prompt = injectedPrompt || new TerminalPrompt();
+  const configPath = path.join(projectRoot, CONFIG_FILE_NAME);
+  const tempPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.tmp`);
 
   try {
-    // Check for git repo
-    const hasGit = fs.existsSync(path.join(projectRoot, '.git'));
-    if (!hasGit) {
-      prompt.display('');
-      prompt.display('  Warning: No .git directory found in this directory.');
-      prompt.display('  ALCLI is designed to run within a git repository.');
-      const proceed = await prompt.confirm('Continue anyway?', false);
-      if (!proceed) {
-        return { saved: false, config: null, reason: 'Not a git repository — setup cancelled.' };
-      }
-    }
-
     // Load existing config
     const existing = loadExistingConfig(projectRoot);
     const isReconfigure = Object.keys(existing).length > 0;
@@ -815,10 +853,34 @@ export async function runSetup({
       return { saved: false, config, reason: 'User chose not to save.' };
     }
 
-    // Save
+    // Validate BEFORE touching the canonical file — write to a temp file,
+    // validate through the real config module, then atomically rename.
+    // Clean up any stale temp file from a previous interrupted run.
+    try { fs.unlinkSync(tempPath); } catch { /* didn't exist — fine */ }
+
+    saveConfig(config, projectRoot, tempPath);
+
+    const validation = validateConfig(projectRoot, { configPath: tempPath });
+    if (!validation.ok) {
+      // Validation failed — remove the temp file and leave the canonical
+      // config (if any) untouched.
+      try { fs.unlinkSync(tempPath); } catch { /* best-effort */ }
+      prompt.display('');
+      prompt.display('  ✖  Configuration validation failed — nothing was saved.');
+      prompt.display('  Errors:');
+      for (const err of validation.errors || []) {
+        prompt.display(`    ${err}`);
+      }
+      return {
+        saved: false,
+        config,
+        reason: 'Configuration validation failed — see errors above.',
+      };
+    }
+
+    // Validation passed — back up the existing config (if any), then
+    // atomically rename the validated temp file into place.
     if (isReconfigure) {
-      // Backup the existing config before overwriting
-      const configPath = path.join(projectRoot, CONFIG_FILE_NAME);
       const backupPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.bak`);
       try {
         fs.copyFileSync(configPath, backupPath);
@@ -828,28 +890,20 @@ export async function runSetup({
       }
     }
 
-    saveConfig(config, projectRoot);
-
-    // Validate the newly written config
-    const validation = validateConfig(projectRoot);
-    if (!validation.ok) {
+    try {
+      fs.renameSync(tempPath, configPath);
+    } catch {
+      // Rename failed — leave the temp file for recovery, do not touch
+      // the canonical file.
       prompt.display('');
-      prompt.display('  ⚠  Warning: The saved configuration failed validation:');
-      for (const err of validation.errors || []) {
-        prompt.display(`    ${err}`);
-      }
-      prompt.display('  The configuration was saved but may not work correctly.');
-      prompt.display('  Run `agentloop --setup` again to fix it.');
-      return {
-        saved: true,
-        config,
-        reason: 'Configuration saved but validation failed — see errors above.',
-      };
+      prompt.display('  ✖  Could not write the final configuration file.');
+      prompt.display(`  The validated config is at ${CONFIG_FILE_NAME}.tmp`);
+      return { saved: false, config, reason: 'File rename failed — temp file preserved.' };
     }
 
     prompt.display('');
     prompt.display('  Configuration saved and validated successfully.');
-    prompt.display(`  File: ${path.join(projectRoot, CONFIG_FILE_NAME)}`);
+    prompt.display(`  File: ${configPath}`);
     prompt.display('  Run `agentloop --setup` anytime to reconfigure.');
 
     return { saved: true, config, reason: 'Configuration saved and validated.' };

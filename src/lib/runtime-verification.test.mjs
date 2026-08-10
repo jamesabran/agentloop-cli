@@ -383,10 +383,15 @@ describe('runRuntimeChecks', () => {
     expect(started).toEqual(['smoke', 'api']);
   });
 
-  it('handles empty checks gracefully', async () => {
+  it('treats an empty check list as a configuration failure', async () => {
+    // Defense-in-depth: an empty check list when verification is required
+    // is a configuration error, not a pass.  The controller also guards
+    // this upstream, but the runner itself must not silently treat
+    // "no checks" as "all checks passed."
     const outcome = await runRuntimeChecks({ checks: [], runner: fakeRunner() });
-    expect(outcome.ok).toBe(true);
+    expect(outcome.ok).toBe(false);
     expect(outcome.results).toHaveLength(0);
+    expect(outcome.failed.name).toBe('(no checks)');
   });
 });
 

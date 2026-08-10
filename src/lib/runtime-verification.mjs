@@ -391,6 +391,19 @@ export async function runRuntimeChecks({
   timeoutMs = 120_000,
   onStart,
 } = {}) {
+  // An empty check list when verification is required is a configuration
+  // error, not a pass.  The controller also guards this upstream, but
+  // failing here is defense-in-depth: a caller that bypasses the
+  // controller-level guard still cannot silently treat "no checks" as
+  // "all checks passed."
+  if (checks.length === 0) {
+    return {
+      ok: false,
+      results: [],
+      failed: { name: '(no checks)', command: '', ok: false, durationMs: 0, output: 'No runtime verification checks configured.' },
+    };
+  }
+
   const results = [];
 
   for (const check of checks) {

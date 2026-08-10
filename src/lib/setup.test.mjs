@@ -883,19 +883,27 @@ describe('runtime verification profile configuration', () => {
     expect(config.runtimeVerification).toBeUndefined();
   });
 
-  it('standard profile with no checks warns but saves the profile', async () => {
+  it('standard profile with no checks is downgraded to lightweight', async () => {
+    // Required profiles need at least one check.  When the user declines
+    // to add any, the profile is downgraded to lightweight so the config
+    // is never saved in a state where required verification would always
+    // fail at runtime.
     const prompt = mockPrompt([
       '', '', '', '',
       true,
       'standard',
-      false,            // do not configure checks
+      false,            // do not configure checks (first attempt)
+      false,            // do not configure checks (second attempt)
+      false,            // third
+      false,            // fourth
+      false,            // fifth — exhausted → downgrade
       'manual', '',
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt });
-    // Profile should be saved even without checks (the warning is UX, not blocking)
-    expect(config.runtimeVerification).toBeDefined();
-    expect(config.runtimeVerification.profile).toBe('standard');
+    // After exhausting attempts with no checks, the profile is downgraded
+    // to lightweight — no runtimeVerification key at all.
+    expect(config.runtimeVerification).toBeUndefined();
   });
 
   it('integration profile with checks is captured', async () => {
