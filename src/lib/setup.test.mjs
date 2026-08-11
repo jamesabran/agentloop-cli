@@ -103,33 +103,47 @@ function mockPrompt(responses = []) {
 }
 
 /**
- * Build a sequence of responses that accepts all defaults.
+ * Return a mock discovery result with all known providers available.
+ * Used by tests so they don't depend on real CLI installation state.
+ */
+function mockDiscoveredAvailable() {
+  return {
+    claude: { available: true, path: '/usr/bin/claude' },
+    codex: { available: true, path: '/usr/bin/codex' },
+  };
+}
+
+/**
+ * Return a mock discovery result with all providers unavailable.
+ */
+function mockDiscoveredUnavailable() {
+  return {
+    claude: { available: false, reason: 'not installed' },
+    codex: { available: false, reason: 'not installed' },
+  };
+}
+
+/**
+ * Build a sequence of responses that accepts all defaults with the new flow.
  *
- * Each free-text question gets '' (accept default).
- * Each confirm gets true (accept default).
- * Each select also gets the default (first option or '' if the selection code
- * uses its own fallback).
- *
- * Because the sections are sequential, we can provide a fixed array.
+ * New flow:
+ *   1. sectionRecommended: confirm → true (fast path)
+ *   2. sectionRoles: planner select → 'manual', implementer confirm → true,
+ *      auditor confirm → true
+ *   3. sectionProviderSettings: claude permissionMode → 'acceptEdits',
+ *      claude relayMode → 'interactive'
  */
 function defaultResponses() {
-  // Section order: project(4 q), roles(0-3 sel), verification(1 conf + possibly more),
-  // controller(1 sel + 1 q), provider(2 sel if claude used).
-  // We just return empty string for everything — default path.
   const arr = [];
-  // Project: repo, baseBranch, remote, tasksFile = 4 questions
-  arr.push('', '', '', '');
-  // Roles: planner has only 1 provider (claude) — no prompt
-  // implementer has only 1 provider (claude) — no prompt
-  // auditor has only 1 provider (codex) — no prompt
-  // → no responses consumed for roles with single-provider
-  // Verification: confirm (use defaults?) → true
+  // Recommended settings: accept fast path
   arr.push(true);
-  // Runtime verification: select profile → 'lightweight'
-  arr.push('lightweight');
-  // Controller: select publish mode → 'manual', maxChangeRounds → ''
-  arr.push('manual', '');
-  // Provider: Claude is used → permissionMode select, relayMode select
+  // Roles: planner select (manual)
+  arr.push('manual');
+  // Roles: implementer confirm (claude)
+  arr.push(true);
+  // Roles: auditor confirm (codex)
+  arr.push(true);
+  // Provider: Claude permissionMode, relayMode (claude selected for implementer)
   arr.push('acceptEdits', 'interactive');
   return arr;
 }
@@ -359,61 +373,66 @@ describe('loadExistingConfig', () => {
  * ================================================================== */
 
 describe('buildConfig with mock prompt', () => {
+  const discovered = mockDiscoveredAvailable();
+
   it('produces minimal config when all defaults are accepted', async () => {
-    const responses = defaultResponses();
-    const prompt = mockPrompt(responses);
-    const config = await buildConfig({ existingConfig: {}, prompt });
-    // With all defaults, config should be essentially empty
+    const prompt = mockPrompt(defaultResponses());
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    // With all defaults (fast path, manual planner), config should be minimal
     expect(config.repo).toBeUndefined();
     expect(config.publishMode).toBeUndefined();
-    expect(config.claude).toBeUndefined();
   });
 
-  it('captures project identification fields', async () => {
+  it('captures project identification fields (manual path)', async () => {
     const prompt = mockPrompt([
+      // Recommended: decline fast path
+      false,
       // Project
       'myorg/myrepo',  // repo
       'trunk',          // baseBranch
       'upstream',       // remote
       'tasks.json',     // tasksFile
-      // Roles — all single-provider, no prompts
       // Verification
       true,             // use default checks
       'lightweight',    // runtime verification profile
       // Controller
       'manual',         // publish mode
       '',               // max change rounds (default)
-      // Provider — Claude
+      // Roles
+      'manual',         // planner → manual
+      true,             // implementer → claude
+      true,             // auditor → codex
+      // Provider — Claude (selected for implementer)
       'acceptEdits',    // permission mode
       'interactive',    // relay mode
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.repo).toBe('myorg/myrepo');
     expect(config.baseBranch).toBe('trunk');
     expect(config.remote).toBe('upstream');
     expect(config.tasksFile).toBe('tasks.json');
   });
 
-  it('captures custom role mapping', async () => {
-    // When roles have only one provider, no select prompt fires.
-    // The role mapping defaults to claude/claude/codex.
+  it('captures custom role mapping with claude for all', async () => {
     const prompt = mockPrompt([
-      // Project
-      '', '', '', '',
-      // Verification
-      true, 'lightweight',
-      // Controller
-      'manual', '',
+      // Recommended: accept fast path
+      true,
+      // Roles: planner → claude, implementer → claude, auditor → codex
+      'claude',         // planner select
+      true,             // implementer confirm
+      true,             // auditor confirm
       // Provider
       'acceptEdits', 'interactive',
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
-    // No custom roles → no roles key
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    // planner=claude is default, implementer=claude is default, auditor=codex is default
     expect(config.roles).toBeUndefined();
   });
 
   it('includes custom checks when defaults are rejected', async () => {
     const prompt = mockPrompt([
+      // Recommended: decline fast path
+      false,
       // Project
       '', '', '', '',
       // Verification
@@ -424,16 +443,22 @@ describe('buildConfig with mock prompt', () => {
       'lightweight',    // runtime verification profile
       // Controller
       'manual', '',
+      // Roles
+      'manual',         // planner → manual
+      true,             // implementer → claude
+      true,             // auditor → codex
       // Provider
       'acceptEdits', 'interactive',
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.checks).toBeDefined();
     expect(config.checks).toEqual([{ name: 'lint', script: 'lint' }]);
   });
 
   it('captures runtime verification with standard profile and checks', async () => {
     const prompt = mockPrompt([
+      // Recommended: decline fast path
+      false,
       // Project
       '', '', '', '',
       // Verification — defaults
@@ -443,13 +468,17 @@ describe('buildConfig with mock prompt', () => {
       true,             // configure runtime checks
       'api-smoke',      // check name
       'npm run test:integration',  // check command
-      '',               // finish checks
+      false,            // add another? → no
       // Controller
       'manual', '',
+      // Roles
+      'manual',         // planner → manual
+      true,             // implementer → claude
+      true,             // auditor → codex
       // Provider
       'acceptEdits', 'interactive',
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.runtimeVerification).toBeDefined();
     expect(config.runtimeVerification.profile).toBe('standard');
     expect(config.runtimeVerification.checks).toEqual([
@@ -459,6 +488,8 @@ describe('buildConfig with mock prompt', () => {
 
   it('captures auto publish mode', async () => {
     const prompt = mockPrompt([
+      // Recommended: decline fast path
+      false,
       // Project
       '', '', '', '',
       // Verification
@@ -466,45 +497,41 @@ describe('buildConfig with mock prompt', () => {
       // Controller
       'auto',           // publish mode
       '3',              // max change rounds
+      // Roles
+      'manual',         // planner → manual
+      true,             // implementer → claude
+      true,             // auditor → codex
       // Provider
       'acceptEdits', 'interactive',
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.publishMode).toBe('auto');
     expect(config.maxChangeRounds).toBe(3);
   });
 
   it('captures Claude provider settings', async () => {
     const prompt = mockPrompt([
-      // Project
-      '', '', '', '',
-      // Verification
-      true, 'lightweight',
-      // Controller
-      'manual', '',
+      // Recommended: accept fast path
+      true,
+      // Roles: implementer → claude
+      'manual',         // planner → manual
+      true,             // implementer → claude
+      true,             // auditor → codex
       // Provider — Claude
       'default',        // permission mode (non-default)
       'auto',           // relay mode (non-default)
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.claude).toBeDefined();
     expect(config.claude.permissionMode).toBe('default');
     expect(config.claude.relayMode).toBe('auto');
   });
 
   it('omits Claude settings when they are defaults', async () => {
-    const prompt = mockPrompt([
-      // Project
-      '', '', '', '',
-      // Verification
-      true, 'lightweight',
-      // Controller
-      'manual', '',
-      // Provider
-      'acceptEdits',    // default permission mode
-      'interactive',    // default relay mode
-    ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
+    const prompt = mockPrompt(defaultResponses());
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    // Manual planner → Claude not selected for planner
+    // Default Claude settings for implementer → omitted
     expect(config.claude).toBeUndefined();
   });
 });
@@ -514,6 +541,8 @@ describe('buildConfig with mock prompt', () => {
  * ================================================================== */
 
 describe('reconfiguration with existing config', () => {
+  const discovered = mockDiscoveredAvailable();
+
   it('reuses existing values as defaults', async () => {
     const existing = {
       repo: 'org/existing',
@@ -522,23 +551,26 @@ describe('reconfiguration with existing config', () => {
       maxChangeRounds: 1,
       claude: { permissionMode: 'default', relayMode: 'auto' },
     };
-    // User accepts all defaults (empty responses)
+    // User accepts all defaults
     const prompt = mockPrompt([
+      // Recommended: decline to exercise manual path
+      false,
       // Project — all empty → keep existing
       '', '', '', '',
       // Verification
       true, 'lightweight',
-      // Controller
-      // The select for publishMode: existing is 'auto', default choice
-      // The question for maxChangeRounds: existing is '1'
+      // Controller — keep existing values
       'auto',           // select: keep 'auto'
       '',               // question: keep '1'
+      // Roles
+      'manual',         // planner → manual
+      true,             // implementer → claude
+      true,             // auditor → codex
       // Provider
       'default',        // select: keep 'default'
       'auto',           // select: keep 'auto'
     ]);
-    const config = await buildConfig({ existingConfig: existing, prompt });
-    // When user accepts defaults, config should reflect existing non-default values
+    const config = await buildConfig({ existingConfig: existing, prompt, discovered });
     expect(config.repo).toBe('org/existing');
     expect(config.baseBranch).toBe('trunk');
     expect(config.publishMode).toBe('auto');
@@ -553,7 +585,9 @@ describe('reconfiguration with existing config', () => {
       publishMode: 'auto',
     };
     const prompt = mockPrompt([
-      // Project — override repo, keep defaults for rest
+      // Recommended: decline fast path
+      false,
+      // Project — override repo
       'org/new-repo',   // repo
       '', '', '',
       // Verification
@@ -561,10 +595,14 @@ describe('reconfiguration with existing config', () => {
       // Controller
       'manual',         // override publish mode
       '',
+      // Roles
+      'manual',         // planner → manual
+      true,             // implementer → claude
+      true,             // auditor → codex
       // Provider
       'acceptEdits', 'interactive',
     ]);
-    const config = await buildConfig({ existingConfig: existing, prompt });
+    const config = await buildConfig({ existingConfig: existing, prompt, discovered });
     expect(config.repo).toBe('org/new-repo');
     expect(config.publishMode).toBeUndefined(); // manual is default → omitted
   });
@@ -758,27 +796,29 @@ describe('backward compatibility', () => {
  * ================================================================== */
 
 describe('cancellation leaves project unchanged', () => {
+  const discovered = mockDiscoveredAvailable();
+
   it('buildConfig does not write to disk', async () => {
     const dir = makeProject();
     const configPath = path.join(dir, 'agentloop.config.json');
 
     const prompt = mockPrompt([
+      false,            // recommended: decline fast path
       'org/repo', '', '', '',
       true, 'lightweight',
       'manual', '',
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
       'acceptEdits', 'interactive',
     ]);
-    await buildConfig({ existingConfig: {}, prompt });
+    await buildConfig({ existingConfig: {}, prompt, discovered });
 
     // buildConfig never writes — it only returns the config
     expect(fs.existsSync(configPath)).toBe(false);
   });
 
   it('runSetup with a mock prompt that says no does not save', async () => {
-    // We test this by directly using the core functions rather than runSetup
-    // since runSetup also handles writing and confirmation.
-    // The cancellation is tested via the confirm step in runSetup.
-    // For unit tests, we verify that saveConfig only writes when called.
     const dir = makeProject({ config: { repo: 'org/original' } });
     const configPath = path.join(dir, 'agentloop.config.json');
 
@@ -828,6 +868,23 @@ describe('formatSummary', () => {
     expect(summary).toContain('main');
     expect(summary).toContain('manual');
   });
+
+  it('shows Manual / External Planner when planner is manual', () => {
+    const summary = formatSummary(
+      {},
+      { planner: 'manual', implementer: 'claude', auditor: 'codex' },
+    );
+    expect(summary).toContain('Manual / External Planner');
+  });
+
+  it('shows provider settings only for selected providers', () => {
+    // No Claude selected for any role — no Claude Provider Settings section
+    const summary = formatSummary(
+      {},
+      { planner: 'manual', implementer: 'codex', auditor: 'codex' },
+    );
+    expect(summary).not.toContain('Claude Provider Settings');
+  });
 });
 
 /* ================================================================== *
@@ -835,34 +892,34 @@ describe('formatSummary', () => {
  * ================================================================== */
 
 describe('provider-specific settings scoping', () => {
+  const discovered = mockDiscoveredAvailable();
+
   it('omits claude key from config when all Claude settings are defaults', async () => {
     const prompt = mockPrompt([
-      '', '', '', '',
-      true, 'lightweight',
-      'manual', '',
+      true,             // recommended: accept fast path
+      'manual',         // planner → manual
+      true,             // implementer → claude
+      true,             // auditor → codex
       'acceptEdits', 'interactive',
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.claude).toBeUndefined();
   });
 
   it('Claude settings are provider-scoped, not global', async () => {
-    // Claude permission mode and relay mode are under the `claude` key,
-    // never at the top level of the config.
     const prompt = mockPrompt([
-      '', '', '', '',
-      true, 'lightweight',
-      'manual', '',
+      true,             // recommended: accept fast path
+      'manual',         // planner → manual
+      true,             // implementer → claude
+      true,             // auditor → codex
       'default', 'auto',
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
-    // These should be under config.claude, not config directly
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.permissionMode).toBeUndefined();
     expect(config.relayMode).toBeUndefined();
-    if (config.claude) {
-      expect(config.claude.permissionMode).toBe('default');
-      expect(config.claude.relayMode).toBe('auto');
-    }
+    expect(config.claude).toBeDefined();
+    expect(config.claude.permissionMode).toBe('default');
+    expect(config.claude.relayMode).toBe('auto');
   });
 });
 
@@ -871,54 +928,64 @@ describe('provider-specific settings scoping', () => {
  * ================================================================== */
 
 describe('runtime verification profile configuration', () => {
+  const discovered = mockDiscoveredAvailable();
+
   it('lightweight profile produces no runtimeVerification key', async () => {
     const prompt = mockPrompt([
-      '', '', '', '',
-      true,
-      'lightweight',
-      'manual', '',
+      false,            // recommended: decline fast path
+      '', '', '', '',   // project
+      true,             // verification: use default checks
+      'lightweight',    // runtime profile
+      'manual', '',     // controller
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
       'acceptEdits', 'interactive',
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.runtimeVerification).toBeUndefined();
   });
 
   it('standard profile with no checks is downgraded to lightweight', async () => {
     // Required profiles need at least one check.  When the user declines
-    // to add any, the profile is downgraded to lightweight so the config
-    // is never saved in a state where required verification would always
-    // fail at runtime.
+    // to add any across all attempts, the profile is downgraded.
     const prompt = mockPrompt([
-      '', '', '', '',
-      true,
-      'standard',
-      false,            // do not configure checks (first attempt)
-      false,            // do not configure checks (second attempt)
-      false,            // third
-      false,            // fourth
-      false,            // fifth — exhausted → downgrade
-      'manual', '',
+      false,            // recommended: decline fast path
+      '', '', '', '',   // project
+      true,             // use default checks
+      'standard',       // profile
+      false,            // configure? no (attempt 1)
+      false,            // configure? no (attempt 2)
+      false,            // configure? no (attempt 3)
+      false,            // configure? no (attempt 4)
+      false,            // configure? no (attempt 5 — exhausted)
+      'manual', '',     // controller
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
       'acceptEdits', 'interactive',
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
-    // After exhausting attempts with no checks, the profile is downgraded
-    // to lightweight — no runtimeVerification key at all.
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.runtimeVerification).toBeUndefined();
   });
 
   it('integration profile with checks is captured', async () => {
     const prompt = mockPrompt([
-      '', '', '', '',
-      true,
-      'integration',
+      false,            // recommended: decline fast path
+      '', '', '', '',   // project
+      true,             // use default checks
+      'integration',    // profile
       true,             // configure checks
       'full-e2e',       // name
       'npm run test:e2e:full',  // command
-      '',               // finish
-      'manual', '',
+      false,            // add another? → no
+      'manual', '',     // controller
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
       'acceptEdits', 'interactive',
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.runtimeVerification.profile).toBe('integration');
     expect(config.runtimeVerification.checks).toEqual([
       { name: 'full-e2e', command: 'npm run test:e2e:full' },
@@ -927,17 +994,21 @@ describe('runtime verification profile configuration', () => {
 
   it('custom profile is captured', async () => {
     const prompt = mockPrompt([
-      '', '', '', '',
-      true,
-      'custom',
-      true,
-      'custom-check',
-      'npm run custom-check',
-      '',
-      'manual', '',
+      false,            // recommended: decline fast path
+      '', '', '', '',   // project
+      true,             // use default checks
+      'custom',         // profile
+      true,             // configure checks
+      'custom-check',   // name
+      'npm run custom-check',  // command
+      false,            // add another? → no
+      'manual', '',     // controller
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
       'acceptEdits', 'interactive',
     ]);
-    const config = await buildConfig({ existingConfig: {}, prompt });
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.runtimeVerification.profile).toBe('custom');
   });
 });
@@ -1022,9 +1093,342 @@ describe('edge cases', () => {
 
   it('buildConfig handles empty existingConfig', async () => {
     const prompt = mockPrompt(defaultResponses());
-    const config = await buildConfig({ existingConfig: {}, prompt });
+    const config = await buildConfig({
+      existingConfig: {},
+      prompt,
+      discovered: mockDiscoveredAvailable(),
+    });
     expect(typeof config).toBe('object');
     expect(Array.isArray(config)).toBe(false);
+  });
+});
+
+/* ================================================================== *
+ * Recommended settings fast path                                        *
+ * ================================================================== */
+
+describe('recommended settings fast path', () => {
+  const discovered = mockDiscoveredAvailable();
+
+  it('accepting recommended skips project/verification/controller sections', async () => {
+    // Fast path: only consumes recommended confirm + roles + provider settings
+    const prompt = mockPrompt([
+      true,             // accept recommended
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    // Fast path → no project fields, no controller fields
+    expect(config.repo).toBeUndefined();
+    expect(config.publishMode).toBeUndefined();
+    expect(config.checks).toBeUndefined();
+  });
+
+  it('declining recommended walks through all sections individually', async () => {
+    const prompt = mockPrompt([
+      false,            // decline fast path
+      'myorg/repo',     // project: repo
+      '', '', '',       // project: baseBranch, remote, tasksFile (defaults)
+      true,             // use default checks
+      'lightweight',    // runtime profile
+      'manual', '',     // controller
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({
+      existingConfig: {},
+      prompt,
+      discovered,
+      detectedRepo: null,
+    });
+    expect(config.repo).toBe('myorg/repo');
+  });
+
+  it('detected repo is included when provided', async () => {
+    const prompt = mockPrompt([
+      true,             // accept recommended
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({
+      existingConfig: {},
+      prompt,
+      discovered,
+      detectedRepo: 'myorg/myrepo',
+    });
+    expect(config.repo).toBe('myorg/myrepo');
+  });
+
+  it('no detected repo still produces valid config', async () => {
+    const prompt = mockPrompt(defaultResponses());
+    const config = await buildConfig({
+      existingConfig: {},
+      prompt,
+      discovered,
+      detectedRepo: null,
+    });
+    expect(config.repo).toBeUndefined();
+  });
+});
+
+/* ================================================================== *
+ * Capability discovery integration                                      *
+ * ================================================================== */
+
+describe('capability discovery integration', () => {
+  it('only available agents appear as selectable options', async () => {
+    // Only claude is available
+    const discovered = {
+      claude: { available: true, path: '/usr/bin/claude' },
+      codex: { available: false, reason: 'not installed' },
+    };
+
+    const prompt = mockPrompt([
+      true,             // recommended: accept fast path
+      'claude',         // planner → claude (manual + claude available)
+      true,             // implementer → claude
+      // auditor: codex not available → no options → skipped
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    // Only planner and implementer have providers
+    expect(config.roles).toBeUndefined(); // all defaults
+  });
+
+  it('unavailable agents show nothing for that role', async () => {
+    // Neither claude nor codex available
+    const discovered = mockDiscoveredUnavailable();
+
+    const prompt = mockPrompt([
+      true,             // recommended: accept fast path
+      true,             // planner → confirm manual (only option)
+      // implementer: claude not available → no options (skipped)
+      // auditor: codex not available → no options (skipped)
+      // providerSettings: no providers → nothing consumed
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    // Only planner has a selected provider (manual is non-default)
+    expect(config.roles).toBeDefined();
+    expect(config.roles.planner).toBe('manual');
+  });
+});
+
+/* ================================================================== *
+ * Explicit role assignment                                              *
+ * ================================================================== */
+
+describe('explicit role assignment', () => {
+  const discovered = mockDiscoveredAvailable();
+
+  it('manual planner is always an option regardless of discovery', async () => {
+    const prompt = mockPrompt([
+      true,             // recommended: accept fast path
+      'manual',         // planner → manual
+      true,             // implementer → claude
+      true,             // auditor → codex
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    expect(config.roles).toBeDefined();
+    expect(config.roles.planner).toBe('manual');
+  });
+
+  it('single provider asks explicit confirmation (no silent assignment)', async () => {
+    // The 'true' for implementer/auditor is the confirm response
+    const prompt = mockPrompt([
+      true,             // recommended: accept fast path
+      'manual',         // planner → select manual
+      true,             // implementer → confirm claude
+      true,             // auditor → confirm codex
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    // Manual planner is non-default → written. implementer/auditor are defaults → omitted.
+    expect(config.roles).toBeDefined();
+    expect(config.roles.planner).toBe('manual');
+    expect(config.roles.implementer).toBeUndefined();
+    expect(config.roles.auditor).toBeUndefined();
+  });
+
+  it('manual planner config saves correctly', async () => {
+    const dir = makeProject();
+    saveConfig({
+      roles: { planner: 'manual', implementer: 'claude', auditor: 'codex' },
+    }, dir);
+
+    // Validate through real config module
+    const result = importConfigField('ROLE_MAPPING', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    const mapping = JSON.parse(result.stdout);
+    expect(mapping.planner).toBe('manual');
+    expect(mapping.implementer).toBe('claude');
+    expect(mapping.auditor).toBe('codex');
+  });
+});
+
+/* ================================================================== *
+ * Runtime check entry UX improvements                                  *
+ * ================================================================== */
+
+describe('runtime check entry UX', () => {
+  const discovered = mockDiscoveredAvailable();
+
+  it('empty name is rejected instead of finishing the loop', async () => {
+    const prompt = mockPrompt([
+      false,            // recommended: decline fast path
+      '', '', '', '',   // project
+      true,             // use default checks
+      'standard',       // profile
+      true,             // configure checks
+      // Empty name → inner while re-prompts
+      '',               // Check name: → '' → rejected, inner loop re-prompts
+      'my-check',       // Check name (retry) → valid
+      'npm run test',   // Command → valid
+      false,            // Add another? → no
+      // Checks exist → exit outer loop
+      'manual', '',     // controller
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    expect(config.runtimeVerification).toBeDefined();
+    expect(config.runtimeVerification.checks).toEqual([
+      { name: 'my-check', command: 'npm run test' },
+    ]);
+  });
+
+  it('empty command is rejected instead of finishing the loop', async () => {
+    const prompt = mockPrompt([
+      false,            // recommended: decline fast path
+      '', '', '', '',   // project
+      true,             // use default checks
+      'standard',       // profile
+      true,             // configure checks
+      'my-check',       // Check name → valid
+      '',               // Command → '' → rejected, inner loop re-prompts
+      'npm run real',   // Command (retry) → valid
+      false,            // Add another? → no
+      'manual', '',     // controller
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    expect(config.runtimeVerification).toBeDefined();
+    expect(config.runtimeVerification.checks).toEqual([
+      { name: 'my-check', command: 'npm run real' },
+    ]);
+  });
+
+  it('duplicate name is rejected and re-prompted', async () => {
+    const prompt = mockPrompt([
+      false,            // recommended: decline fast path
+      '', '', '', '',   // project
+      true,             // use default checks
+      'standard',       // profile
+      true,             // configure checks
+      'my-check',       // name #1 → accepted
+      'npm run test',   // command #1 → accepted
+      true,             // add another? → yes
+      'my-check',       // DUPLICATE name → rejected, inner while re-prompts
+      'unique-check',   // name (retry) → accepted
+      'npm run unique', // command → accepted
+      false,            // add another? → no
+      'manual', '',     // controller
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    expect(config.runtimeVerification).toBeDefined();
+    expect(config.runtimeVerification.checks).toHaveLength(2);
+    expect(config.runtimeVerification.checks[0].name).toBe('my-check');
+    expect(config.runtimeVerification.checks[1].name).toBe('unique-check');
+  });
+
+  it('duplicate command is rejected and re-prompted', async () => {
+    const prompt = mockPrompt([
+      false,            // recommended: decline fast path
+      '', '', '', '',   // project
+      true,             // use default checks
+      'standard',       // profile
+      true,             // configure checks
+      'check-a',        // name #1 → accepted
+      'npm run same',   // command #1 → accepted
+      true,             // add another? → yes
+      'check-b',        // name #2 → accepted
+      'npm run same',   // DUPLICATE command → rejected, inner while re-prompts
+      'npm run diff',   // command (retry) → accepted
+      false,            // add another? → no
+      'manual', '',     // controller
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    expect(config.runtimeVerification).toBeDefined();
+    expect(config.runtimeVerification.checks).toHaveLength(2);
+    expect(config.runtimeVerification.checks[1].command).toBe('npm run diff');
+  });
+
+  it('"add another?" stops the loop when false', async () => {
+    const prompt = mockPrompt([
+      false,            // recommended: decline fast path
+      '', '', '', '',   // project
+      true,             // use default checks
+      'standard',       // profile
+      true,             // configure checks
+      'api-smoke',      // name
+      'npm run test:integration',  // command
+      false,            // add another? → no
+      'manual', '',     // controller
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    expect(config.runtimeVerification).toBeDefined();
+    expect(config.runtimeVerification.checks).toEqual([
+      { name: 'api-smoke', command: 'npm run test:integration' },
+    ]);
+  });
+
+  it('multiple runtime checks can be added', async () => {
+    const prompt = mockPrompt([
+      false,            // recommended: decline fast path
+      '', '', '', '',   // project
+      true,             // use default checks
+      'standard',       // profile
+      true,             // configure checks
+      'check-1',        // name
+      'cmd-1',          // command
+      true,             // add another? → yes
+      'check-2',        // name
+      'cmd-2',          // command
+      true,             // add another? → yes
+      'check-3',        // name
+      'cmd-3',          // command
+      false,            // add another? → no
+      'manual', '',     // controller
+      'manual',         // planner
+      true,             // implementer
+      true,             // auditor
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    expect(config.runtimeVerification.checks).toHaveLength(3);
   });
 });
 

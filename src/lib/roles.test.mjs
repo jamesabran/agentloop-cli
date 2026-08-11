@@ -23,6 +23,7 @@ import {
   defaultRoleMapping,
   getProviderIdentity,
   LOGICAL_ROLES,
+  MANUAL_PLANNER,
   PROVIDER_CAPABILITIES,
   PROVIDER_IDENTITIES,
   resolveProvider,
@@ -201,6 +202,77 @@ describe('resolveProvider rejects invalid configurations', () => {
     // claude might audit in a future release, but not yet
     expect(() => resolveProvider('auditor', { auditor: 'claude' }))
       .toThrow(/Provider "claude" does not support the "auditor" role/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Manual / External Planner                                            *
+ * ------------------------------------------------------------------ */
+
+describe('Manual / External Planner', () => {
+  it('resolveProvider returns manual for planner role', () => {
+    const { provider } = resolveProvider('planner', {
+      planner: MANUAL_PLANNER,
+      implementer: 'claude',
+      auditor: 'codex',
+    });
+    expect(provider).toBe(MANUAL_PLANNER);
+  });
+
+  it('rejects manual for implementer role', () => {
+    expect(() =>
+      resolveProvider('implementer', {
+        planner: 'claude',
+        implementer: MANUAL_PLANNER,
+        auditor: 'codex',
+      }),
+    ).toThrow(/is only valid for the planner role/);
+  });
+
+  it('rejects manual for auditor role', () => {
+    expect(() =>
+      resolveProvider('auditor', {
+        planner: 'claude',
+        implementer: 'claude',
+        auditor: MANUAL_PLANNER,
+      }),
+    ).toThrow(/is only valid for the planner role/);
+  });
+
+  it('getProviderIdentity returns MANUAL for manual planner', () => {
+    expect(getProviderIdentity(MANUAL_PLANNER)).toBe('MANUAL');
+  });
+
+  it('manual does not appear in PROVIDER_CAPABILITIES', () => {
+    expect(PROVIDER_CAPABILITIES[MANUAL_PLANNER]).toBeUndefined();
+  });
+
+  it('planner: manual config loads correctly alongside defaults', () => {
+    const dir = makeProject({
+      config: {
+        roles: { planner: MANUAL_PLANNER },
+      },
+    });
+    const result = importConfigField('ROLE_MAPPING', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    const mapping = JSON.parse(result.stdout);
+    expect(mapping.planner).toBe(MANUAL_PLANNER);
+    expect(mapping.implementer).toBe('claude'); // default
+    expect(mapping.auditor).toBe('codex'); // default
+  });
+
+  it('full config with manual planner loads all three roles', () => {
+    const dir = makeProject({
+      config: {
+        roles: { planner: MANUAL_PLANNER, implementer: 'claude', auditor: 'codex' },
+      },
+    });
+    const result = importConfigField('ROLE_MAPPING', { cwd: dir, env: baseEnv() });
+    expect(result.status).toBe(0);
+    const mapping = JSON.parse(result.stdout);
+    expect(mapping.planner).toBe(MANUAL_PLANNER);
+    expect(mapping.implementer).toBe('claude');
+    expect(mapping.auditor).toBe('codex');
   });
 });
 

@@ -24,7 +24,9 @@ import process from 'node:process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { LOGICAL_ROLES, PROVIDER_CAPABILITIES } from './roles.mjs';
+import { LOGICAL_ROLES, MANUAL_PLANNER, PROVIDER_CAPABILITIES } from './roles.mjs';
+import { discoverAgents } from './discovery.mjs';
+import { parseGithubOwnerRepo } from './git-url.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_MODULE_URL = pathToFileURL(path.join(HERE, 'config.mjs')).href;
 
@@ -47,6 +49,27 @@ function findProjectRoot(startDir) {
   }
 }
 
+/**
+ * Detect the repository owner/name from a git remote.
+ *
+ * Returns `owner/repo` when the remote URL resolves to a GitHub repository,
+ * or `null` when detection fails (no remote, non-GitHub URL, etc.).
+ *
+ * @param {string} projectRoot
+ * @param {string} remote — git remote name (e.g. "origin")
+ * @returns {string|null}
+ */
+function detectRepo(projectRoot, remote) {
+  const result = spawnSync('git', ['remote', 'get-url', remote], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: 5_000,
+  });
+  if (result.status !== 0) return null;
+  return parseGithubOwnerRepo(result.stdout.trim());
+}
+
 /* ------------------------------------------------------------------ *
  * Constants                                                            *
  * ------------------------------------------------------------------ */
@@ -63,8 +86,8 @@ const CLAUDE_PERMISSION_MODES = Object.freeze([
 const CLAUDE_RELAY_MODES = Object.freeze(['interactive', 'auto']);
 
 const RV_PROFILE_CHOICES = Object.freeze([
-  { value: 'lightweight', label: 'Lightweight — runtime verification is NOT required' },
-  { value: 'standard', label: 'Standard — basic smoke / integration checks required' },
+  { value: 'lightweight', label: 'Lightweight — runtime verification is NOT required (static checks only)' },
+  { value: 'standard', label: 'Standard — basic smoke / integration checks required (recommended)' },
   { value: 'integration', label: 'Integration — full integration suite required' },
   { value: 'custom', label: 'Custom — project-defined verification commands' },
 ]);
@@ -75,6 +98,80 @@ const DEFAULT_CHECKS = Object.freeze([
   { name: 'test', script: 'test' },
   { name: 'build', script: 'build' },
 ]);
+
+/** Provider defaults — used to omit default values from saved config. */
+const PROVIDER_DEFAULTS = Object.freeze({
+  claude: Object.freeze({ permissionMode: 'acceptEdits', relayMode: 'interactive' }),
+});
+
+/** Human-readable display names for providers. */
+const PROVIDER_DISPLAY = Object.freeze({
+  claude: 'Claude',
+  codex: 'Codex',
+});
+
+/**
+ * Claude provider-specific settings handler.
+ *
+ * Extracted from the old inline sectionProviderSettings so it can be
+ * registered in PROVIDER_SETTINGS and only invoked when Claude is selected
+ * for at least one role.
+ */
+async function claudeSettingsHandler(existing, prompt) {
+  const existingClaude = (existing.claude && typeof existing.claude === 'object')
+    ? existing.claude
+    : {};
+
+  const currentPerm = CLAUDE_PERMISSION_MODES.includes(existingClaude.permissionMode)
+    ? existingClaude.permissionMode
+    : 'acceptEdits';
+  const permissionMode = await prompt.select(
+    'Claude permission mode (--permission-mode flag):',
+    [
+      { value: 'default', label: 'default — prompt for each tool use' },
+      { value: 'acceptEdits', label: 'acceptEdits — auto-approve file edits (recommended)' },
+      { value: 'bypassPermissions', label: 'bypassPermissions — skip all permission prompts (not recommended)' },
+      { value: 'plan', label: 'plan — read-only mode, no edits' },
+    ],
+    currentPerm,
+  );
+  prompt.display('');
+
+  const currentRelay = CLAUDE_RELAY_MODES.includes(existingClaude.relayMode)
+    ? existingClaude.relayMode
+    : 'interactive';
+  const relayMode = await prompt.select(
+    'ALCLI relay mode (permission requests outside the allowlist):',
+    [
+      { value: 'interactive', label: 'Interactive — relay to terminal for user approval (safe default)' },
+      { value: 'auto', label: 'Auto — auto-approve after hard-deny checks (unattended operation)' },
+    ],
+    currentRelay,
+  );
+
+  return {
+    claude: {
+      ...(permissionMode !== 'acceptEdits' ? { permissionMode } : {}),
+      ...(relayMode !== 'interactive' ? { relayMode } : {}),
+    },
+  };
+}
+
+/**
+ * Provider-specific settings registry.
+ *
+ * Maps provider names to their settings sections.  Adding a new provider
+ * with configurable settings means adding an entry here and supplying the
+ * settings handler.  Only providers selected for at least one role receive
+ * their settings section during setup.
+ */
+const PROVIDER_SETTINGS = Object.freeze({
+  claude: {
+    label: 'Claude Provider Settings',
+    handler: claudeSettingsHandler,
+  },
+  // codex has no provider-specific settings currently.
+});
 
 /* ------------------------------------------------------------------ *
  * Prompt interface                                                     *
@@ -206,17 +303,90 @@ function validateAgainstConfigModule(configPath, { env } = {}) {
  * ------------------------------------------------------------------ */
 
 /**
+ * Section 0 — Recommended settings fast path.
+ *
+ * Detects the repository from git remote and offers a fast path that
+ * auto-applies sensible defaults for project, verification, and controller
+ * settings.  Agent role selection is NOT included — the user must still
+ * explicitly configure Planner, Implementer, and Auditor.
+ *
+ * @param {object} existing — current config values (may be {})
+ * @param {object} prompt — prompt interface
+ * @param {string|null} detectedRepo — pre-detected repository, or null
+ * @returns {Promise<object>} { fastPath: boolean, detectedRepo: string|null }
+ */
+async function sectionRecommended(existing, prompt, detectedRepo) {
+  prompt.section('Project Settings');
+
+  if (detectedRepo) {
+    prompt.display(`  Repository detected: ${detectedRepo}`);
+  } else {
+    prompt.display('  No repository detected from git remote.');
+  }
+
+  const useRecommended = await prompt.confirm(
+    'Use recommended project settings?',
+    true,
+  );
+
+  return {
+    fastPath: useRecommended,
+    detectedRepo,
+  };
+}
+
+/**
+ * Section 0.5 — Agent capability discovery.
+ *
+ * Discovers which agents are actually usable on this machine and displays
+ * the results so the user can see what is available before making role
+ * assignments.
+ *
+ * @param {object} prompt — prompt interface
+ * @returns {Promise<Record<string, {available: boolean, reason?: string, path?: string}>>}
+ */
+async function sectionDiscovery(prompt) {
+  prompt.section('Available Agents');
+  prompt.display('');
+
+  const discovered = discoverAgents();
+
+  for (const [provider, result] of Object.entries(discovered)) {
+    const label = PROVIDER_DISPLAY[provider] || provider;
+    if (result.available) {
+      prompt.display(`  ✓ ${label}`);
+    } else {
+      prompt.display(`  ✗ ${label} — ${result.reason || 'not installed/configured'}`);
+    }
+  }
+
+  prompt.display('');
+  return discovered;
+}
+
+/**
  * Section 1 — Project identification.
  *
  * @param {object} existing — current config values (may be {})
  * @param {object} prompt — prompt interface
  * @returns {Promise<object>} config fragment
  */
-async function sectionProject(existing, prompt) {
+async function sectionProject(existing, prompt, detectedRepo = undefined) {
   prompt.section('Project');
 
+  // Resolve the repo default.  When detectedRepo is explicitly provided
+  // (even as null, meaning "no repo detected"), use it directly.  When it
+  // is undefined (not passed at all), auto-detect from the git remote.
+  const resolvedDefault = detectedRepo !== undefined
+    ? (detectedRepo || existing.repo || undefined)
+    : (existing.repo || detectRepo(findProjectRoot(process.cwd()), existing.remote || 'origin') || undefined);
+
+  const repoDisplay = resolvedDefault
+    ? `${resolvedDefault}`
+    : '(auto-detect from git remote)';
+
   const repo = await prompt.question(
-    `  Repository (owner/repo) [${existing.repo || '(auto-detect from git remote)'}]: `,
+    `  Repository (owner/repo) [${repoDisplay}]: `,
   );
   const baseBranch = await prompt.question(
     `  Base branch [${existing.baseBranch || 'main'}]: `,
@@ -228,8 +398,10 @@ async function sectionProject(existing, prompt) {
     `  Task-file path (relative to repo root) [${existing.tasksFile || 'agentloop.tasks.json'}]: `,
   );
 
+  const resolvedRepo = repo.trim() || resolvedDefault || undefined;
+
   return {
-    ...(repo.trim() ? { repo: repo.trim() } : (existing.repo ? { repo: existing.repo } : {})),
+    ...(resolvedRepo ? { repo: resolvedRepo } : {}),
     ...(baseBranch.trim() ? { baseBranch: baseBranch.trim() } : (existing.baseBranch ? { baseBranch: existing.baseBranch } : {})),
     ...(remote.trim() ? { remote: remote.trim() } : (existing.remote ? { remote: existing.remote } : {})),
     ...(tasksFile.trim() ? { tasksFile: tasksFile.trim() } : (existing.tasksFile ? { tasksFile: existing.tasksFile } : {})),
@@ -240,13 +412,18 @@ async function sectionProject(existing, prompt) {
  * Section 2 — Agent roles.
  *
  * Each logical role (planner, implementer, auditor) is mapped to a provider.
- * The available providers are those that support the role.
+ * The user chooses from agents that are both supported for the role AND
+ * currently available according to capability discovery.
+ *
+ * Manual / External Planner is always available for the planner role
+ * regardless of discovery results.
  *
  * @param {object} existing — current config values
  * @param {object} prompt — prompt interface
+ * @param {object} discovered — results from discoverAgents()
  * @returns {Promise<object>} config fragment with `roles`
  */
-async function sectionRoles(existing, prompt) {
+async function sectionRoles(existing, prompt, discovered) {
   prompt.section('Agent Roles');
 
   const existingRoles = existing.roles || {};
@@ -259,32 +436,59 @@ async function sectionRoles(existing, prompt) {
   };
 
   for (const role of LOGICAL_ROLES) {
-    const currentProvider =
-      (typeof existingRoles[role] === 'string' && existingRoles[role].trim()) ||
-      null;
+    const opts = [];
 
-    // Which providers support this role?
-    const available = Object.entries(PROVIDER_CAPABILITIES)
+    // Manual / External Planner is always available — it requires no agent.
+    if (role === 'planner') {
+      opts.push({
+        value: MANUAL_PLANNER,
+        label: 'Manual / External Planner — you supply pre-approved tasks; ALCLI does not launch a planning agent',
+      });
+    }
+
+    // Add discovered providers that support this role AND are available.
+    const capable = Object.entries(PROVIDER_CAPABILITIES)
       .filter(([, caps]) => caps.includes(role))
       .map(([provider]) => provider);
 
-    if (available.length === 0) {
-      prompt.display(`  ${role}: no providers available — skipping`);
-      continue;
+    for (const provider of capable) {
+      if (discovered[provider]?.available === true) {
+        const display = PROVIDER_DISPLAY[provider] || provider;
+        opts.push({ value: provider, label: display });
+      }
     }
 
-    if (available.length === 1) {
-      const only = available[0];
-      const marker = currentProvider === only ? ' (default)' : '';
-      prompt.display(`  ${role}: ${only}${marker} (only provider that supports this role)`);
-      roles[role] = only;
+    if (opts.length === 0) {
+      prompt.display(`  ${role}: no available providers — skipping`);
       continue;
     }
 
     prompt.display(`  ${ROLE_LABELS[role]}`);
-    const options = available.map((p) => ({ value: p, label: p }));
-    const def = currentProvider || available[0];
-    roles[role] = await prompt.select('Provider:', options, def);
+
+    // Determine a sensible default: respect existing config if the
+    // previously selected provider is still available, otherwise use
+    // the first option.
+    const currentProvider =
+      (typeof existingRoles[role] === 'string' && existingRoles[role].trim()) || null;
+    const defaultOption = opts.find((o) => o.value === currentProvider)
+      ? opts[currentProvider ? opts.findIndex((o) => o.value === currentProvider) : 0]
+      : opts[0];
+    const defaultValue = defaultOption ? defaultOption.value : opts[0].value;
+
+    if (opts.length === 1) {
+      // Single option: confirm explicitly rather than silently assigning.
+      prompt.display(`    ${opts[0].label}`);
+      const confirmed = await prompt.confirm(
+        `  Use for ${role}?`,
+        true,
+      );
+      if (confirmed) {
+        roles[role] = opts[0].value;
+      }
+    } else {
+      roles[role] = await prompt.select('Provider:', opts, defaultValue);
+    }
+
     prompt.display('');
   }
 
@@ -294,35 +498,43 @@ async function sectionRoles(existing, prompt) {
 /**
  * Section 3 — Verification.
  *
- * Deterministic checks (typecheck, lint, test, build) and runtime verification
- * profile (lightweight, standard, integration, custom).
+ * Deterministic checks (compile, lint, test, build) and runtime verification
+ * profile selection.  Uses plain-language descriptions first, technical
+ * details second.
  *
  * @param {object} existing — current config values
  * @param {object} prompt — prompt interface
  * @returns {Promise<object>} config fragment
  */
 async function sectionVerification(existing, prompt) {
-  prompt.section('Verification');
+  prompt.section('Automatic Project Checks');
+
+  prompt.display('  Before ALCLI sends work for audit, it can verify that:');
+  prompt.display('');
+  prompt.display('    ✓ The code compiles correctly');
+  prompt.display('    ✓ Code-quality checks pass');
+  prompt.display('    ✓ Automated tests pass');
+  prompt.display('    ✓ The production build succeeds');
+  prompt.display('');
 
   // --- Deterministic checks ---
   const existingChecks = existing.checks || [];
   const hasCustomChecks = existingChecks.length > 0;
 
-  prompt.display('  Deterministic checks (run before each audit):');
+  prompt.display('  Advanced: typecheck, lint, test, build');
+  prompt.display('');
   if (hasCustomChecks) {
-    prompt.display(`    Currently: ${existingChecks.map((c) => `${c.name}=${c.script}`).join(', ')}`);
-  } else {
-    prompt.display(`    Default: ${DEFAULT_CHECKS.map((c) => c.name).join(', ')}`);
+    prompt.display(`    Currently configured: ${existingChecks.map((c) => `${c.name}=${c.script}`).join(', ')}`);
   }
 
-  const useDefaults = await prompt.confirm('Use default checks (typecheck, lint, test, build)?', !hasCustomChecks);
+  const useDefaults = await prompt.confirm('Use these recommended checks?', !hasCustomChecks);
 
   let checks;
   if (useDefaults) {
     checks = DEFAULT_CHECKS.map((c) => ({ ...c }));
   } else {
     checks = [];
-    prompt.display('  Enter checks one at a time (empty name to finish):');
+    prompt.display('  Enter checks one at a time.');
     let idx = 1;
     while (true) {
       const name = await prompt.question(`    Check #${idx} name: `);
@@ -349,11 +561,17 @@ async function sectionVerification(existing, prompt) {
   // --- Runtime verification ---
   const existingRv = existing.runtimeVerification || {};
   prompt.display('');
-  prompt.display('  Runtime verification profile:');
+  prompt.display('  Runtime Checks');
+  prompt.display('');
+  prompt.display('  ALCLI can run the project and verify that it actually works,');
+  prompt.display('  not just that the code passes automated checks.');
+  prompt.display('');
+  prompt.display('  How thoroughly should ALCLI check the running project?');
+  prompt.display('');
 
-  const currentProfile = existingRv.profile || 'lightweight';
+  const currentProfile = existingRv.profile || 'standard';
   const profile = await prompt.select(
-    'Select the baseline runtime verification requirement for this project:',
+    'Select the runtime verification level:',
     RV_PROFILE_CHOICES,
     currentProfile,
   );
@@ -363,10 +581,12 @@ async function sectionVerification(existing, prompt) {
   if (profile !== 'lightweight') {
     const existingRvChecks = existingRv.checks || [];
     const hasRvChecks = existingRvChecks.length > 0;
+    const usedNames = new Set();
+    const usedCommands = new Set();
 
-    // Required profiles (standard / integration / custom) need at least one
-    // check so the runtime gate is not silently bypassed.  Loop until the
-    // user provides at least one, up to a safety limit.
+    // Required profiles need at least one check so the runtime gate is
+    // not silently bypassed.  Loop until the user provides at least one,
+    // up to a safety limit.
     const MAX_RV_ATTEMPTS = 5;
     let firstPass = true;
     let attempts = 0;
@@ -374,13 +594,13 @@ async function sectionVerification(existing, prompt) {
       attempts += 1;
       if (!firstPass) {
         prompt.display('');
-        prompt.display('    At least one runtime check is required for this profile.');
-        prompt.display('    Without checks, every task that requires runtime verification will fail.');
+        prompt.display('    A runtime check is required for this profile.');
+        prompt.display('    Without any checks, every task requiring runtime verification will fail.');
       }
       firstPass = false;
 
       if (hasRvChecks) {
-        prompt.display(`    Current checks: ${existingRvChecks.map((c) => c.name).join(', ')}`);
+        prompt.display(`    Existing checks: ${existingRvChecks.map((c) => c.name).join(', ')}`);
       }
       const configureRv = await prompt.confirm(
         'Configure runtime verification commands?',
@@ -396,24 +616,57 @@ async function sectionVerification(existing, prompt) {
         continue;
       }
 
-      prompt.display('    Enter runtime check commands one at a time (empty name to finish):');
-      let idx = 1;
-      while (true) {
-        const name = await prompt.question(`      Check #${idx} name: `);
-        if (!name.trim()) break;
-        if (!isValidCheckName(name.trim())) {
-          prompt.display(`      Invalid name — must match ${CHECK_TOKEN}. Skipping.`);
-          continue;
+      prompt.display('    Enter runtime checks one at a time.');
+      prompt.display('    Example: name=api-smoke, command=npm run test:integration');
+      prompt.display('');
+
+      do {
+        // --- Name ---
+        let enteredName;
+        while (true) {
+          enteredName = await prompt.question('      Check name: ');
+          if (!enteredName.trim()) {
+            prompt.display('      Name is required.');
+            continue;
+          }
+          if (!isValidCheckName(enteredName.trim())) {
+            prompt.display(`      Invalid name — must match ${CHECK_TOKEN}.`);
+            continue;
+          }
+          if (usedNames.has(enteredName.trim())) {
+            prompt.display(`      A check named "${enteredName.trim()}" already exists.`);
+            continue;
+          }
+          break;
         }
-        const command = await prompt.question(`      Check #${idx} command (e.g. "npm run test:integration"): `);
-        if (!command.trim()) break;
-        if (!isValidRvCommand(command.trim())) {
-          prompt.display(`      Invalid command — must match ${COMMAND_TOKEN}. Skipping.`);
-          continue;
+        enteredName = enteredName.trim();
+
+        // --- Command ---
+        let enteredCommand;
+        while (true) {
+          enteredCommand = await prompt.question('      Command (e.g. "npm run test:integration"): ');
+          if (!enteredCommand.trim()) {
+            prompt.display('      Command is required.');
+            continue;
+          }
+          if (!isValidRvCommand(enteredCommand.trim())) {
+            prompt.display(`      Invalid command — must match ${COMMAND_TOKEN}.`);
+            continue;
+          }
+          if (usedCommands.has(enteredCommand.trim())) {
+            prompt.display(`      Command "${enteredCommand.trim()}" is already used by another check.`);
+            continue;
+          }
+          break;
         }
-        rvChecks.push({ name: name.trim(), command: command.trim() });
-        idx += 1;
-      }
+        enteredCommand = enteredCommand.trim();
+
+        // Record
+        rvChecks.push({ name: enteredName, command: enteredCommand });
+        usedNames.add(enteredName);
+        usedCommands.add(enteredCommand);
+        prompt.display(`      ✓ Added: ${enteredName} → ${enteredCommand}`);
+      } while (await prompt.confirm('  Add another runtime check?', false));
     }
 
     if (rvChecks.length === 0) {
@@ -500,8 +753,8 @@ async function sectionController(existing, prompt) {
  * Section 5 — Provider-specific settings.
  *
  * Only shown for providers that are assigned to at least one role in the
- * current mapping.  Claude permission mode and relay mode only appear when
- * Claude is used.
+ * current mapping.  The registry (PROVIDER_SETTINGS) determines which
+ * providers have configurable settings and how to collect them.
  *
  * @param {object} existing — current config values
  * @param {object} roles — the resolved role mapping ({ planner, implementer, auditor })
@@ -510,61 +763,46 @@ async function sectionController(existing, prompt) {
  */
 async function sectionProviderSettings(existing, prompt, roles) {
   const usedProviders = new Set(Object.values(roles));
+  // Remove manual — it is not a real provider with settings.
+  usedProviders.delete(MANUAL_PLANNER);
 
-  if (!usedProviders.has('claude')) return {};
+  const result = {};
 
-  prompt.section('Claude Provider Settings');
+  for (const [provider, { label, handler }] of Object.entries(PROVIDER_SETTINGS)) {
+    if (usedProviders.has(provider)) {
+      prompt.section(label);
+      const settings = await handler(existing, prompt);
+      if (settings && typeof settings === 'object') {
+        Object.assign(result, settings);
+      }
+    }
+  }
 
-  const existingClaude = (existing.claude && typeof existing.claude === 'object')
-    ? existing.claude
-    : {};
-
-  // Permission mode
-  const currentPerm = CLAUDE_PERMISSION_MODES.includes(existingClaude.permissionMode)
-    ? existingClaude.permissionMode
-    : 'acceptEdits';
-  const permissionMode = await prompt.select(
-    'Claude permission mode (--permission-mode flag):',
-    [
-      { value: 'default', label: 'default — prompt for each tool use' },
-      { value: 'acceptEdits', label: 'acceptEdits — auto-approve file edits (recommended)' },
-      { value: 'bypassPermissions', label: 'bypassPermissions — skip all permission prompts (not recommended)' },
-      { value: 'plan', label: 'plan — read-only mode, no edits' },
-    ],
-    currentPerm,
-  );
-  prompt.display('');
-
-  // Relay mode (ALCLI-specific)
-  const currentRelay = CLAUDE_RELAY_MODES.includes(existingClaude.relayMode)
-    ? existingClaude.relayMode
-    : 'interactive';
-  const relayMode = await prompt.select(
-    'ALCLI relay mode (permission requests outside the allowlist):',
-    [
-      {
-        value: 'interactive',
-        label: 'Interactive — relay to terminal for user approval (safe default)',
-      },
-      {
-        value: 'auto',
-        label: 'Auto — auto-approve after hard-deny checks (unattended operation)',
-      },
-    ],
-    currentRelay,
-  );
-
-  return {
-    claude: {
-      ...(permissionMode !== 'acceptEdits' ? { permissionMode } : {}),
-      ...(relayMode !== 'interactive' ? { relayMode } : {}),
-    },
-  };
+  return result;
 }
 
 /* ------------------------------------------------------------------ *
  * Config assembly & persistence                                        *
  * ------------------------------------------------------------------ */
+
+/**
+ * Strip provider settings that match defaults so the saved config is
+ * minimal.  Each provider declares its defaults in PROVIDER_DEFAULTS.
+ *
+ * @param {string} provider
+ * @param {object} settings
+ * @returns {object} settings with default-valued keys removed
+ */
+function normaliseProviderSettings(provider, settings) {
+  const defaults = PROVIDER_DEFAULTS[provider] || {};
+  const result = {};
+  for (const [key, value] of Object.entries(settings)) {
+    if (value !== undefined && value !== defaults[key]) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
 
 /**
  * Build a complete `agentloop.config.json` object from the collected
@@ -633,16 +871,14 @@ export function assembleConfig(fragments) {
     config.maxChangeRounds = controller.maxChangeRounds;
   }
 
-  // Provider settings — only write non-default values.
-  if (providerSettings.claude && typeof providerSettings.claude === 'object') {
-    const claude = {};
-    if (providerSettings.claude.permissionMode && providerSettings.claude.permissionMode !== 'acceptEdits') {
-      claude.permissionMode = providerSettings.claude.permissionMode;
+  // Provider settings — only write non-default values for any provider.
+  for (const [provider, settings] of Object.entries(providerSettings)) {
+    if (settings && typeof settings === 'object') {
+      const normalised = normaliseProviderSettings(provider, settings);
+      if (Object.keys(normalised).length > 0) {
+        config[provider] = normalised;
+      }
     }
-    if (providerSettings.claude.relayMode && providerSettings.claude.relayMode !== 'interactive') {
-      claude.relayMode = providerSettings.claude.relayMode;
-    }
-    if (Object.keys(claude).length > 0) config.claude = claude;
   }
 
   return config;
@@ -734,7 +970,11 @@ export function formatSummary(config, roles) {
   lines.push('  Agent Roles');
   for (const role of LOGICAL_ROLES) {
     const provider = roles[role] || (role === 'auditor' ? 'codex' : 'claude');
-    lines.push(`    ${role}: ${provider}`);
+    if (role === 'planner' && provider === MANUAL_PLANNER) {
+      lines.push(`    ${role}: Manual / External Planner`);
+    } else {
+      lines.push(`    ${role}: ${provider}`);
+    }
   }
 
   // Verification
@@ -761,19 +1001,29 @@ export function formatSummary(config, roles) {
   lines.push(`    Publish mode:       ${config.publishMode || 'manual'}`);
   lines.push(`    Max change rounds:  ${config.maxChangeRounds ?? 2}`);
 
-  // Provider settings
-  if (config.claude) {
+  // Provider settings — only for providers actually selected.
+  const usedProviders = new Set(Object.values(roles));
+  usedProviders.delete(MANUAL_PLANNER);
+
+  for (const provider of usedProviders) {
+    const providerConfig = config[provider] || {};
     lines.push('');
-    lines.push('  Claude Provider Settings');
-    if (config.claude.permissionMode) {
-      lines.push(`    Permission mode:  ${config.claude.permissionMode}`);
-    } else {
-      lines.push('    Permission mode:  acceptEdits (default)');
+    const display = PROVIDER_DISPLAY[provider]
+      ? `${PROVIDER_DISPLAY[provider]} Provider Settings`
+      : `${provider} Provider Settings`;
+    lines.push(`  ${display}`);
+
+    // Show saved values
+    for (const [key, value] of Object.entries(providerConfig)) {
+      lines.push(`    ${key}: ${value}`);
     }
-    if (config.claude.relayMode) {
-      lines.push(`    Relay mode:       ${config.claude.relayMode}`);
-    } else {
-      lines.push('    Relay mode:       interactive (default)');
+
+    // Show defaults for known settings keys not present in config
+    const defaults = PROVIDER_DEFAULTS[provider] || {};
+    for (const [key, defaultValue] of Object.entries(defaults)) {
+      if (!(key in providerConfig)) {
+        lines.push(`    ${key}: ${defaultValue} (default)`);
+      }
     }
   }
 
@@ -822,19 +1072,41 @@ export async function runSetup({
       prompt.display('  ═══════════════════════════════════════════════════════');
     }
 
-    // Section 1: Project
-    const project = await sectionProject(existing, prompt);
+    // Section 0: Recommended settings fast path
+    // Detect repo before sectionRecommended so the display is accurate.
+    const detectedRepo = detectRepo(projectRoot, existing.remote || 'origin');
+    const recommended = await sectionRecommended(existing, prompt, detectedRepo);
 
-    // Section 2: Agent Roles
-    const { roles } = await sectionRoles(existing, prompt);
+    let project, verification, controller;
 
-    // Section 3: Verification
-    const verification = await sectionVerification(existing, prompt);
+    if (recommended.fastPath) {
+      // Auto-apply sensible defaults for project/verification/controller.
+      // Agent role selection is NOT included — the user must still choose.
+      project = {
+        ...(detectedRepo ? { repo: detectedRepo } : {}),
+      };
+      verification = {};
+      controller = {};
+      prompt.display('  ✓ Using recommended project settings.');
+      prompt.display('  Agent roles must still be configured explicitly.');
+    } else {
+      // Section 1: Project
+      project = await sectionProject(existing, prompt);
 
-    // Section 4: Controller
-    const controller = await sectionController(existing, prompt);
+      // Section 3: Verification
+      verification = await sectionVerification(existing, prompt);
 
-    // Section 5: Provider-specific settings
+      // Section 4: Controller
+      controller = await sectionController(existing, prompt);
+    }
+
+    // Section 0.5: Agent capability discovery (always runs)
+    const discovered = await sectionDiscovery(prompt);
+
+    // Section 2: Agent Roles (always runs — with discovery results)
+    const { roles } = await sectionRoles(existing, prompt, discovered);
+
+    // Section 5: Provider-specific settings (always runs — for selected providers)
     const providerSettings = await sectionProviderSettings(existing, prompt, roles);
 
     // Assemble
@@ -1071,16 +1343,46 @@ export async function runSetup({
  * Each section handler is called with the given prompt interface so tests can
  * supply canned responses.  Returns the assembled config without writing to disk.
  *
+ * Follows the same sequence as `runSetup`: recommended fast path → discovery →
+ * roles → provider settings.  Tests can inject pre-computed discovery results
+ * and a detected repo to avoid I/O.
+ *
  * @param {object} options
  * @param {object} [options.existingConfig] — current config values (default: {})
  * @param {object} options.prompt — prompt interface (must supply all methods)
+ * @param {object|null} [options.discovered] — pre-computed discovery results (default: run discoverAgents)
+ * @param {string|null} [options.detectedRepo] — pre-detected repository (default: null)
  * @returns {Promise<object>} the assembled config
  */
-export async function buildConfig({ existingConfig = {}, prompt }) {
-  const project = await sectionProject(existingConfig, prompt);
-  const { roles } = await sectionRoles(existingConfig, prompt);
-  const verification = await sectionVerification(existingConfig, prompt);
-  const controller = await sectionController(existingConfig, prompt);
+export async function buildConfig({
+  existingConfig = {},
+  prompt,
+  discovered = null,
+  detectedRepo = null,
+}) {
+  const d = discovered ?? discoverAgents();
+
+  // Section 0: Recommended settings
+  const recommended = await sectionRecommended(existingConfig, prompt, detectedRepo);
+
+  let project, verification, controller;
+
+  if (recommended.fastPath) {
+    project = {
+      ...(recommended.detectedRepo ? { repo: recommended.detectedRepo } : {}),
+    };
+    verification = {};
+    controller = {};
+  } else {
+    project = await sectionProject(existingConfig, prompt, detectedRepo);
+    verification = await sectionVerification(existingConfig, prompt);
+    controller = await sectionController(existingConfig, prompt);
+  }
+
+  // Agent Roles (always — with discovery results)
+  const { roles } = await sectionRoles(existingConfig, prompt, d);
+
+  // Provider-specific settings (always — for selected providers)
   const providerSettings = await sectionProviderSettings(existingConfig, prompt, roles);
 
   return assembleConfig({

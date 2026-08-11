@@ -14,6 +14,15 @@
 export const LOGICAL_ROLES = Object.freeze(['planner', 'implementer', 'auditor']);
 
 /**
+ * Value for the planner role when no agent is launched.
+ *
+ * The user supplies a pre-approved implementation task — planning may have
+ * been done by a human, ChatGPT, another tool, or an external process.
+ * ALCLI does not launch a planning agent in this configuration.
+ */
+export const MANUAL_PLANNER = 'manual';
+
+/**
  * Which logical roles each supported provider can fill.
  *
  * "claude" supports planner and implementer — it is the default workhorse.
@@ -73,6 +82,17 @@ export function resolveProvider(role, mapping) {
       `No provider configured for role "${role}". ` +
         `Configured roles: ${JSON.stringify(mapping)}.`,
     );
+  }
+
+  // Manual / External Planner is not a real provider — it signals that
+  // ALCLI does not launch a planning agent.  It is only valid for planner.
+  if (provider === MANUAL_PLANNER) {
+    if (role !== 'planner') {
+      throw new Error(
+        `"${MANUAL_PLANNER}" is only valid for the planner role, not "${role}".`,
+      );
+    }
+    return { provider: MANUAL_PLANNER };
   }
 
   const capabilities = PROVIDER_CAPABILITIES[provider];
