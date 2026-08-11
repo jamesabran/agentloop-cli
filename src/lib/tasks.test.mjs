@@ -104,6 +104,31 @@ describe('resolveTaskFilePath', () => {
     expect(() => resolveTaskFilePath('C:\\tasks.json', repo)).toThrow(/absolute path/);
   });
 
+  it('rejects Windows absolute paths regardless of the host OS', () => {
+    const repo = makeRepo();
+    // Forward-slash variant of a drive-letter path.
+    expect(() => resolveTaskFilePath('C:/tasks.json', repo)).toThrow(/absolute path/);
+    // Lower-case drive letter.
+    expect(() => resolveTaskFilePath('d:\\path\\to\\tasks.json', repo)).toThrow(/absolute path/);
+  });
+
+  it('rejects Windows UNC paths regardless of the host OS', () => {
+    const repo = makeRepo();
+    expect(() => resolveTaskFilePath('\\\\server\\share\\tasks.json', repo)).toThrow(/absolute path/);
+    expect(() => resolveTaskFilePath('//server/share/tasks.json', repo)).toThrow(/absolute path/);
+  });
+
+  it('does not reject drive-relative paths (C:file — not absolute on any platform)', () => {
+    const repo = makeRepo();
+    // A drive-relative path like C:file.txt is NOT absolute on Windows — it
+    // resolves relative to the current directory on that drive.  Only
+    // C:\...  or C:/...  is absolute.
+    const resolved = resolveTaskFilePath('C:relative-tasks.json', repo);
+    // On Windows this would be resolved against the repo root (harmless).
+    // The key property is the function does not throw.
+    expect(resolved).toBe(path.resolve(repo, 'C:relative-tasks.json'));
+  });
+
   it('rejects a path that traverses outside the repository', () => {
     const repo = makeRepo();
     expect(() => resolveTaskFilePath('../../../etc/tasks.json', repo)).toThrow(

@@ -67,6 +67,32 @@ export function isValidTaskId(id) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Cross-platform path helpers                                         *
+ * ------------------------------------------------------------------ */
+
+/**
+ * Detect absolute paths regardless of the host OS.
+ *
+ * Node's {@link path.isAbsolute} is platform-specific: on POSIX it does
+ * not recognise Windows drive-letter paths (`C:\foo`) or UNC paths as
+ * absolute.  When ALCLI rejects absolute paths for configuration
+ * fields the rejection must be consistent on every platform.
+ *
+ * @param {string} p
+ * @returns {boolean}
+ */
+function isAbsoluteCrossPlatform(p) {
+  // POSIX absolute (covers `/`, `//server/share` on POSIX)
+  if (path.isAbsolute(p)) return true;
+  // Windows drive letter: C:\ or C:/
+  if (/^[a-zA-Z]:[/\\]/.test(p)) return true;
+  // Windows UNC: \\server\share or //server/share (the latter is also
+  // recognised as POSIX-absolute by Node, but be explicit.)
+  if (/^[/\\]{2}[^/\\]/.test(p)) return true;
+  return false;
+}
+
+/* ------------------------------------------------------------------ *
  * Path resolution                                                     *
  * ------------------------------------------------------------------ */
 
@@ -86,8 +112,12 @@ export function resolveTaskFilePath(configured, repoRoot) {
     throw new Error('The configured task-file path must not be empty.');
   }
 
-  // Reject absolute paths
-  if (path.isAbsolute(relative)) {
+  // Reject absolute paths — must recognise both POSIX and Windows forms
+  // regardless of the host OS.  Node's path.isAbsolute() is
+  // platform-specific: on POSIX it rejects C:\foo even though that path
+  // is absolute on Windows and should never be resolved relative to a
+  // repository root.
+  if (isAbsoluteCrossPlatform(relative)) {
     throw new Error(
       `The task-file path ${JSON.stringify(relative)} must be relative to the repository root, ` +
         'not an absolute path.',

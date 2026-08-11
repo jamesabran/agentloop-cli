@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { assertRemoteMatchesRepo, parseGithubOwnerRepo } from './git.mjs';
+import { parseGithubOwnerRepo } from './git.mjs';
 
 // ---------------------------------------------------------------------------
 // Test-runner compatibility
@@ -143,12 +143,131 @@ describe('parseGithubOwnerRepo', () => {
 });
 
 describe('assertRemoteMatchesRepo', () => {
-  it('resolves without throwing when origin is the repository this checkout actually has', async () => {
-    // REPO is resolved from this project's own `origin` remote (or
-    // agentloop.config.json) at load time, so it is always the ground truth
-    // `assertRemoteMatchesRepo` checks against — this proves the two stay in
-    // agreement for whatever project the controller happens to be running in.
-    await expect(assertRemoteMatchesRepo()).resolves.toBeUndefined();
+  it('resolves without throwing when the remote matches the pinned repository', () => {
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-git-rm-'));
+    tempDirs.push(project);
+
+    spawnSync('git', ['init', '--quiet'], { cwd: project });
+    spawnSync('git', ['config', 'user.email', 'test@test.test'], { cwd: project });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: project });
+
+    // A GitHub-style origin remote that parseGithubOwnerRepo recognises.
+    spawnSync('git', [
+      'remote', 'add', 'origin',
+      'https://github.com/test-org/test-repo.git',
+    ], { cwd: project });
+
+    // The pinned repository boundary that assertRemoteMatchesRepo must verify.
+    var pinnedRepo = 'test-org/test-repo';
+
+    var gitUrl = pathToFileURL(path.resolve(HERE, 'git.mjs')).href;
+
+    var testScript = ''
+      + 'import { assertRemoteMatchesRepo } from ' + JSON.stringify(gitUrl) + ';\n'
+      + 'try {\n'
+      + '  await assertRemoteMatchesRepo();\n'
+      + '  process.stdout.write(JSON.stringify({ ok: true }));\n'
+      + '} catch (e) {\n'
+      + '  process.stdout.write(JSON.stringify({\n'
+      + '    ok: false,\n'
+      + '    message: e.message,\n'
+      + '  }));\n'
+      + '}\n';
+
+    var scriptFile = path.join(project, '_assert-remote-test.mjs');
+    fs.writeFileSync(scriptFile, testScript, 'utf8');
+
+    var result = spawnSync(
+      process.execPath,
+      [scriptFile],
+      {
+        cwd: project,
+        env: {
+          ...process.env,
+          AGENTLOOP_REPO: pinnedRepo,
+          AGENTLOOP_BASE_BRANCH: 'main',
+        },
+        encoding: 'utf8',
+        timeout: 15000,
+      },
+    );
+
+    expect(result.status).toBe(0);
+
+    var jsonStart = result.stdout.indexOf('{"ok":');
+    expect(jsonStart).not.toBe(-1);
+    var data = JSON.parse(result.stdout.slice(jsonStart));
+    expect(data.ok).toBe(true);
+  });
+
+  it('throws when the remote does not match the pinned repository', () => {
+    var project = fs.mkdtempSync(path.join(os.tmpdir(), 'agentloop-git-rm-'));
+    tempDirs.push(project);
+
+    spawnSync('git', ['init', '--quiet'], { cwd: project });
+    spawnSync('git', ['config', 'user.email', 'test@test.test'], { cwd: project });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: project });
+
+    // A GitHub-style origin remote that points at a *different* repo than
+    // the one pinned in agentloop.config.json.
+    spawnSync('git', [
+      'remote', 'add', 'origin',
+      'https://github.com/other-org/other-repo.git',
+    ], { cwd: project });
+
+    // Pin the repository via agentloop.config.json — this avoids the
+    // AGENTLOOP_REPO guard that rejects at import time so the mismatch is
+    // surfaced by assertRemoteMatchesRepo itself.
+    fs.writeFileSync(
+      path.join(project, 'agentloop.config.json'),
+      JSON.stringify({ repo: 'test-org/test-repo' }),
+      'utf8',
+    );
+
+    var gitUrl = pathToFileURL(path.resolve(HERE, 'git.mjs')).href;
+
+    var testScript = ''
+      + 'import { assertRemoteMatchesRepo } from ' + JSON.stringify(gitUrl) + ';\n'
+      + 'try {\n'
+      + '  await assertRemoteMatchesRepo();\n'
+      + '  process.stdout.write(JSON.stringify({ ok: false, error: "assertRemoteMatchesRepo did not throw" }));\n'
+      + '} catch (e) {\n'
+      + '  process.stdout.write(JSON.stringify({\n'
+      + '    ok: true,\n'
+      + '    message: e.message,\n'
+      + '  }));\n'
+      + '}\n';
+
+    var scriptFile = path.join(project, '_assert-remote-mismatch-test.mjs');
+    fs.writeFileSync(scriptFile, testScript, 'utf8');
+
+    // Neutralize any AGENTLOOP_REPO inherited from the parent environment
+    // so the config-time guard does not reject the import before
+    // assertRemoteMatchesRepo() ever runs.  Also pin the base branch so
+    // the child process does not depend on the parent checkout's HEAD.
+    var result = spawnSync(
+      process.execPath,
+      [scriptFile],
+      {
+        cwd: project,
+        env: {
+          ...process.env,
+          AGENTLOOP_REPO: '',
+          AGENTLOOP_BASE_BRANCH: 'main',
+        },
+        encoding: 'utf8',
+        timeout: 15000,
+      },
+    );
+
+    expect(result.status).toBe(0);
+
+    var jsonStart = result.stdout.indexOf('{"ok":');
+    expect(jsonStart).not.toBe(-1);
+    var data = JSON.parse(result.stdout.slice(jsonStart));
+    expect(data.ok).toBe(true);
+    expect(data.message).toMatch(/Refusing to publish/);
+    expect(data.message).toMatch(/test-org\/test-repo/);
   });
 });
 
