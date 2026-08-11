@@ -378,12 +378,11 @@ describe('buildConfig with mock prompt', () => {
   it('produces minimal config when all defaults are accepted', async () => {
     const prompt = mockPrompt(defaultResponses());
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
-    // With all defaults (fast path, manual planner), config should be minimal
-    // except for the recommended standard runtime verification profile.
+    // With all defaults (fast path, manual planner), config should be minimal.
+    // Runtime verification is not enabled — it needs user-provided checks.
     expect(config.repo).toBeUndefined();
     expect(config.publishMode).toBeUndefined();
-    expect(config.runtimeVerification).toBeDefined();
-    expect(config.runtimeVerification.profile).toBe('standard');
+    expect(config.runtimeVerification).toBeUndefined();
   });
 
   it('captures project identification fields (manual path)', async () => {
@@ -1115,7 +1114,7 @@ describe('recommended settings fast path', () => {
 
   it('accepting recommended skips project/verification/controller sections', async () => {
     // Fast path: only consumes recommended confirm + roles + provider settings.
-    // Should still include the recommended standard runtime verification.
+    // Runtime verification is not enabled — it needs user-provided checks.
     const prompt = mockPrompt([
       true,             // accept recommended
       'manual',         // planner
@@ -1124,13 +1123,11 @@ describe('recommended settings fast path', () => {
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
-    // Fast path → no project fields, no controller fields
+    // Fast path → no project fields, no controller fields, no runtime checks
     expect(config.repo).toBeUndefined();
     expect(config.publishMode).toBeUndefined();
     expect(config.checks).toBeUndefined();
-    // Recommended standard runtime verification is set
-    expect(config.runtimeVerification).toBeDefined();
-    expect(config.runtimeVerification.profile).toBe('standard');
+    expect(config.runtimeVerification).toBeUndefined();
   });
 
   it('declining recommended walks through all sections individually', async () => {

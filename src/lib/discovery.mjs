@@ -40,10 +40,11 @@ function spawnForDiscovery(binPath, args) {
     });
   }
 
-  // Quote the command and arguments for cmd.exe.
+  // Quote every component for cmd.exe, including binPath itself.
   // Safe for version flags — no user-provided text on the command line.
+  // Matches the pattern in process.mjs:144-158.
   const quote = (/** @type {string} */ arg) => (/\s/.test(arg) ? `"${arg}"` : arg);
-  const line = [binPath, ...args.map(quote)].join(' ');
+  const line = [binPath, ...args].map(quote).join(' ');
   const shell = process.env.ComSpec || 'cmd.exe';
 
   return spawnSync(shell, ['/d', '/s', '/c', line], {
