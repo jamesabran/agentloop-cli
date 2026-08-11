@@ -1085,9 +1085,16 @@ export async function runSetup({
       project = {
         ...(detectedRepo ? { repo: detectedRepo } : {}),
       };
-      verification = {};
+      // Default checks (typecheck, lint, test, build) + standard runtime
+      // verification profile (recommended).  No runtime checks are
+      // configured yet — the verification gate will fail until the user
+      // runs --setup again to add them.
+      verification = {
+        runtimeVerification: { profile: 'standard' },
+      };
       controller = {};
       prompt.display('  ✓ Using recommended project settings.');
+      prompt.display('  Runtime verification: standard (add checks with --setup)');
       prompt.display('  Agent roles must still be configured explicitly.');
     } else {
       // Section 1: Project
@@ -1371,7 +1378,9 @@ export async function buildConfig({
     project = {
       ...(recommended.detectedRepo ? { repo: recommended.detectedRepo } : {}),
     };
-    verification = {};
+    verification = {
+      runtimeVerification: { profile: 'standard' },
+    };
     controller = {};
   } else {
     project = await sectionProject(existingConfig, prompt, detectedRepo);

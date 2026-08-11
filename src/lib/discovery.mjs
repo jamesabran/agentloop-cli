@@ -14,9 +14,45 @@
 
 import { spawnSync } from 'node:child_process';
 import process from 'node:process';
+import path from 'node:path';
 
 import { resolveExecutable, npmGlobalDirs } from './process.mjs';
 import { PROVIDER_CAPABILITIES } from './roles.mjs';
+
+/**
+ * Run a command through spawnSync, handling Windows .cmd shims.
+ *
+ * On Windows, Node refuses to spawn .cmd files directly (CVE-2024-27980).
+ * We must route them through cmd.exe, matching the pattern in process.mjs.
+ *
+ * @param {string} binPath — resolved executable path
+ * @param {string[]} args
+ * @returns {ReturnType<typeof spawnSync>}
+ */
+function spawnForDiscovery(binPath, args) {
+  const isWindowsShim = process.platform === 'win32' && /\.(cmd|bat)$/i.test(binPath);
+
+  if (!isWindowsShim) {
+    return spawnSync(binPath, args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000,
+    });
+  }
+
+  // Quote the command and arguments for cmd.exe.
+  // Safe for version flags — no user-provided text on the command line.
+  const quote = (/** @type {string} */ arg) => (/\s/.test(arg) ? `"${arg}"` : arg);
+  const line = [binPath, ...args.map(quote)].join(' ');
+  const shell = process.env.ComSpec || 'cmd.exe';
+
+  return spawnSync(shell, ['/d', '/s', '/c', line], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 10_000,
+    windowsVerbatimArguments: true,
+  });
+}
 
 /**
  * Discovery configuration for each supported provider.
@@ -71,11 +107,7 @@ export function checkProvider(provider) {
     };
   }
 
-  const result = spawnSync(binPath, [discovery.versionFlag], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 10_000,
-  });
+  const result = spawnForDiscovery(binPath, [discovery.versionFlag]);
 
   if (result.status === 0) {
     return { available: true, path: binPath };

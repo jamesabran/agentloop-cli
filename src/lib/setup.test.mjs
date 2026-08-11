@@ -379,8 +379,11 @@ describe('buildConfig with mock prompt', () => {
     const prompt = mockPrompt(defaultResponses());
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     // With all defaults (fast path, manual planner), config should be minimal
+    // except for the recommended standard runtime verification profile.
     expect(config.repo).toBeUndefined();
     expect(config.publishMode).toBeUndefined();
+    expect(config.runtimeVerification).toBeDefined();
+    expect(config.runtimeVerification.profile).toBe('standard');
   });
 
   it('captures project identification fields (manual path)', async () => {
@@ -1111,7 +1114,8 @@ describe('recommended settings fast path', () => {
   const discovered = mockDiscoveredAvailable();
 
   it('accepting recommended skips project/verification/controller sections', async () => {
-    // Fast path: only consumes recommended confirm + roles + provider settings
+    // Fast path: only consumes recommended confirm + roles + provider settings.
+    // Should still include the recommended standard runtime verification.
     const prompt = mockPrompt([
       true,             // accept recommended
       'manual',         // planner
@@ -1124,6 +1128,9 @@ describe('recommended settings fast path', () => {
     expect(config.repo).toBeUndefined();
     expect(config.publishMode).toBeUndefined();
     expect(config.checks).toBeUndefined();
+    // Recommended standard runtime verification is set
+    expect(config.runtimeVerification).toBeDefined();
+    expect(config.runtimeVerification.profile).toBe('standard');
   });
 
   it('declining recommended walks through all sections individually', async () => {
