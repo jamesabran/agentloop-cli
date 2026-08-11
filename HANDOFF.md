@@ -1,8 +1,9 @@
 # Setup/Onboarding UX Redesign — Implementation Handoff
 
-## Commit
+## Commits
 
-`55a4d86feat: redesigned setup UX — discovery, manual planner, improved verification`
+1. `55a4d86` — feat: redesigned setup UX — discovery, manual planner, improved verification
+2. `af4a915` — fix: address audit findings — Windows discovery and recommended runtime verification
 
 ## Summary
 
@@ -94,11 +95,24 @@ Adding a new provider means adding entries to these registries — no conditiona
 - No changes to `config.mjs` (already correctly validates through `resolveProvider`)
 - No universal plugin/provider framework — the registries are small, frozen, and purpose-fit
 
+### Audit fixes (af4a915)
+
+Two blocking issues found and fixed:
+
+1. **Windows discovery** — `spawnSync` does not handle `.cmd` shims on Windows.
+   Added `spawnForDiscovery()` helper that routes `.cmd`/`.bat` files through
+   `cmd.exe /d /s /c`, matching the existing pattern in `process.mjs`.
+
+2. **Recommended fast path runtime verification** — `verification = {}` silently
+   disabled runtime verification. Now sets `runtimeVerification: { profile: 'standard' }`
+   which matches the recommended default. The verification gate will fail until
+   the user adds checks via `--setup`, which is the correct prompt to configure.
+
 AGENTLOOP_AGENT_STATUS
 ROLE: CLAUDE
 STATUS: COMPLETE
 TASK: setup-onboarding-ux
-HEAD: 55a4d863073cf6690c1d476123e8d0a4f992ed09
+HEAD: af4a91593ab9f51c8ec3451b34440a5181cc062c
 BLOCKERS: 0
 NEXT: CODEX_AUDIT
 END_STATUS
