@@ -24,7 +24,7 @@ import process from 'node:process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { LOGICAL_ROLES, MANUAL_PLANNER, PROVIDER_CAPABILITIES } from './roles.mjs';
+import { LOGICAL_ROLES, MANUAL_EXTERNAL } from './roles.mjs';
 import { discoverAgents } from './discovery.mjs';
 import { parseGithubOwnerRepo } from './git-url.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -104,17 +104,16 @@ const PROVIDER_DEFAULTS = Object.freeze({
   claude: Object.freeze({ permissionMode: 'acceptEdits', relayMode: 'interactive' }),
 });
 
-/** Human-readable display names for providers. */
-const PROVIDER_DISPLAY = Object.freeze({
+/** Human-readable display names for agents. */
+const AGENT_DISPLAY = Object.freeze({
   claude: 'Claude',
   codex: 'Codex',
 });
 
 /**
- * Claude provider-specific settings handler.
+ * Claude agent-specific settings handler.
  *
- * Extracted from the old inline sectionProviderSettings so it can be
- * registered in PROVIDER_SETTINGS and only invoked when Claude is selected
+ * Registered in AGENT_SETTINGS and only invoked when Claude is selected
  * for at least one role.
  */
 async function claudeSettingsHandler(existing, prompt) {
@@ -165,12 +164,12 @@ async function claudeSettingsHandler(existing, prompt) {
  * settings handler.  Only providers selected for at least one role receive
  * their settings section during setup.
  */
-const PROVIDER_SETTINGS = Object.freeze({
+const AGENT_SETTINGS = Object.freeze({
   claude: {
-    label: 'Claude Provider Settings',
+    label: 'Claude Agent Settings',
     handler: claudeSettingsHandler,
   },
-  // codex has no provider-specific settings currently.
+  // codex has no agent-specific settings currently.
 });
 
 /* ------------------------------------------------------------------ *
@@ -303,12 +302,48 @@ function validateAgainstConfigModule(configPath, { env } = {}) {
  * ------------------------------------------------------------------ */
 
 /**
- * Section 0 — Recommended settings fast path.
+ * Section 0 — Existing configuration detected.
  *
- * Detects the repository from git remote and offers a fast path that
- * auto-applies sensible defaults for project, verification, and controller
- * settings.  Agent role selection is NOT included — the user must still
- * explicitly configure Planner, Implementer, and Auditor.
+ * When an agentloop.config.json already exists, ask the user how they want
+ * to proceed before showing any detailed questions.
+ *
+ * @param {object} existing — current config values (may be {})
+ * @param {object} prompt — prompt interface
+ * @returns {Promise<object>} { action: 'recommended' | 'review' | 'cancel' }
+ */
+async function sectionExistingConfig(existing, prompt) {
+  prompt.section('Existing Setup Found');
+
+  prompt.display('  ALCLI is already configured for this project.');
+  prompt.display('');
+  prompt.display('  What would you like to do?');
+  prompt.display('');
+
+  const action = await prompt.select(
+    '',
+    [
+      { value: 'recommended', label: 'Use recommended project settings' },
+      { value: 'review', label: 'Review or change current settings' },
+      { value: 'cancel', label: 'Cancel' },
+    ],
+    'recommended',
+  );
+
+  if (action === 'review') {
+    prompt.display('');
+    prompt.display('  Your current settings are shown as defaults.');
+    prompt.display('  Press Enter to keep a setting unchanged.');
+  }
+
+  return { action };
+}
+
+/**
+ * Section 1 — Project settings mode.
+ *
+ * Silently detects the repository (no diagnostic output) and offers a clean
+ * two-choice menu.  Returns the same shape as before so the rest of the flow
+ * does not need to change.
  *
  * @param {object} existing — current config values (may be {})
  * @param {object} prompt — prompt interface
@@ -318,25 +353,26 @@ function validateAgainstConfigModule(configPath, { env } = {}) {
 async function sectionRecommended(existing, prompt, detectedRepo) {
   prompt.section('Project Settings');
 
-  if (detectedRepo) {
-    prompt.display(`  Repository detected: ${detectedRepo}`);
-  } else {
-    prompt.display('  No repository detected from git remote.');
-  }
+  prompt.display('  How would you like to configure this project?');
+  prompt.display('');
 
-  const useRecommended = await prompt.confirm(
-    'Use recommended project settings?',
-    true,
+  const choice = await prompt.select(
+    '',
+    [
+      { value: 'recommended', label: 'Use recommended project settings' },
+      { value: 'custom', label: 'Customize every setting' },
+    ],
+    'recommended',
   );
 
   return {
-    fastPath: useRecommended,
+    fastPath: choice === 'recommended',
     detectedRepo,
   };
 }
 
 /**
- * Section 0.5 — Agent capability discovery.
+ * Section 2 — Agent discovery.
  *
  * Discovers which agents are actually usable on this machine and displays
  * the results so the user can see what is available before making role
@@ -351,8 +387,8 @@ async function sectionDiscovery(prompt) {
 
   const discovered = discoverAgents();
 
-  for (const [provider, result] of Object.entries(discovered)) {
-    const label = PROVIDER_DISPLAY[provider] || provider;
+  for (const [agent, result] of Object.entries(discovered)) {
+    const label = AGENT_DISPLAY[agent] || agent;
     if (result.available) {
       prompt.display(`  ✓ ${label}`);
     } else {
@@ -409,14 +445,14 @@ async function sectionProject(existing, prompt, detectedRepo = undefined) {
 }
 
 /**
- * Section 2 — Agent roles.
+ * Section 3 — Agent roles.
  *
- * Each logical role (planner, implementer, auditor) is mapped to a provider.
- * The user chooses from agents that are both supported for the role AND
- * currently available according to capability discovery.
+ * Every logical role (planner, implementer, auditor) is assigned to an agent
+ * or to Manual / External.  The user chooses from all agents that are both
+ * capable of the role AND currently available on this machine.
  *
- * Manual / External Planner is always available for the planner role
- * regardless of discovery results.
+ * Manual / External is always available for every role — it means the work
+ * is done outside ALCLI by a human or external tool.
  *
  * @param {object} existing — current config values
  * @param {object} prompt — prompt interface
@@ -429,66 +465,42 @@ async function sectionRoles(existing, prompt, discovered) {
   const existingRoles = existing.roles || {};
   const roles = {};
 
-  const ROLE_LABELS = {
-    planner: 'Planner — plans the implementation approach before coding starts',
-    implementer: 'Implementer — writes code and responds to audit findings',
-    auditor: 'Auditor — read-only review; finds defects, never writes code',
+  const ROLE_DESCRIPTIONS = {
+    planner: 'Plans the work before implementation begins.',
+    implementer: 'Carries out the task and makes the required changes.',
+    auditor: 'Reviews the completed work and reports any problems.',
   };
 
   for (const role of LOGICAL_ROLES) {
     const opts = [];
 
-    // Manual / External Planner is always available — it requires no agent.
-    if (role === 'planner') {
-      opts.push({
-        value: MANUAL_PLANNER,
-        label: 'Manual / External Planner — you supply pre-approved tasks; ALCLI does not launch a planning agent',
-      });
-    }
+    // Manual / External is always available for every role.
+    opts.push({
+      value: MANUAL_EXTERNAL,
+      label: 'Manual / External',
+    });
 
-    // Add discovered providers that support this role AND are available.
-    const capable = Object.entries(PROVIDER_CAPABILITIES)
-      .filter(([, caps]) => caps.includes(role))
-      .map(([provider]) => provider);
-
-    for (const provider of capable) {
-      if (discovered[provider]?.available === true) {
-        const display = PROVIDER_DISPLAY[provider] || provider;
-        opts.push({ value: provider, label: display });
+    // Add every discovered agent that is available on this machine.
+    // All known agents support every role at the configuration level.
+    for (const [agent, result] of Object.entries(discovered)) {
+      if (result.available === true) {
+        const display = AGENT_DISPLAY[agent] || agent;
+        opts.push({ value: agent, label: display });
       }
     }
 
-    if (opts.length === 0) {
-      prompt.display(`  ${role}: no available providers — skipping`);
-      continue;
-    }
+    prompt.display(`  ${role.charAt(0).toUpperCase() + role.slice(1)}`);
+    prompt.display(`  ${ROLE_DESCRIPTIONS[role]}`);
+    prompt.display('');
 
-    prompt.display(`  ${ROLE_LABELS[role]}`);
-
-    // Determine a sensible default: respect existing config if the
-    // previously selected provider is still available, otherwise use
-    // the first option.
-    const currentProvider =
+    // Default to Manual / External for safety, or to the existing
+    // choice if it is still available.
+    const currentValue =
       (typeof existingRoles[role] === 'string' && existingRoles[role].trim()) || null;
-    const defaultOption = opts.find((o) => o.value === currentProvider)
-      ? opts[currentProvider ? opts.findIndex((o) => o.value === currentProvider) : 0]
-      : opts[0];
-    const defaultValue = defaultOption ? defaultOption.value : opts[0].value;
+    const matched = opts.find((o) => o.value === currentValue);
+    const defaultValue = matched ? matched.value : MANUAL_EXTERNAL;
 
-    if (opts.length === 1) {
-      // Single option: confirm explicitly rather than silently assigning.
-      prompt.display(`    ${opts[0].label}`);
-      const confirmed = await prompt.confirm(
-        `  Use for ${role}?`,
-        true,
-      );
-      if (confirmed) {
-        roles[role] = opts[0].value;
-      }
-    } else {
-      roles[role] = await prompt.select('Provider:', opts, defaultValue);
-    }
-
+    roles[role] = await prompt.select('', opts, defaultValue);
     prompt.display('');
   }
 
@@ -750,11 +762,11 @@ async function sectionController(existing, prompt) {
 }
 
 /**
- * Section 5 — Provider-specific settings.
+ * Section 5 — Agent-specific settings.
  *
- * Only shown for providers that are assigned to at least one role in the
- * current mapping.  The registry (PROVIDER_SETTINGS) determines which
- * providers have configurable settings and how to collect them.
+ * Only shown for agents that are assigned to at least one role in the
+ * current mapping.  The registry (AGENT_SETTINGS) determines which
+ * agents have configurable settings and how to collect them.
  *
  * @param {object} existing — current config values
  * @param {object} roles — the resolved role mapping ({ planner, implementer, auditor })
@@ -762,14 +774,14 @@ async function sectionController(existing, prompt) {
  * @returns {Promise<object>} config fragment
  */
 async function sectionProviderSettings(existing, prompt, roles) {
-  const usedProviders = new Set(Object.values(roles));
-  // Remove manual — it is not a real provider with settings.
-  usedProviders.delete(MANUAL_PLANNER);
+  const usedAgents = new Set(Object.values(roles));
+  // Remove manual — it is not a real agent with settings.
+  usedAgents.delete(MANUAL_EXTERNAL);
 
   const result = {};
 
-  for (const [provider, { label, handler }] of Object.entries(PROVIDER_SETTINGS)) {
-    if (usedProviders.has(provider)) {
+  for (const [agent, { label, handler }] of Object.entries(AGENT_SETTINGS)) {
+    if (usedAgents.has(agent)) {
       prompt.section(label);
       const settings = await handler(existing, prompt);
       if (settings && typeof settings === 'object') {
@@ -828,17 +840,14 @@ export function assembleConfig(fragments) {
   if (project.remote) config.remote = project.remote;
   if (project.tasksFile) config.tasksFile = project.tasksFile;
 
-  // Roles — only if non-default
-  const hasNonDefaultRoles = LOGICAL_ROLES.some((role) => {
-    const def = role === 'auditor' ? 'codex' : 'claude';
-    return (roles[role] || def) !== def;
-  });
-  if (hasNonDefaultRoles) {
+  // Roles — always write when explicitly configured by the user.
+  // Every role gets an explicit choice during setup; write them all so
+  // the config reflects the user's actual selections.
+  if (Object.keys(roles).length > 0) {
     config.roles = {};
     for (const role of LOGICAL_ROLES) {
-      const def = role === 'auditor' ? 'codex' : 'claude';
-      if ((roles[role] || def) !== def) {
-        config.roles[role] = roles[role] || def;
+      if (roles[role]) {
+        config.roles[role] = roles[role];
       }
     }
   }
@@ -969,11 +978,12 @@ export function formatSummary(config, roles) {
   lines.push('');
   lines.push('  Agent Roles');
   for (const role of LOGICAL_ROLES) {
-    const provider = roles[role] || (role === 'auditor' ? 'codex' : 'claude');
-    if (role === 'planner' && provider === MANUAL_PLANNER) {
-      lines.push(`    ${role}: Manual / External Planner`);
+    const provider = roles[role] || 'claude';
+    if (provider === MANUAL_EXTERNAL) {
+      lines.push(`    ${role.charAt(0).toUpperCase() + role.slice(1)}: Manual / External`);
     } else {
-      lines.push(`    ${role}: ${provider}`);
+      const display = AGENT_DISPLAY[provider] || provider;
+      lines.push(`    ${role.charAt(0).toUpperCase() + role.slice(1)}: ${display}`);
     }
   }
 
@@ -1001,16 +1011,16 @@ export function formatSummary(config, roles) {
   lines.push(`    Publish mode:       ${config.publishMode || 'manual'}`);
   lines.push(`    Max change rounds:  ${config.maxChangeRounds ?? 2}`);
 
-  // Provider settings — only for providers actually selected.
+  // Agent settings — only for agents actually selected.
   const usedProviders = new Set(Object.values(roles));
-  usedProviders.delete(MANUAL_PLANNER);
+  usedProviders.delete(MANUAL_EXTERNAL);
 
   for (const provider of usedProviders) {
     const providerConfig = config[provider] || {};
     lines.push('');
-    const display = PROVIDER_DISPLAY[provider]
-      ? `${PROVIDER_DISPLAY[provider]} Provider Settings`
-      : `${provider} Provider Settings`;
+    const display = AGENT_DISPLAY[provider]
+      ? `${AGENT_DISPLAY[provider]} Agent Settings`
+      : `${provider} Agent Settings`;
     lines.push(`  ${display}`);
 
     // Show saved values
@@ -1040,10 +1050,11 @@ export function formatSummary(config, roles) {
 /**
  * Run the full interactive setup flow against the terminal.
  *
- * 1. Detect existing configuration
- * 2. Walk through each section
- * 3. Show summary and confirm
- * 4. Write `agentloop.config.json` (with validation)
+ * 1. Detect existing configuration — show choice menu if found
+ * 2. Project settings mode
+ * 3. Agent discovery, role assignment, agent settings
+ * 4. Show summary and confirm
+ * 5. Write `agentloop.config.json` (with validation)
  *
  * @param {object} [options]
  * @param {string} [options.projectRoot] — project root directory (default: cwd)
@@ -1059,58 +1070,72 @@ export async function runSetup({
   const tmpPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.tmp`);
 
   try {
-    // Load existing config (for display defaults only — the actual
-    // "is this a reconfiguration" check looks at whether the file exists).
+    // Load existing config for display defaults.
     const existing = loadExistingConfig(projectRoot);
     const oldFileExists = fs.existsSync(configPath);
 
+    // Step 1: If a config already exists, ask how to proceed.
     if (oldFileExists) {
+      const { action } = await sectionExistingConfig(existing, prompt);
+      if (action === 'cancel') {
+        prompt.display('');
+        prompt.display('  Setup cancelled — existing configuration was not changed.');
+        return { saved: false, config: null, reason: 'User cancelled at existing-config prompt.' };
+      }
+      if (action === 'recommended') {
+        // Apply recommended defaults for project/verification/controller.
+        // Agent role selection still runs — the user must choose.
+        // Deliberately pass empty config so prior selections do NOT leak as defaults.
+        const detectedRepo = detectRepo(projectRoot, existing.remote || 'origin');
+        const project = { ...(detectedRepo ? { repo: detectedRepo } : {}) };
+        const verification = {};
+        const controller = {};
+
+        const discovered = await sectionDiscovery(prompt);
+        const { roles } = await sectionRoles({}, prompt, discovered);
+        const providerSettings = await sectionProviderSettings({}, prompt, roles);
+
+        const config = assembleConfig({ project, roles, verification, controller, providerSettings });
+        prompt.display(formatSummary(config, roles));
+
+        const confirmed = await prompt.confirm('Save this configuration?', true);
+        if (!confirmed) {
+          return { saved: false, config, reason: 'User chose not to save.' };
+        }
+
+        return commitConfig({ config, projectRoot, configPath, tmpPath, oldFileExists, prompt });
+      }
+      // action === 'review' — fall through to full flow with existing defaults.
       prompt.display('');
-      prompt.display('  ═══════════════════════════════════════════════════════');
-      prompt.display('  Existing configuration found — entering reconfiguration.');
-      prompt.display('  Current values are shown as defaults. Press Enter to keep them.');
-      prompt.display('  ═══════════════════════════════════════════════════════');
+      prompt.display('  Your current settings are shown as defaults.');
+      prompt.display('  Press Enter to keep a setting unchanged.');
     }
 
-    // Section 0: Recommended settings fast path
-    // Detect repo before sectionRecommended so the display is accurate.
+    // Step 2: Project settings — recommended or customize?
+    // Silently detect the repo; no diagnostic output for the user.
     const detectedRepo = detectRepo(projectRoot, existing.remote || 'origin');
     const recommended = await sectionRecommended(existing, prompt, detectedRepo);
 
     let project, verification, controller;
 
     if (recommended.fastPath) {
-      // Auto-apply sensible defaults for project/verification/controller.
-      // Agent role selection is NOT included — the user must still choose.
-      project = {
-        ...(detectedRepo ? { repo: detectedRepo } : {}),
-      };
-      // Runtime verification is not enabled — a required profile needs
-      // user-provided checks, which the fast path does not collect.
-      // The user can add them later via --setup.
+      project = { ...(detectedRepo ? { repo: detectedRepo } : {}) };
       verification = {};
       controller = {};
       prompt.display('  ✓ Using recommended project settings.');
-      prompt.display('  Runtime verification: not configured (use --setup to add checks)');
-      prompt.display('  Agent roles must still be configured explicitly.');
     } else {
-      // Section 1: Project
-      project = await sectionProject(existing, prompt);
-
-      // Section 3: Verification
+      project = await sectionProject(existing, prompt, detectedRepo);
       verification = await sectionVerification(existing, prompt);
-
-      // Section 4: Controller
       controller = await sectionController(existing, prompt);
     }
 
-    // Section 0.5: Agent capability discovery (always runs)
+    // Step 3: Agent discovery (always runs).
     const discovered = await sectionDiscovery(prompt);
 
-    // Section 2: Agent Roles (always runs — with discovery results)
+    // Step 4: Agent roles (always runs — explicit choice for every role).
     const { roles } = await sectionRoles(existing, prompt, discovered);
 
-    // Section 5: Provider-specific settings (always runs — for selected providers)
+    // Step 5: Agent-specific settings (only for selected agents).
     const providerSettings = await sectionProviderSettings(existing, prompt, roles);
 
     // Assemble
@@ -1130,215 +1155,182 @@ export async function runSetup({
       return { saved: false, config, reason: 'User chose not to save.' };
     }
 
-    // --- Crash-safe validate-then-commit ---
-    //
-    // 1. Copy the old canonical file aside (copy, not move — the original
-    //    stays in place during the risky write).
-    // 2. Write the candidate to a temp file and atomically rename it over
-    //    the canonical path.
-    // 3. Validate the canonical file through the real config module.
-    // 4. On failure: copy the pre-update backup back to canonical (restore).
-    // 5. On success: promote the pre-update backup → .bak.
-
-    // Phase 1: snapshot the existing config (copy, not move).
-    //
-    // Use .pre-update as the snapshot target, but if a file already
-    // exists at that path (retained from a previous interrupted run),
-    // rotate it to a timestamped name first.  If rotation fails, fall
-    // back to a unique timestamped path so the previous recovery file
-    // is never silently overwritten.
-    //
-    // Timestamps use second precision — add a counter suffix when the
-    // base name already exists so rapid re-runs never collide.
-    let snapshotPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update`);
-    if (fs.existsSync(snapshotPath)) {
-      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      const baseStamped = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}`);
-
-      // Find a free stamped name for the rotation target.
-      let stampedPath = baseStamped;
-      if (fs.existsSync(stampedPath)) {
-        for (let i = 1; i < 100; i += 1) {
-          stampedPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}-${i}`);
-          if (!fs.existsSync(stampedPath)) break;
-        }
-      }
-      // If all suffixes are occupied the loop exits with the last
-      // candidate — which still exists.  Abort rather than overwrite.
-      if (fs.existsSync(stampedPath)) {
-        prompt.display('');
-        prompt.display('  ✖  Cannot create a unique recovery file name.');
-        prompt.display('  Too many recovery files exist — clean up old .pre-update.* files and try again.');
-        return { saved: false, config, reason: 'Cannot create unique recovery file name.' };
-      }
-
-      try {
-        fs.renameSync(snapshotPath, stampedPath);
-        prompt.display(`  Rotated previous recovery file to ${path.basename(stampedPath)}`);
-      } catch {
-        // Could not rotate — find a unique fallback name for this
-        // run's snapshot instead so the existing .pre-update is
-        // never overwritten.
-        snapshotPath = baseStamped;
-        if (fs.existsSync(snapshotPath)) {
-          for (let i = 1; i < 100; i += 1) {
-            snapshotPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}-${i}`);
-            if (!fs.existsSync(snapshotPath)) break;
-          }
-        }
-        if (fs.existsSync(snapshotPath)) {
-          prompt.display('');
-          prompt.display('  ✖  Cannot create a unique snapshot file name.');
-          prompt.display('  Too many recovery files exist — clean up old .pre-update.* files and try again.');
-          return { saved: false, config, reason: 'Cannot create unique snapshot file name.' };
-        }
-        prompt.display('  Warning: could not rotate the existing .pre-update recovery file.');
-        prompt.display(`  Using ${path.basename(snapshotPath)} for this run instead.`);
-        prompt.display('  The existing .pre-update was not modified.');
-      }
-    }
-
-    let hadOldFile = false;
-    if (oldFileExists) {
-      try {
-        fs.copyFileSync(configPath, snapshotPath);
-        hadOldFile = true;
-      } catch {
-        // Copy failed — the original is still intact but we cannot
-        // safely replace it without a backup to roll back to.
-        prompt.display('');
-        prompt.display('  ✖  Could not create a backup of the existing configuration.');
-        prompt.display('  The existing config was not modified.');
-        return {
-          saved: false,
-          config,
-          reason: 'Could not snapshot the existing config — nothing was changed.',
-        };
-      }
-    }
-
-    // Phase 2: atomically write the candidate.
-    // Write to a temp file first, then rename (rename is atomic).
-    // If the process crashes before the rename, the temp file is cleaned
-    // up on the next invocation — canonical is untouched.
-    saveConfig(config, projectRoot, tmpPath);
-    try {
-      fs.renameSync(tmpPath, configPath);
-    } catch {
-      // Rename failed — the temp file still exists for recovery, and
-      // the canonical file (if any) is untouched.
-      try { fs.unlinkSync(tmpPath); } catch { /* best-effort */ }
-      prompt.display('');
-      prompt.display('  ✖  Could not write the configuration file.');
-      // Clean up the pre-update backup — the old config is still at
-      // the canonical path, untouched.
-      if (hadOldFile) {
-        try { fs.unlinkSync(snapshotPath); } catch { /* best-effort */ }
-      }
-      return { saved: false, config, reason: 'File write failed — nothing was changed.' };
-    }
-
-    // Phase 3: validate the newly written canonical file.
-    const validation = validateConfig(projectRoot);
-    if (!validation.ok) {
-      // Validation failed — restore the old config from the pre-update
-      // backup (if we have one), or remove the invalid candidate.
-      if (hadOldFile) {
-        // Restore atomically: copy the backup to a temp file, then
-        // rename over the canonical path.  A direct copyFile over the
-        // canonical path could leave a partial file on failure.
-        let restored = false;
-        try {
-          fs.copyFileSync(snapshotPath, tmpPath);
-          fs.renameSync(tmpPath, configPath);
-          restored = true;
-        } catch {
-          // Restore failed.  Clean up the temp file if it exists, but
-          // leave .pre-update intact — it is the only good copy.
-          try { fs.unlinkSync(tmpPath); } catch { /* best-effort */ }
-        }
-
-        if (restored) {
-          try { fs.unlinkSync(snapshotPath); } catch { /* best-effort */ }
-        } else {
-          prompt.display('');
-          prompt.display('  ✖  Validation failed and the previous config could not be restored.');
-          prompt.display(`  The previous config is at ${CONFIG_FILE_NAME}.pre-update`);
-          prompt.display('  Rename it back to agentloop.config.json to recover.');
-          return {
-            saved: false,
-            config,
-            reason: 'Validation failed and restore also failed — manual recovery required.',
-          };
-        }
-      } else {
-        // No old file — just remove the invalid candidate.
-        try { fs.unlinkSync(configPath); } catch { /* best-effort */ }
-      }
-
-      prompt.display('');
-      prompt.display('  ✖  Configuration validation failed — nothing was saved.');
-      prompt.display('  Errors:');
-      for (const err of validation.errors || []) {
-        prompt.display(`    ${err}`);
-      }
-      return {
-        saved: false,
-        config,
-        reason: 'Configuration validation failed — see errors above.',
-      };
-    }
-
-    // Phase 4: validation passed.  Promote the pre-update backup → .bak.
-    if (hadOldFile) {
-      const bakPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.bak`);
-
-      // If a .bak already exists, move it to a timestamped name so we
-      // never silently overwrite a previous backup.
-      if (fs.existsSync(bakPath)) {
-        const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        const stampedPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.bak.${ts}`);
-        try {
-          fs.renameSync(bakPath, stampedPath);
-          prompt.display(`  Moved previous backup to ${path.basename(stampedPath)}`);
-        } catch {
-          // Rotation failed — do NOT overwrite.  Keep the pre-update
-          // backup on disk and warn the user rather than risk losing
-          // either the old .bak or the old config.
-          prompt.display('  Warning: could not rotate the existing .bak file.');
-          prompt.display(`  The previous config is preserved at ${CONFIG_FILE_NAME}.pre-update`);
-          prompt.display('  You can remove it once you have a safe copy of the .bak file.');
-          // pre-update-backup stays on disk so nothing is lost.
-          return { saved: true, config, reason: 'Configuration saved but backup rotation failed — see warning above.' };
-        }
-      }
-
-      // Move the pre-update backup (the old config) to .bak.
-      try {
-        fs.renameSync(snapshotPath, bakPath);
-        prompt.display(`  Backed up previous config to ${CONFIG_FILE_NAME}.bak`);
-      } catch {
-        // Backup rename failed — the pre-update backup stays on disk.
-        // The new config is already validated and in place, so this is
-        // non-fatal, but we must not silently discard the old config.
-        prompt.display('  Warning: could not back up the previous config.');
-        prompt.display(`  The previous config is preserved at ${CONFIG_FILE_NAME}.pre-update`);
-        prompt.display('  Rename it to agentloop.config.json.bak to keep it as a backup,');
-        prompt.display('  or delete it once you are satisfied with the new configuration.');
-      }
-    }
-
-    prompt.display('');
-    prompt.display('  Configuration saved and validated successfully.');
-    prompt.display(`  File: ${configPath}`);
-    prompt.display('  Run `agentloop --setup` anytime to reconfigure.');
-
-    return { saved: true, config, reason: 'Configuration saved and validated.' };
+    return commitConfig({ config, projectRoot, configPath, tmpPath, oldFileExists, prompt });
   } finally {
     if (!injectedPrompt) {
       prompt.close();
     }
   }
+}
+
+/**
+ * Crash-safe config write with validate-then-commit semantics.
+ *
+ * 1. Snapshot the old canonical file (copy, not move).
+ * 2. Write the candidate to a temp file and atomically rename.
+ * 3. Validate the canonical file through the real config module.
+ * 4. On failure: restore from backup. On success: promote backup → .bak.
+ *
+ * @param {object} options
+ * @returns {{ saved: boolean, config: object, reason: string }}
+ */
+function commitConfig({ config, projectRoot, configPath, tmpPath, oldFileExists, prompt }) {
+  // Phase 1: snapshot the existing config (copy, not move).
+  //
+  // Use .pre-update as the snapshot target, but if a file already
+  // exists at that path (retained from a previous interrupted run),
+  // rotate it to a timestamped name first.
+  let snapshotPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update`);
+  if (fs.existsSync(snapshotPath)) {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const baseStamped = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}`);
+
+    let stampedPath = baseStamped;
+    if (fs.existsSync(stampedPath)) {
+      for (let i = 1; i < 100; i += 1) {
+        stampedPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}-${i}`);
+        if (!fs.existsSync(stampedPath)) break;
+      }
+    }
+    if (fs.existsSync(stampedPath)) {
+      prompt.display('');
+      prompt.display('  ✖  Cannot create a unique recovery file name.');
+      prompt.display('  Too many recovery files exist — clean up old .pre-update.* files and try again.');
+      return { saved: false, config, reason: 'Cannot create unique recovery file name.' };
+    }
+
+    try {
+      fs.renameSync(snapshotPath, stampedPath);
+      prompt.display(`  Rotated previous recovery file to ${path.basename(stampedPath)}`);
+    } catch {
+      snapshotPath = baseStamped;
+      if (fs.existsSync(snapshotPath)) {
+        for (let i = 1; i < 100; i += 1) {
+          snapshotPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.pre-update.${ts}-${i}`);
+          if (!fs.existsSync(snapshotPath)) break;
+        }
+      }
+      if (fs.existsSync(snapshotPath)) {
+        prompt.display('');
+        prompt.display('  ✖  Cannot create a unique snapshot file name.');
+        prompt.display('  Too many recovery files exist — clean up old .pre-update.* files and try again.');
+        return { saved: false, config, reason: 'Cannot create unique snapshot file name.' };
+      }
+      prompt.display('  Warning: could not rotate the existing .pre-update recovery file.');
+      prompt.display(`  Using ${path.basename(snapshotPath)} for this run instead.`);
+      prompt.display('  The existing .pre-update was not modified.');
+    }
+  }
+
+  let hadOldFile = false;
+  if (oldFileExists) {
+    try {
+      fs.copyFileSync(configPath, snapshotPath);
+      hadOldFile = true;
+    } catch {
+      prompt.display('');
+      prompt.display('  ✖  Could not create a backup of the existing configuration.');
+      prompt.display('  The existing config was not modified.');
+      return {
+        saved: false,
+        config,
+        reason: 'Could not snapshot the existing config — nothing was changed.',
+      };
+    }
+  }
+
+  // Phase 2: atomically write the candidate.
+  saveConfig(config, projectRoot, tmpPath);
+  try {
+    fs.renameSync(tmpPath, configPath);
+  } catch {
+    try { fs.unlinkSync(tmpPath); } catch { /* best-effort */ }
+    prompt.display('');
+    prompt.display('  ✖  Could not write the configuration file.');
+    if (hadOldFile) {
+      try { fs.unlinkSync(snapshotPath); } catch { /* best-effort */ }
+    }
+    return { saved: false, config, reason: 'File write failed — nothing was changed.' };
+  }
+
+  // Phase 3: validate the newly written canonical file.
+  const validation = validateConfig(projectRoot);
+  if (!validation.ok) {
+    if (hadOldFile) {
+      let restored = false;
+      try {
+        fs.copyFileSync(snapshotPath, tmpPath);
+        fs.renameSync(tmpPath, configPath);
+        restored = true;
+      } catch {
+        try { fs.unlinkSync(tmpPath); } catch { /* best-effort */ }
+      }
+
+      if (restored) {
+        try { fs.unlinkSync(snapshotPath); } catch { /* best-effort */ }
+      } else {
+        prompt.display('');
+        prompt.display('  ✖  Validation failed and the previous config could not be restored.');
+        prompt.display(`  The previous config is at ${CONFIG_FILE_NAME}.pre-update`);
+        prompt.display('  Rename it back to agentloop.config.json to recover.');
+        return {
+          saved: false,
+          config,
+          reason: 'Validation failed and restore also failed — manual recovery required.',
+        };
+      }
+    } else {
+      try { fs.unlinkSync(configPath); } catch { /* best-effort */ }
+    }
+
+    prompt.display('');
+    prompt.display('  ✖  Configuration validation failed — nothing was saved.');
+    prompt.display('  Errors:');
+    for (const err of validation.errors || []) {
+      prompt.display(`    ${err}`);
+    }
+    return {
+      saved: false,
+      config,
+      reason: 'Configuration validation failed — see errors above.',
+    };
+  }
+
+  // Phase 4: validation passed.  Promote the pre-update backup → .bak.
+  if (hadOldFile) {
+    const bakPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.bak`);
+
+    if (fs.existsSync(bakPath)) {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const stampedPath = path.join(projectRoot, `${CONFIG_FILE_NAME}.bak.${ts}`);
+      try {
+        fs.renameSync(bakPath, stampedPath);
+        prompt.display(`  Moved previous backup to ${path.basename(stampedPath)}`);
+      } catch {
+        prompt.display('  Warning: could not rotate the existing .bak file.');
+        prompt.display(`  The previous config is preserved at ${CONFIG_FILE_NAME}.pre-update`);
+        prompt.display('  You can remove it once you have a safe copy of the .bak file.');
+        return { saved: true, config, reason: 'Configuration saved but backup rotation failed — see warning above.' };
+      }
+    }
+
+    try {
+      fs.renameSync(snapshotPath, bakPath);
+      prompt.display(`  Backed up previous config to ${CONFIG_FILE_NAME}.bak`);
+    } catch {
+      prompt.display('  Warning: could not back up the previous config.');
+      prompt.display(`  The previous config is preserved at ${CONFIG_FILE_NAME}.pre-update`);
+      prompt.display('  Rename it to agentloop.config.json.bak to keep it as a backup,');
+      prompt.display('  or delete it once you are satisfied with the new configuration.');
+    }
+  }
+
+  prompt.display('');
+  prompt.display('  Configuration saved and validated successfully.');
+  prompt.display(`  File: ${configPath}`);
+  prompt.display('  Run `agentloop --setup` anytime to reconfigure.');
+
+  return { saved: true, config, reason: 'Configuration saved and validated.' };
 }
 
 /**

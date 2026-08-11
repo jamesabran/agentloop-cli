@@ -23,7 +23,7 @@ import {
   defaultRoleMapping,
   getProviderIdentity,
   LOGICAL_ROLES,
-  MANUAL_PLANNER,
+  MANUAL_EXTERNAL,
   PROVIDER_CAPABILITIES,
   PROVIDER_IDENTITIES,
   resolveProvider,
@@ -109,18 +109,18 @@ describe('defaultRoleMapping', () => {
  * ------------------------------------------------------------------ */
 
 describe('PROVIDER_CAPABILITIES', () => {
-  it('claude supports planner and implementer, not auditor', () => {
+  it('claude supports all three roles', () => {
     const caps = PROVIDER_CAPABILITIES.claude;
     expect(caps).toContain('planner');
     expect(caps).toContain('implementer');
-    expect(caps).not.toContain('auditor');
+    expect(caps).toContain('auditor');
   });
 
-  it('codex supports auditor only', () => {
+  it('codex supports all three roles', () => {
     const caps = PROVIDER_CAPABILITIES.codex;
+    expect(caps).toContain('planner');
+    expect(caps).toContain('implementer');
     expect(caps).toContain('auditor');
-    expect(caps).not.toContain('planner');
-    expect(caps).not.toContain('implementer');
   });
 
   it('is frozen so capabilities cannot be mutated at runtime', () => {
@@ -187,21 +187,20 @@ describe('resolveProvider rejects invalid configurations', () => {
       .toThrow(/Unknown provider "gpt-5"/);
   });
 
-  it('throws when the provider exists but does not support the role', () => {
-    // codex only supports auditor — not implementer
-    expect(() => resolveProvider('implementer', { implementer: 'codex' }))
-      .toThrow(/Provider "codex" does not support the "implementer" role/);
+  it('allows codex for all roles now that all providers support all roles', () => {
+    // codex now supports all roles — this is no longer an error.
+    const { provider } = resolveProvider('implementer', { implementer: 'codex' });
+    expect(provider).toBe('codex');
   });
 
-  it('throws when codex is mapped to planner', () => {
-    expect(() => resolveProvider('planner', { planner: 'codex' }))
-      .toThrow(/Provider "codex" does not support the "planner" role/);
+  it('allows codex as planner (all providers support all roles)', () => {
+    const { provider } = resolveProvider('planner', { planner: 'codex' });
+    expect(provider).toBe('codex');
   });
 
-  it('throws when claude is mapped to auditor', () => {
-    // claude might audit in a future release, but not yet
-    expect(() => resolveProvider('auditor', { auditor: 'claude' }))
-      .toThrow(/Provider "claude" does not support the "auditor" role/);
+  it('allows claude as auditor (all providers support all roles)', () => {
+    const { provider } = resolveProvider('auditor', { auditor: 'claude' });
+    expect(provider).toBe('claude');
   });
 });
 
@@ -209,70 +208,79 @@ describe('resolveProvider rejects invalid configurations', () => {
  * Manual / External Planner                                            *
  * ------------------------------------------------------------------ */
 
-describe('Manual / External Planner', () => {
+describe('Manual / External', () => {
   it('resolveProvider returns manual for planner role', () => {
     const { provider } = resolveProvider('planner', {
-      planner: MANUAL_PLANNER,
+      planner: MANUAL_EXTERNAL,
       implementer: 'claude',
       auditor: 'codex',
     });
-    expect(provider).toBe(MANUAL_PLANNER);
+    expect(provider).toBe(MANUAL_EXTERNAL);
   });
 
-  it('rejects manual for implementer role', () => {
-    expect(() =>
-      resolveProvider('implementer', {
-        planner: 'claude',
-        implementer: MANUAL_PLANNER,
-        auditor: 'codex',
-      }),
-    ).toThrow(/is only valid for the planner role/);
+  it('accepts manual for implementer role', () => {
+    const { provider } = resolveProvider('implementer', {
+      planner: 'claude',
+      implementer: MANUAL_EXTERNAL,
+      auditor: 'codex',
+    });
+    expect(provider).toBe(MANUAL_EXTERNAL);
   });
 
-  it('rejects manual for auditor role', () => {
-    expect(() =>
-      resolveProvider('auditor', {
-        planner: 'claude',
-        implementer: 'claude',
-        auditor: MANUAL_PLANNER,
-      }),
-    ).toThrow(/is only valid for the planner role/);
+  it('accepts manual for auditor role', () => {
+    const { provider } = resolveProvider('auditor', {
+      planner: 'claude',
+      implementer: 'claude',
+      auditor: MANUAL_EXTERNAL,
+    });
+    expect(provider).toBe(MANUAL_EXTERNAL);
   });
 
-  it('getProviderIdentity returns MANUAL for manual planner', () => {
-    expect(getProviderIdentity(MANUAL_PLANNER)).toBe('MANUAL');
+  it('allows manual for all three roles simultaneously', () => {
+    const mapping = {
+      planner: MANUAL_EXTERNAL,
+      implementer: MANUAL_EXTERNAL,
+      auditor: MANUAL_EXTERNAL,
+    };
+    expect(resolveProvider('planner', mapping).provider).toBe(MANUAL_EXTERNAL);
+    expect(resolveProvider('implementer', mapping).provider).toBe(MANUAL_EXTERNAL);
+    expect(resolveProvider('auditor', mapping).provider).toBe(MANUAL_EXTERNAL);
+  });
+
+  it('getProviderIdentity returns MANUAL for manual', () => {
+    expect(getProviderIdentity(MANUAL_EXTERNAL)).toBe('MANUAL');
   });
 
   it('manual does not appear in PROVIDER_CAPABILITIES', () => {
-    expect(PROVIDER_CAPABILITIES[MANUAL_PLANNER]).toBeUndefined();
+    expect(PROVIDER_CAPABILITIES[MANUAL_EXTERNAL]).toBeUndefined();
   });
 
   it('planner: manual config loads correctly alongside defaults', () => {
     const dir = makeProject({
       config: {
-        roles: { planner: MANUAL_PLANNER },
+        roles: { planner: MANUAL_EXTERNAL },
       },
     });
     const result = importConfigField('ROLE_MAPPING', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
     const mapping = JSON.parse(result.stdout);
-    expect(mapping.planner).toBe(MANUAL_PLANNER);
+    expect(mapping.planner).toBe(MANUAL_EXTERNAL);
     expect(mapping.implementer).toBe('claude'); // default
     expect(mapping.auditor).toBe('codex'); // default
   });
 
-  it('full config with manual planner loads all three roles', () => {
+  it('full config with all-manual roles loads correctly', () => {
     const dir = makeProject({
       config: {
-        roles: { planner: MANUAL_PLANNER, implementer: 'claude', auditor: 'codex' },
+        roles: { planner: MANUAL_EXTERNAL, implementer: MANUAL_EXTERNAL, auditor: MANUAL_EXTERNAL },
       },
     });
     const result = importConfigField('ROLE_MAPPING', { cwd: dir, env: baseEnv() });
     expect(result.status).toBe(0);
     const mapping = JSON.parse(result.stdout);
-    expect(mapping.planner).toBe(MANUAL_PLANNER);
-    expect(mapping.implementer).toBe('claude');
-    expect(mapping.auditor).toBe('codex');
+    expect(mapping.planner).toBe(MANUAL_EXTERNAL);
+    expect(mapping.implementer).toBe(MANUAL_EXTERNAL);
+    expect(mapping.auditor).toBe(MANUAL_EXTERNAL);
   });
 });
 
@@ -356,22 +364,24 @@ describe('ROLE_MAPPING from agentloop.config.json', () => {
     expect(result.stderr).toMatch(/Unknown provider/);
   });
 
-  it('rejects a provider that does not support the role at config load', () => {
+  it('allows codex as implementer (all providers support all roles)', () => {
     const dir = makeProject({
       config: { roles: { implementer: 'codex' } },
     });
     const result = importConfigField('ROLE_MAPPING', { cwd: dir, env: baseEnv() });
-    expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/does not support/);
+    expect(result.status).toBe(0);
+    const mapping = JSON.parse(result.stdout);
+    expect(mapping.implementer).toBe('codex');
   });
 
-  it('rejects when auditor is mapped to claude (not yet supported)', () => {
+  it('allows claude as auditor (all providers support all roles)', () => {
     const dir = makeProject({
       config: { roles: { auditor: 'claude' } },
     });
     const result = importConfigField('ROLE_MAPPING', { cwd: dir, env: baseEnv() });
-    expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/does not support/);
+    expect(result.status).toBe(0);
+    const mapping = JSON.parse(result.stdout);
+    expect(mapping.auditor).toBe('claude');
   });
 
   it('treats an empty string role value as unset and uses the default', () => {

@@ -383,13 +383,259 @@ function stopClaudeTerminal(context, step, reason) {
   throw new LoopStopped(message);
 }
 
+/**
+ * Pure state-transition for manual implementation — no I/O, fully testable.
+ *
+ * When `manualImplementationPending` is true and HEAD is a real commit,
+ * the handoff accepts the first commit even if `implementHeadBefore` was
+ * null (e.g. on an unborn branch).  Every subsequent run records a fresh
+ * baseline so fixes after REQUEST_CHANGES require a new commit.
+ *
+ * @param {object} state — current controller state
+ * @param {string|null} currentHead — current HEAD commit, or null if unavailable
+ * @returns {{ action: 'accept' | 'wait', state: object }}
+ */
+export function manualImplementationAction(state, currentHead) {
+  const recordedHead = state.implementHeadBefore;
+  const isPending = state.manualImplementationPending === true;
+
+  // Pending + real HEAD → check for acceptance.
+  if (isPending && currentHead) {
+    // First commit on an unborn branch: baseline was null, HEAD is now set.
+    if (recordedHead === null) {
+      return {
+        action: 'accept',
+        state: {
+          ...state,
+          implementHeadBefore: null,
+          manualImplementationPending: false,
+          claudeSessionId: null,
+        },
+      };
+    }
+    // New commit after a recorded baseline.
+    if (currentHead !== recordedHead) {
+      return {
+        action: 'accept',
+        state: {
+          ...state,
+          implementHeadBefore: null,
+          manualImplementationPending: false,
+          claudeSessionId: null,
+        },
+      };
+    }
+    // HEAD matches baseline — still waiting.
+    return {
+      action: 'wait',
+      state: { ...state, claudeSessionId: null },
+    };
+  }
+
+  // Not yet pending, or HEAD is still null.
+  // Record baseline and set the pending flag so the next run can detect a commit.
+  return {
+    action: 'wait',
+    state: {
+      ...state,
+      implementHeadBefore: currentHead,
+      manualImplementationPending: true,
+      claudeSessionId: null,
+    },
+  };
+}
+
+/**
+ * Manual / External implementation handoff.
+ *
+ * When the implementer role is set to Manual / External, ALCLI does not
+ * launch an agent.  Instead it records the current HEAD and stops.  The
+ * user makes changes, commits, and re-runs ALCLI.  On re-run the
+ * controller detects the new commit and proceeds to audit.
+ */
+async function handleManualImplementation({ context, options, fixing }) {
+  const { state } = context;
+
+  if (options.dryRun) {
+    log.info('[dry-run] would pause for manual implementation.');
+    throw new LoopStopped('Dry run: manual implementation step not executed.');
+  }
+
+  const before = await headCommit();
+  const { action, state: nextState } = manualImplementationAction(state, before);
+
+  if (action === 'accept') {
+    log.info('Manual implementation detected — HEAD has advanced. Proceeding to audit.');
+
+    // Run implementer-gate runtime verification, same as the automated path.
+    if (context.runtimeVerification && isRuntimeVerificationRequired(context.runtimeVerification)) {
+      const rvChecks = context.runtimeVerification.checks;
+      if (rvChecks.length === 0) {
+        throw new LoopStopped(
+          `Runtime verification is required (profile: ${context.runtimeVerification.profile}) but no checks are configured. ` +
+            'Add runtime verification checks to agentloop.config.json or the task configuration.',
+        );
+      }
+      log.info('Running implementer-gate runtime verification for manual handoff…');
+      const rvResult = await runRuntimeChecks({
+        checks: rvChecks,
+        onStart: (name) => log.info(`  ${name}`),
+      });
+      log.info(summariseRuntimeChecks(rvResult.results));
+      if (!rvResult.ok) {
+        const failedOutput = runtimeFailureExcerpt(rvResult.failed);
+        throw new LoopStopped(
+          `Implementer-gate runtime check "${rvResult.failed.name}" failed against ${short(before)}.\n\n${failedOutput}`,
+        );
+      }
+      context.state = recordImplementerRuntimeVerification(nextState, {
+        head: before,
+        status: 'PASS',
+        output: 'Implementer-gate runtime verification passed (manual).',
+      });
+    } else {
+      context.state = recordImplementerRuntimeVerification(nextState, {
+        head: before,
+        status: 'NOT_REQUIRED',
+      });
+    }
+
+    // Clear the baseline so the next manual run (including fixes) starts fresh.
+    context.state = recordImplementation(
+      clearFailures({ ...context.state, claudeSessionId: null, implementHeadBefore: null }),
+      before,
+    );
+    return;
+  }
+
+  // action === 'wait': record baseline and stop.
+  context.state = nextState;
+  saveState(context.state);
+
+  log.warn('═══════════════════════════════════════════════════════');
+  log.warn('  Manual Implementation Required');
+  log.warn('═══════════════════════════════════════════════════════');
+  log.warn('');
+  log.warn('  Implementer is set to Manual / External.');
+  log.warn('  Make your changes, commit them, then re-run ALCLI.');
+  log.warn('');
+
+  throw new LoopStopped(
+    'Manual implementation required. Make changes, commit, and re-run ALCLI to continue.',
+  );
+}
+
+/**
+ * Manual / External audit handoff.
+ *
+ * When the auditor role is set to Manual / External, ALCLI writes the audit
+ * prompt and a decision template to .agent/, then stops.  The user reviews
+ * the changes, records their decision, and re-runs ALCLI.  On re-run the
+ * controller reads the decision and proceeds accordingly.
+ */
+async function handleManualAudit({ context, state, scope, head, checksResult, runtimeChecksResult, brief, identity, options }) {
+  if (options.dryRun) {
+    log.info('[dry-run] would pause for manual audit.');
+    throw new LoopStopped('Dry run: manual audit step not executed.');
+  }
+
+  const decisionFile = path.join(AGENT_DIR, 'manual-audit-decision.json');
+
+  // Check for an existing decision (from a previous run).
+  if (fs.existsSync(decisionFile)) {
+    let decision;
+    try {
+      decision = JSON.parse(fs.readFileSync(decisionFile, 'utf8'));
+    } catch {
+      log.warn('Could not parse manual audit decision file. Fix or delete it and re-run.');
+      throw new LoopStopped(
+        'Manual audit decision file is corrupt. Fix or delete ' + decisionFile + ' and re-run ALCLI.',
+      );
+    }
+
+    if (decision.approved === true) {
+      log.info('Manual audit: APPROVED.');
+      fs.unlinkSync(decisionFile);
+      // Record an audit result the controller can continue from.
+      context.state = recordAudit(context.state, {
+        head,
+        verdict: 'APPROVED',
+        blockers: [],
+      });
+      // Clear the prompt file if it exists.
+      const promptFile = path.join(AGENT_DIR, 'manual-audit-prompt.md');
+      try { fs.unlinkSync(promptFile); } catch { /* ok */ }
+      return;
+    }
+
+    if (decision.approved === false) {
+      log.info('Manual audit: REJECTED.');
+      fs.unlinkSync(decisionFile);
+      context.state = recordAudit(context.state, {
+        head,
+        verdict: 'REQUEST_CHANGES',
+        blockers: [],
+      });
+      return;
+    }
+
+    // Decision exists but approved is neither true nor false.
+    log.warn('Manual audit decision must have "approved": true or false.');
+    throw new LoopStopped(
+      'Manual audit decision must set "approved" to true or false. Edit ' + decisionFile + ' and re-run.',
+    );
+  }
+
+  // No decision yet — write the prompt and a decision template.
+  const promptText = auditPrompt({
+    task: state.task,
+    brief,
+    head,
+    scope,
+    round: state.round + 1,
+    checks: checksResult ? summariseChecks(checksResult.results) : '(none)',
+    runtimeVerification: runtimeChecksResult
+      ? summariseRuntimeChecks(runtimeChecksResult.results)
+      : null,
+    role: identity,
+  });
+
+  const promptFile = path.join(AGENT_DIR, 'manual-audit-prompt.md');
+  fs.mkdirSync(AGENT_DIR, { recursive: true });
+  fs.writeFileSync(promptFile, promptText, 'utf8');
+  fs.writeFileSync(decisionFile, JSON.stringify({
+    approved: null,
+    comments: '',
+    instructions: 'Set "approved" to true or false, add optional comments, save, and re-run ALCLI.',
+  }, null, 2), 'utf8');
+
+  saveState(context.state);
+
+  log.warn('═══════════════════════════════════════════════════════');
+  log.warn('  Manual Audit Required');
+  log.warn('═══════════════════════════════════════════════════════');
+  log.warn('');
+  log.warn(`  Review the audit prompt:  ${promptFile}`);
+  log.warn(`  Record your decision in:  ${decisionFile}`);
+  log.warn('  Then re-run ALCLI to continue.');
+  log.warn('');
+
+  throw new LoopStopped(
+    'Manual audit required. Review the prompt, record your decision, and re-run ALCLI.',
+  );
+}
+
 /** Start or resume the implementer, and record the local commit it produced. */
 async function runImplementerStep({ decision, context, options }) {
   const { state, brief } = context;
   const fixing = decision.action === ACTIONS.FIX;
 
   // Resolve the provider identity for status-block validation and prompts.
-  const { identity } = resolveRoleProvider('implementer');
+  const { provider, identity } = resolveRoleProvider('implementer');
+
+  if (provider === 'manual') {
+    return handleManualImplementation({ context, options, fixing });
+  }
 
   const prompt = fixing
     ? fixPrompt({
@@ -619,7 +865,7 @@ async function runAuditStep({ context, options }) {
   }
 
   // Resolve the provider identity for status-block validation.
-  const { identity } = resolveRoleProvider('auditor');
+  const { provider, identity } = resolveRoleProvider('auditor');
 
   if (options.dryRun) {
     log.info(
@@ -703,6 +949,15 @@ async function runAuditStep({ context, options }) {
       head,
       status: 'NOT_REQUIRED',
       required: false,
+    });
+  }
+
+  if (provider === 'manual') {
+    return handleManualAudit({
+      context, state, scope, head,
+      checksResult: checks,
+      runtimeChecksResult,
+      brief, identity, options,
     });
   }
 

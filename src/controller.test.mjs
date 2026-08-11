@@ -20,6 +20,7 @@ import {
   defaultBranch,
   hasValidImplementationHandoff,
   isValidNoChangeHandoff,
+  manualImplementationAction,
   parseArgs,
   selectBranch,
 } from './controller.mjs';
@@ -261,5 +262,103 @@ describe('defaultBranch never collides with the base branch', () => {
       expect(defaultBranch(task)).toMatch(/^agent\/task-/);
       expect(defaultBranch(task)).not.toBe('main');
     }
+  });
+});
+
+/* ================================================================== *
+ * Manual implementation controller transitions                         *
+ * ================================================================== */
+
+describe('manualImplementationAction', () => {
+  const A = 'a'.repeat(40);
+  const B = 'b'.repeat(40);
+
+  it('returns wait on fresh state with a HEAD', () => {
+    const state = { ...emptyState(), task: '5', branch: 'agent/task-5' };
+    const result = manualImplementationAction(state, A);
+    expect(result.action).toBe('wait');
+    expect(result.state.implementHeadBefore).toBe(A);
+    expect(result.state.manualImplementationPending).toBe(true);
+    expect(result.state.claudeSessionId).toBeNull();
+  });
+
+  it('returns wait when HEAD has not changed (pending with matching baseline)', () => {
+    const state = {
+      ...emptyState(),
+      task: '5',
+      branch: 'agent/task-5',
+      implementHeadBefore: A,
+      manualImplementationPending: true,
+    };
+    const result = manualImplementationAction(state, A);
+    expect(result.action).toBe('wait');
+    expect(result.state.implementHeadBefore).toBe(A);
+    expect(result.state.manualImplementationPending).toBe(true);
+  });
+
+  it('returns accept when HEAD has advanced past baseline', () => {
+    const state = {
+      ...emptyState(),
+      task: '5',
+      branch: 'agent/task-5',
+      implementHeadBefore: A,
+      manualImplementationPending: true,
+    };
+    const result = manualImplementationAction(state, B);
+    expect(result.action).toBe('accept');
+    expect(result.state.implementHeadBefore).toBeNull();
+    expect(result.state.manualImplementationPending).toBe(false);
+  });
+
+  it('accepts first commit on unborn branch (baseline was null, pending is true, HEAD now set)', () => {
+    const state = {
+      ...emptyState(),
+      task: '5',
+      branch: 'agent/task-5',
+      implementHeadBefore: null,
+      manualImplementationPending: true,
+    };
+    const result = manualImplementationAction(state, A);
+    expect(result.action).toBe('accept');
+    expect(result.state.implementHeadBefore).toBeNull();
+    expect(result.state.manualImplementationPending).toBe(false);
+  });
+
+  it('returns wait on null HEAD when not pending (initial unborn — records baseline)', () => {
+    const state = { ...emptyState(), task: '5', branch: 'agent/task-5' };
+    const result = manualImplementationAction(state, null);
+    expect(result.action).toBe('wait');
+    expect(result.state.implementHeadBefore).toBeNull();
+    expect(result.state.manualImplementationPending).toBe(true);
+  });
+
+  it('returns wait on null HEAD when pending (still unborn)', () => {
+    const state = {
+      ...emptyState(),
+      task: '5',
+      branch: 'agent/task-5',
+      implementHeadBefore: null,
+      manualImplementationPending: true,
+    };
+    const result = manualImplementationAction(state, null);
+    expect(result.action).toBe('wait');
+    expect(result.state.implementHeadBefore).toBeNull();
+    expect(result.state.manualImplementationPending).toBe(true);
+  });
+
+  it('accept clears pending flag and claude session', () => {
+    const state = {
+      ...emptyState(),
+      task: '5',
+      branch: 'agent/task-5',
+      implementHeadBefore: A,
+      manualImplementationPending: true,
+      claudeSessionId: 'some-uuid',
+    };
+    const result = manualImplementationAction(state, B);
+    expect(result.action).toBe('accept');
+    expect(result.state.implementHeadBefore).toBeNull();
+    expect(result.state.manualImplementationPending).toBe(false);
+    expect(result.state.claudeSessionId).toBeNull();
   });
 });

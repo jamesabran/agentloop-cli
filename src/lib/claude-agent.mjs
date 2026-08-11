@@ -100,17 +100,18 @@ export function detectUsageLimit(text, now = Date.now()) {
 /**
  * Build the argument list for a Claude run.
  *
- * @param {{ sessionId: string|null, resume: boolean }} options
+ * @param {{ sessionId: string|null, resume: boolean, permissionMode?: string }} options
  * @returns {string[]}
  */
-export function buildClaudeArgs({ sessionId, resume }) {
+export function buildClaudeArgs({ sessionId, resume, permissionMode }) {
+  const effectiveMode = permissionMode ?? CLAUDE_PERMISSION_MODE;
   const args = [
     '--print',
     '--output-format',
     'stream-json',
     '--verbose',
     '--permission-mode',
-    CLAUDE_PERMISSION_MODE,
+    effectiveMode,
     '--add-dir',
     REPO_ROOT,
   ];
@@ -253,6 +254,7 @@ export function classifyClaudeOutcome({ outcome, result, text, session }) {
  *   prompt: string,
  *   sessionId?: string|null,
  *   resume?: boolean,
+ *   permissionMode?: string,
  *   onStdout?: (chunk: string) => void,
  *   onLog?: (line: string) => void,
  * }} options
@@ -262,9 +264,9 @@ export function classifyClaudeOutcome({ outcome, result, text, session }) {
  *   timedOut?: boolean,
  * }>}
  */
-export async function runClaude({ prompt, sessionId = null, resume = false, onStdout, onLog }) {
+export async function runClaude({ prompt, sessionId = null, resume = false, permissionMode, onStdout, onLog }) {
   const session = sessionId ?? randomUUID();
-  const args = buildClaudeArgs({ sessionId: session, resume });
+  const args = buildClaudeArgs({ sessionId: session, resume, permissionMode });
 
   // Permission relay: only for standard `claude` binary.  The relay hook is
   // always set up when the binary supports it so hard-deny rules are enforced

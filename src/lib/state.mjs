@@ -101,6 +101,10 @@ const SCHEMA = Object.freeze({
   recoveryRequired: (value) => typeof value === 'boolean',
   recoveryReason: (value) => value === null || (typeof value === 'string' && value.length <= 4000),
   updatedAt: (value) => value === null || isIsoDate(value),
+  /** HEAD recorded before manual implementation — used to detect external commits on resume. */
+  implementHeadBefore: (value) => value === null || SHA.test(String(value)),
+  /** True when the controller is waiting for a manual implementation commit. */
+  manualImplementationPending: (value) => typeof value === 'boolean',
 });
 
 const ALLOWED_KEYS = Object.freeze(Object.keys(SCHEMA));
@@ -144,6 +148,10 @@ export function emptyState() {
     recoveryRequired: false,
     recoveryReason: null,
     updatedAt: null,
+    /** HEAD recorded before manual implementation — used to detect external commits on resume. */
+    implementHeadBefore: null,
+    /** True when the controller is waiting for a manual implementation commit. */
+    manualImplementationPending: false,
     /** Fields rejected by the schema on the last load. Never persisted. */
     dropped: [],
   };

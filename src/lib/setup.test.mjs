@@ -29,6 +29,7 @@ import {
   buildConfig,
   formatSummary,
   loadExistingConfig,
+  runSetup,
   saveConfig,
   validateConfig,
 } from './setup.mjs';
@@ -124,26 +125,23 @@ function mockDiscoveredUnavailable() {
 }
 
 /**
- * Build a sequence of responses that accepts all defaults with the new flow.
+ * Build a sequence of responses for a fresh setup accepting all defaults.
  *
- * New flow:
- *   1. sectionRecommended: confirm → true (fast path)
- *   2. sectionRoles: planner select → 'manual', implementer confirm → true,
- *      auditor confirm → true
- *   3. sectionProviderSettings: claude permissionMode → 'acceptEdits',
+ * New flow (fresh setup):
+ *   1. sectionRecommended: select → 'recommended' (fast path)
+ *   2. sectionDiscovery: (no responses needed — display only)
+ *   3. sectionRoles: planner select → 'manual', implementer select → 'claude',
+ *      auditor select → 'codex'
+ *   4. sectionProviderSettings: claude permissionMode → 'acceptEdits',
  *      claude relayMode → 'interactive'
  */
 function defaultResponses() {
   const arr = [];
-  // Recommended settings: accept fast path
-  arr.push(true);
-  // Roles: planner select (manual)
-  arr.push('manual');
-  // Roles: implementer confirm (claude)
-  arr.push(true);
-  // Roles: auditor confirm (codex)
-  arr.push(true);
-  // Provider: Claude permissionMode, relayMode (claude selected for implementer)
+  // Recommended settings: accept recommended
+  arr.push('recommended');
+  // Roles: planner → manual, implementer → claude, auditor → codex
+  arr.push('manual', 'claude', 'codex');
+  // Agent settings: Claude permissionMode, relayMode
   arr.push('acceptEdits', 'interactive');
   return arr;
 }
@@ -206,7 +204,7 @@ describe('assembleConfig', () => {
     expect(config.remote).toBeUndefined();
   });
 
-  it('includes non-default role mapping', () => {
+  it('includes all explicitly-set role mappings', () => {
     const config = assembleConfig({
       project: {},
       roles: { planner: 'claude', implementer: 'codex', auditor: 'codex' },
@@ -215,21 +213,23 @@ describe('assembleConfig', () => {
       providerSettings: {},
     });
     expect(config.roles).toBeDefined();
-    // implementer: 'codex' is non-default (default is 'claude')
+    expect(config.roles.planner).toBe('claude');
     expect(config.roles.implementer).toBe('codex');
-    // planner: 'claude' is default → not included
-    expect(config.roles.planner).toBeUndefined();
+    expect(config.roles.auditor).toBe('codex');
   });
 
-  it('omits roles key when mapping is entirely default', () => {
+  it('always writes roles when explicitly configured', () => {
     const config = assembleConfig({
       project: {},
-      roles: { planner: 'claude', implementer: 'claude', auditor: 'codex' },
+      roles: { planner: 'manual', implementer: 'claude', auditor: 'codex' },
       verification: {},
       controller: {},
       providerSettings: {},
     });
-    expect(config.roles).toBeUndefined();
+    expect(config.roles).toBeDefined();
+    expect(config.roles.planner).toBe('manual');
+    expect(config.roles.implementer).toBe('claude');
+    expect(config.roles.auditor).toBe('codex');
   });
 
   it('includes deterministic checks', () => {
@@ -378,11 +378,9 @@ describe('buildConfig with mock prompt', () => {
   it('produces minimal config when all defaults are accepted', async () => {
     const prompt = mockPrompt(defaultResponses());
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
-    // With all defaults (fast path, manual planner), config should be minimal.
-    // Runtime verification is not enabled — it needs user-provided checks.
-    expect(config.repo).toBeUndefined();
-    expect(config.publishMode).toBeUndefined();
-    expect(config.runtimeVerification).toBeUndefined();
+    // With all defaults (fast path, manual planner, claude implementer, codex auditor),
+    // roles are always written.
+    expect(config.roles).toBeDefined();
   });
 
   it('captures project identification fields (manual path)', async () => {
@@ -402,8 +400,8 @@ describe('buildConfig with mock prompt', () => {
       '',               // max change rounds (default)
       // Roles
       'manual',         // planner → manual
-      true,             // implementer → claude
-      true,             // auditor → codex
+      'claude',         // implementer → claude
+      'codex',          // auditor → codex
       // Provider — Claude (selected for implementer)
       'acceptEdits',    // permission mode
       'interactive',    // relay mode
@@ -418,17 +416,19 @@ describe('buildConfig with mock prompt', () => {
   it('captures custom role mapping with claude for all', async () => {
     const prompt = mockPrompt([
       // Recommended: accept fast path
-      true,
+      'recommended',
       // Roles: planner → claude, implementer → claude, auditor → codex
       'claude',         // planner select
-      true,             // implementer confirm
-      true,             // auditor confirm
-      // Provider
+      'claude',         // implementer select
+      'codex',          // auditor select
+      // Agent settings
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
-    // planner=claude is default, implementer=claude is default, auditor=codex is default
-    expect(config.roles).toBeUndefined();
+    expect(config.roles).toBeDefined();
+    expect(config.roles.planner).toBe('claude');
+    expect(config.roles.implementer).toBe('claude');
+    expect(config.roles.auditor).toBe('codex');
   });
 
   it('includes custom checks when defaults are rejected', async () => {
@@ -447,8 +447,8 @@ describe('buildConfig with mock prompt', () => {
       'manual', '',
       // Roles
       'manual',         // planner → manual
-      true,             // implementer → claude
-      true,             // auditor → codex
+      'claude',         // implementer → claude
+      'codex',          // auditor → codex
       // Provider
       'acceptEdits', 'interactive',
     ]);
@@ -475,8 +475,8 @@ describe('buildConfig with mock prompt', () => {
       'manual', '',
       // Roles
       'manual',         // planner → manual
-      true,             // implementer → claude
-      true,             // auditor → codex
+      'claude',         // implementer → claude
+      'codex',          // auditor → codex
       // Provider
       'acceptEdits', 'interactive',
     ]);
@@ -501,8 +501,8 @@ describe('buildConfig with mock prompt', () => {
       '3',              // max change rounds
       // Roles
       'manual',         // planner → manual
-      true,             // implementer → claude
-      true,             // auditor → codex
+      'claude',         // implementer → claude
+      'codex',          // auditor → codex
       // Provider
       'acceptEdits', 'interactive',
     ]);
@@ -514,11 +514,11 @@ describe('buildConfig with mock prompt', () => {
   it('captures Claude provider settings', async () => {
     const prompt = mockPrompt([
       // Recommended: accept fast path
-      true,
+      'recommended',
       // Roles: implementer → claude
       'manual',         // planner → manual
-      true,             // implementer → claude
-      true,             // auditor → codex
+      'claude',         // implementer → claude
+      'codex',          // auditor → codex
       // Provider — Claude
       'default',        // permission mode (non-default)
       'auto',           // relay mode (non-default)
@@ -566,8 +566,8 @@ describe('reconfiguration with existing config', () => {
       '',               // question: keep '1'
       // Roles
       'manual',         // planner → manual
-      true,             // implementer → claude
-      true,             // auditor → codex
+      'claude',         // implementer → claude
+      'codex',          // auditor → codex
       // Provider
       'default',        // select: keep 'default'
       'auto',           // select: keep 'auto'
@@ -599,8 +599,8 @@ describe('reconfiguration with existing config', () => {
       '',
       // Roles
       'manual',         // planner → manual
-      true,             // implementer → claude
-      true,             // auditor → codex
+      'claude',         // implementer → claude
+      'codex',          // auditor → codex
       // Provider
       'acceptEdits', 'interactive',
     ]);
@@ -805,13 +805,13 @@ describe('cancellation leaves project unchanged', () => {
     const configPath = path.join(dir, 'agentloop.config.json');
 
     const prompt = mockPrompt([
-      false,            // recommended: decline fast path
+      'custom',          // recommended: decline fast path
       'org/repo', '', '', '',
       true, 'lightweight',
       'manual', '',
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -871,12 +871,13 @@ describe('formatSummary', () => {
     expect(summary).toContain('manual');
   });
 
-  it('shows Manual / External Planner when planner is manual', () => {
+  it('shows Manual / External for any role when manual is selected', () => {
     const summary = formatSummary(
       {},
-      { planner: 'manual', implementer: 'claude', auditor: 'codex' },
+      { planner: 'manual', implementer: 'manual', auditor: 'codex' },
     );
-    expect(summary).toContain('Manual / External Planner');
+    expect(summary).toContain('Planner: Manual / External');
+    expect(summary).toContain('Implementer: Manual / External');
   });
 
   it('shows provider settings only for selected providers', () => {
@@ -885,7 +886,7 @@ describe('formatSummary', () => {
       {},
       { planner: 'manual', implementer: 'codex', auditor: 'codex' },
     );
-    expect(summary).not.toContain('Claude Provider Settings');
+    expect(summary).not.toContain('Claude Agent Settings');
   });
 });
 
@@ -898,10 +899,10 @@ describe('provider-specific settings scoping', () => {
 
   it('omits claude key from config when all Claude settings are defaults', async () => {
     const prompt = mockPrompt([
-      true,             // recommended: accept fast path
+      'recommended',    // recommended: accept fast path
       'manual',         // planner → manual
-      true,             // implementer → claude
-      true,             // auditor → codex
+      'claude',         // implementer → claude
+      'codex',          // auditor → codex
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -910,10 +911,10 @@ describe('provider-specific settings scoping', () => {
 
   it('Claude settings are provider-scoped, not global', async () => {
     const prompt = mockPrompt([
-      true,             // recommended: accept fast path
+      'recommended',    // recommended: accept fast path
       'manual',         // planner → manual
-      true,             // implementer → claude
-      true,             // auditor → codex
+      'claude',         // implementer → claude
+      'codex',          // auditor → codex
       'default', 'auto',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -934,14 +935,14 @@ describe('runtime verification profile configuration', () => {
 
   it('lightweight profile produces no runtimeVerification key', async () => {
     const prompt = mockPrompt([
-      false,            // recommended: decline fast path
+      'custom',          // recommended: decline fast path
       '', '', '', '',   // project
       true,             // verification: use default checks
       'lightweight',    // runtime profile
       'manual', '',     // controller
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -952,7 +953,7 @@ describe('runtime verification profile configuration', () => {
     // Required profiles need at least one check.  When the user declines
     // to add any across all attempts, the profile is downgraded.
     const prompt = mockPrompt([
-      false,            // recommended: decline fast path
+      'custom',          // recommended: decline fast path
       '', '', '', '',   // project
       true,             // use default checks
       'standard',       // profile
@@ -963,8 +964,8 @@ describe('runtime verification profile configuration', () => {
       false,            // configure? no (attempt 5 — exhausted)
       'manual', '',     // controller
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -973,7 +974,7 @@ describe('runtime verification profile configuration', () => {
 
   it('integration profile with checks is captured', async () => {
     const prompt = mockPrompt([
-      false,            // recommended: decline fast path
+      'custom',          // recommended: decline fast path
       '', '', '', '',   // project
       true,             // use default checks
       'integration',    // profile
@@ -983,8 +984,8 @@ describe('runtime verification profile configuration', () => {
       false,            // add another? → no
       'manual', '',     // controller
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -996,7 +997,7 @@ describe('runtime verification profile configuration', () => {
 
   it('custom profile is captured', async () => {
     const prompt = mockPrompt([
-      false,            // recommended: decline fast path
+      'custom',          // recommended: decline fast path
       '', '', '', '',   // project
       true,             // use default checks
       'custom',         // profile
@@ -1006,8 +1007,8 @@ describe('runtime verification profile configuration', () => {
       false,            // add another? → no
       'manual', '',     // controller
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -1025,12 +1026,11 @@ describe('invalid configuration is rejected', () => {
     // the role/provider validation. We test that in validateConfig above.
   });
 
-  it('rejects unsupported role-provider combo', () => {
+  it('accepts claude for all roles (all providers support all roles)', () => {
     const dir = makeProject();
-    // auditor cannot be 'claude' — claude doesn't support auditor role
-    saveConfig({ roles: { auditor: 'claude' } }, dir);
+    saveConfig({ roles: { planner: 'claude', implementer: 'claude', auditor: 'claude' } }, dir);
     const result = validateConfig(dir);
-    expect(result.ok).toBe(false);
+    expect(result.ok).toBe(true);
   });
 
   it('rejects unknown provider', () => {
@@ -1116,10 +1116,10 @@ describe('recommended settings fast path', () => {
     // Fast path: only consumes recommended confirm + roles + provider settings.
     // Runtime verification is not enabled — it needs user-provided checks.
     const prompt = mockPrompt([
-      true,             // accept recommended
+      'recommended',    // accept recommended
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -1139,8 +1139,8 @@ describe('recommended settings fast path', () => {
       'lightweight',    // runtime profile
       'manual', '',     // controller
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({
@@ -1154,10 +1154,10 @@ describe('recommended settings fast path', () => {
 
   it('detected repo is included when provided', async () => {
     const prompt = mockPrompt([
-      true,             // accept recommended
+      'recommended',    // accept recommended
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({
@@ -1186,40 +1186,41 @@ describe('recommended settings fast path', () => {
  * ================================================================== */
 
 describe('capability discovery integration', () => {
-  it('only available agents appear as selectable options', async () => {
-    // Only claude is available
+  it('only available agents appear alongside Manual / External', async () => {
+    // Only claude is available — every role shows Manual + Claude.
     const discovered = {
       claude: { available: true, path: '/usr/bin/claude' },
       codex: { available: false, reason: 'not installed' },
     };
 
     const prompt = mockPrompt([
-      true,             // recommended: accept fast path
-      'claude',         // planner → claude (manual + claude available)
-      true,             // implementer → claude
-      // auditor: codex not available → no options → skipped
+      'recommended',    // recommended: accept fast path
+      'claude',         // planner → selects claude
+      'claude',         // implementer → selects claude
+      'claude',         // auditor → selects claude (only available besides Manual)
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
-    // Only planner and implementer have providers
-    expect(config.roles).toBeUndefined(); // all defaults
+    // All three roles have claude selected — roles are always written.
+    expect(config.roles).toBeDefined();
   });
 
-  it('unavailable agents show nothing for that role', async () => {
-    // Neither claude nor codex available
+  it('all roles fall back to Manual / External when no agents available', async () => {
+    // Neither claude nor codex available — every role only has Manual / External.
     const discovered = mockDiscoveredUnavailable();
 
     const prompt = mockPrompt([
-      true,             // recommended: accept fast path
-      true,             // planner → confirm manual (only option)
-      // implementer: claude not available → no options (skipped)
-      // auditor: codex not available → no options (skipped)
-      // providerSettings: no providers → nothing consumed
+      'recommended',    // recommended: accept fast path
+      'manual',         // planner → select Manual / External
+      'manual',         // implementer → select Manual / External
+      'manual',         // auditor → select Manual / External
+      // providerSettings: no providers selected → nothing consumed
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
-    // Only planner has a selected provider (manual is non-default)
     expect(config.roles).toBeDefined();
     expect(config.roles.planner).toBe('manual');
+    expect(config.roles.implementer).toBe('manual');
+    expect(config.roles.auditor).toBe('manual');
   });
 });
 
@@ -1230,40 +1231,42 @@ describe('capability discovery integration', () => {
 describe('explicit role assignment', () => {
   const discovered = mockDiscoveredAvailable();
 
-  it('manual planner is always an option regardless of discovery', async () => {
+  it('manual is always an option for every role', async () => {
     const prompt = mockPrompt([
-      true,             // recommended: accept fast path
+      'recommended',    // recommended: accept fast path
       'manual',         // planner → manual
-      true,             // implementer → claude
-      true,             // auditor → codex
-      'acceptEdits', 'interactive',
+      'manual',         // implementer → manual
+      'manual',         // auditor → manual
+      // providerSettings: no agents selected → nothing consumed
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
     expect(config.roles).toBeDefined();
     expect(config.roles.planner).toBe('manual');
+    expect(config.roles.implementer).toBe('manual');
+    expect(config.roles.auditor).toBe('manual');
   });
 
-  it('single provider asks explicit confirmation (no silent assignment)', async () => {
-    // The 'true' for implementer/auditor is the confirm response
+  it('every role uses explicit select — no confirm or silent assignment', async () => {
+    // All roles use select(); no confirm() calls for role assignment.
     const prompt = mockPrompt([
-      true,             // recommended: accept fast path
+      'recommended',    // recommended: accept fast path
       'manual',         // planner → select manual
-      true,             // implementer → confirm claude
-      true,             // auditor → confirm codex
+      'claude',         // implementer → select claude
+      'codex',          // auditor → select codex
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
-    // Manual planner is non-default → written. implementer/auditor are defaults → omitted.
+    // All roles are explicitly selected — always written to config.
     expect(config.roles).toBeDefined();
     expect(config.roles.planner).toBe('manual');
-    expect(config.roles.implementer).toBeUndefined();
-    expect(config.roles.auditor).toBeUndefined();
+    expect(config.roles.implementer).toBe('claude');
+    expect(config.roles.auditor).toBe('codex');
   });
 
-  it('manual planner config saves correctly', async () => {
+  it('manual / external config saves correctly for all roles', async () => {
     const dir = makeProject();
     saveConfig({
-      roles: { planner: 'manual', implementer: 'claude', auditor: 'codex' },
+      roles: { planner: 'manual', implementer: 'manual', auditor: 'manual' },
     }, dir);
 
     // Validate through real config module
@@ -1271,10 +1274,371 @@ describe('explicit role assignment', () => {
     expect(result.status).toBe(0);
     const mapping = JSON.parse(result.stdout);
     expect(mapping.planner).toBe('manual');
-    expect(mapping.implementer).toBe('claude');
-    expect(mapping.auditor).toBe('codex');
+    expect(mapping.implementer).toBe('manual');
+    expect(mapping.auditor).toBe('manual');
   });
 });
+
+/* ================================================================== *
+ * Existing config recommended path — no leak of prior selections        *
+ * ================================================================== */
+
+describe('existing config recommended path does not leak prior roles', () => {
+  const discovered = mockDiscoveredAvailable();
+
+  it('ignores existing role assignments when recommended path is chosen', async () => {
+    const existingWithRoles = {
+      roles: { planner: 'codex', implementer: 'codex', auditor: 'claude' },
+    };
+    // User selects recommended for existing config, then picks defaults:
+    // manual for planner, claude for implementer, codex for auditor.
+    const prompt = mockPrompt([
+      'recommended',    // existing config: select recommended
+      'manual',         // planner → manual (default, not codex)
+      'claude',         // implementer → claude (default, not codex)
+      'codex',          // auditor → codex (default, not claude)
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: existingWithRoles, prompt, discovered });
+    expect(config.roles).toBeDefined();
+    // Must reflect fresh choices, NOT the existing config values.
+    expect(config.roles.planner).toBe('manual');
+    expect(config.roles.implementer).toBe('claude');
+    expect(config.roles.auditor).toBe('codex');
+  });
+
+  it('review path preserves existing role assignments as defaults', async () => {
+    const existingWithRoles = {
+      roles: { planner: 'codex', implementer: 'codex', auditor: 'claude' },
+    };
+    // When buildConfig is called with existingConfig containing roles,
+    // those roles are used as defaults in sectionRoles.  The user accepts
+    // them by selecting the matching values.
+    const prompt = mockPrompt([
+      'recommended',    // project settings: recommended (fast path)
+      'codex',          // planner → keeps existing (codex)
+      'codex',          // implementer → keeps existing (codex)
+      'claude',         // auditor → keeps existing (claude)
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: existingWithRoles, prompt, discovered });
+    expect(config.roles).toBeDefined();
+    expect(config.roles.planner).toBe('codex');
+    expect(config.roles.implementer).toBe('codex');
+    expect(config.roles.auditor).toBe('claude');
+  });
+});
+
+/* ================================================================== *
+ * All-agent combination configuration paths                             *
+ * ================================================================== */
+
+describe('all-agent combination configuration paths', () => {
+  const discovered = mockDiscoveredAvailable();
+
+  it('all-Claude: every role assigned to claude', async () => {
+    const prompt = mockPrompt([
+      'recommended',    // recommended settings
+      'claude',         // planner → claude
+      'claude',         // implementer → claude
+      'claude',         // auditor → claude
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    expect(config.roles).toBeDefined();
+    expect(config.roles.planner).toBe('claude');
+    expect(config.roles.implementer).toBe('claude');
+    expect(config.roles.auditor).toBe('claude');
+  });
+
+  it('all-Codex: every role assigned to codex', async () => {
+    const prompt = mockPrompt([
+      'recommended',    // recommended settings
+      'codex',          // planner → codex
+      'codex',          // implementer → codex
+      'codex',          // auditor → codex
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    expect(config.roles).toBeDefined();
+    expect(config.roles.planner).toBe('codex');
+    expect(config.roles.implementer).toBe('codex');
+    expect(config.roles.auditor).toBe('codex');
+    // No Claude selected → no Claude settings prompt consumed.
+  });
+
+  it('all-Manual: every role is Manual / External', async () => {
+    const prompt = mockPrompt([
+      'recommended',    // recommended settings
+      'manual',         // planner → manual
+      'manual',         // implementer → manual
+      'manual',         // auditor → manual
+      // No agents selected → no agent settings prompts.
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    expect(config.roles).toBeDefined();
+    expect(config.roles.planner).toBe('manual');
+    expect(config.roles.implementer).toBe('manual');
+    expect(config.roles.auditor).toBe('manual');
+  });
+
+  it('mixed: Claude planner, Codex implementer, manual auditor', async () => {
+    const prompt = mockPrompt([
+      'recommended',    // recommended settings
+      'claude',         // planner → claude
+      'codex',          // implementer → codex
+      'manual',         // auditor → manual
+      'acceptEdits', 'interactive',
+    ]);
+    const config = await buildConfig({ existingConfig: {}, prompt, discovered });
+    expect(config.roles).toBeDefined();
+    expect(config.roles.planner).toBe('claude');
+    expect(config.roles.implementer).toBe('codex');
+    expect(config.roles.auditor).toBe('manual');
+  });
+});
+
+/* ================================================================== *
+ * Summary output for all role combinations                              *
+ * ================================================================== */
+
+describe('summary output for all role combinations', () => {
+  it('all-Claude summary shows Claude for all three roles', () => {
+    const summary = formatSummary(
+      {},
+      { planner: 'claude', implementer: 'claude', auditor: 'claude' },
+    );
+    expect(summary).toContain('Planner: Claude');
+    expect(summary).toContain('Implementer: Claude');
+    expect(summary).toContain('Auditor: Claude');
+    expect(summary).toContain('Claude Agent Settings');
+  });
+
+  it('all-Codex summary shows Codex for all three roles', () => {
+    const summary = formatSummary(
+      {},
+      { planner: 'codex', implementer: 'codex', auditor: 'codex' },
+    );
+    expect(summary).toContain('Planner: Codex');
+    expect(summary).toContain('Implementer: Codex');
+    expect(summary).toContain('Auditor: Codex');
+    // Codex appears in the agent settings section even without configurable settings.
+    expect(summary).toContain('Codex Agent Settings');
+  });
+
+  it('all-Manual summary shows Manual / External for all three roles', () => {
+    const summary = formatSummary(
+      {},
+      { planner: 'manual', implementer: 'manual', auditor: 'manual' },
+    );
+    expect(summary).toContain('Planner: Manual / External');
+    expect(summary).toContain('Implementer: Manual / External');
+    expect(summary).toContain('Auditor: Manual / External');
+    // No agent settings section when all roles are manual.
+    expect(summary).not.toContain('Agent Settings');
+  });
+
+  it('mixed summary shows exact choices', () => {
+    const summary = formatSummary(
+      {},
+      { planner: 'manual', implementer: 'codex', auditor: 'claude' },
+    );
+    expect(summary).toContain('Planner: Manual / External');
+    expect(summary).toContain('Implementer: Codex');
+    expect(summary).toContain('Auditor: Claude');
+  });
+});
+
+/* ================================================================== *
+ * Agent-router manual dispatch                                          *
+ * ================================================================== */
+
+describe('agent-router manual dispatch', () => {
+  it('runImplementer and runAuditor are importable functions', async () => {
+    const { runImplementer, runAuditor } = await import('./agent-router.mjs');
+    expect(runImplementer).toBeTypeOf('function');
+    expect(runAuditor).toBeTypeOf('function');
+  });
+
+  it('runCodexImplement and runClaudeAudit are exported', async () => {
+    const { runCodexImplement, runClaudeAudit } = await import('./agent-router.mjs');
+    expect(runCodexImplement).toBeTypeOf('function');
+    expect(runClaudeAudit).toBeTypeOf('function');
+  });
+
+  it('runClaudeAudit is a function that accepts prompt and onStdout', () => {
+    // Verify signature: ({ prompt, onStdout }) => Promise<{ok, text, raw, error}>
+    expect(async () => {
+      const { runClaudeAudit } = await import('./agent-router.mjs');
+      return typeof runClaudeAudit;
+    }).not.toThrow();
+  });
+
+  it('runCodexImplement is a function that accepts prompt and onStdout', () => {
+    expect(async () => {
+      const { runCodexImplement } = await import('./agent-router.mjs');
+      return typeof runCodexImplement;
+    }).not.toThrow();
+  });
+
+  it('resolveRoleProvider returns manual identity for manual mapping', async () => {
+    const { resolveRoleProvider } = await import('./agent-router.mjs');
+    const manualMapping = {
+      planner: 'manual',
+      implementer: 'manual',
+      auditor: 'manual',
+    };
+    const impl = resolveRoleProvider('implementer', manualMapping);
+    expect(impl.provider).toBe('manual');
+    expect(impl.identity).toBe('MANUAL');
+
+    const aud = resolveRoleProvider('auditor', manualMapping);
+    expect(aud.provider).toBe('manual');
+    expect(aud.identity).toBe('MANUAL');
+  });
+
+  it('resolveRoleProvider returns correct identities for all providers', async () => {
+    const { resolveRoleProvider } = await import('./agent-router.mjs');
+    const mapping = { planner: 'claude', implementer: 'codex', auditor: 'claude' };
+    expect(resolveRoleProvider('planner', mapping).identity).toBe('CLAUDE');
+    expect(resolveRoleProvider('implementer', mapping).identity).toBe('CODEX');
+    expect(resolveRoleProvider('auditor', mapping).identity).toBe('CLAUDE');
+  });
+
+  it('runClaudeAudit uses read-only permission mode', async () => {
+    const { runClaudeAudit } = await import('./agent-router.mjs');
+    // The function exists and accepts { prompt, onStdout }.
+    expect(runClaudeAudit).toBeTypeOf('function');
+    expect(runClaudeAudit.length).toBe(1); // one parameter (destructured)
+  });
+
+  it('buildClaudeArgs with permissionMode override produces correct args', async () => {
+    const { buildClaudeArgs } = await import('./claude-agent.mjs');
+    // Without override: uses the default CLAUDE_PERMISSION_MODE.
+    const defaultArgs = buildClaudeArgs({ sessionId: null, resume: false });
+    const permIndex = defaultArgs.indexOf('--permission-mode');
+    expect(permIndex).not.toBe(-1);
+    // The value after --permission-mode should be present.
+    expect(defaultArgs[permIndex + 1]).toBeTruthy();
+
+    // With override: uses the provided value.
+    const auditArgs = buildClaudeArgs({ sessionId: null, resume: false, permissionMode: 'plan' });
+    const auditPermIndex = auditArgs.indexOf('--permission-mode');
+    expect(auditArgs[auditPermIndex + 1]).toBe('plan');
+  });
+});
+
+/* ================================================================== *
+ * runSetup cancellation path                                            *
+ * ================================================================== */
+
+describe('runSetup existing-config menu', () => {
+  it('cancel leaves existing config byte-for-byte unchanged', async () => {
+    const dir = makeProject({ config: { repo: 'org/original', publishMode: 'auto' } });
+    const configPath = path.join(dir, 'agentloop.config.json');
+    const originalContent = fs.readFileSync(configPath, 'utf8');
+
+    const prompt = mockPrompt([
+      'cancel',  // existing-config menu: select [3] Cancel
+    ]);
+
+    const result = await runSetup({ projectRoot: dir, prompt });
+    expect(result.saved).toBe(false);
+    expect(result.config).toBeNull();
+    expect(result.reason).toContain('cancelled');
+
+    // On-disk config is unchanged, byte-for-byte.
+    expect(fs.readFileSync(configPath, 'utf8')).toBe(originalContent);
+  });
+
+  it('recommended path writes fresh config with user-chosen roles', async () => {
+    const dir = makeProject({ config: { repo: 'org/original', publishMode: 'auto' } });
+    const configPath = path.join(dir, 'agentloop.config.json');
+
+    const prompt = mockPrompt([
+      'recommended',    // existing-config menu: select [1] Recommended
+      // Agent discovery is display-only.
+      'manual',         // planner → Manual / External
+      'claude',         // implementer → Claude
+      'codex',          // auditor → Codex
+      // Agent settings for Claude.
+      'acceptEdits',    // Claude permission mode
+      'interactive',    // Claude relay mode
+      true,             // confirm save
+    ]);
+
+    const result = await runSetup({ projectRoot: dir, prompt });
+    expect(result.saved).toBe(true);
+    expect(result.config).toBeDefined();
+    // Roles reflect user's fresh choices, not the old config.
+    expect(result.config.roles).toBeDefined();
+    expect(result.config.roles.planner).toBe('manual');
+    expect(result.config.roles.implementer).toBe('claude');
+    expect(result.config.roles.auditor).toBe('codex');
+
+    // Config was written to disk.
+    const written = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    expect(written.roles.planner).toBe('manual');
+    expect(written.roles.implementer).toBe('claude');
+    expect(written.roles.auditor).toBe('codex');
+    // Old publishMode is not carried forward on recommended path.
+    expect(written.publishMode).toBeUndefined();
+  });
+
+  it('review path preserves existing values as defaults', async () => {
+    const dir = makeProject({
+      config: {
+        repo: 'org/existing',
+        publishMode: 'auto',
+        roles: { planner: 'codex', implementer: 'codex', auditor: 'claude' },
+        claude: { permissionMode: 'default', relayMode: 'auto' },
+      },
+    });
+    const configPath = path.join(dir, 'agentloop.config.json');
+
+    const prompt = mockPrompt([
+      'review',         // existing-config menu: select [2] Review
+      'recommended',    // project: recommended (fast path)
+      // Roles — user accepts existing values.
+      'codex',          // planner → keeps existing codex
+      'codex',          // implementer → keeps existing codex
+      'claude',         // auditor → keeps existing claude
+      // Agent settings — keep existing.
+      'default',        // Claude permission mode
+      'auto',           // Claude relay mode
+      true,             // confirm save
+    ]);
+
+    const result = await runSetup({ projectRoot: dir, prompt });
+    expect(result.saved).toBe(true);
+    expect(result.config.roles.planner).toBe('codex');
+    expect(result.config.roles.implementer).toBe('codex');
+    expect(result.config.roles.auditor).toBe('claude');
+    expect(result.config.claude.permissionMode).toBe('default');
+    expect(result.config.claude.relayMode).toBe('auto');
+  });
+
+  it('declining save after making changes does not write', async () => {
+    const dir = makeProject({ config: { repo: 'org/original' } });
+    const configPath = path.join(dir, 'agentloop.config.json');
+    const originalContent = fs.readFileSync(configPath, 'utf8');
+
+    const prompt = mockPrompt([
+      'recommended',    // existing-config: recommended
+      'manual',         // planner
+      'manual',         // implementer
+      'manual',         // auditor
+      false,            // confirm save → NO
+    ]);
+
+    const result = await runSetup({ projectRoot: dir, prompt });
+    expect(result.saved).toBe(false);
+    expect(fs.readFileSync(configPath, 'utf8')).toBe(originalContent);
+  });
+});
+
+/* ================================================================== *
+ * Runtime check entry UX improvements                                  *
+ * ================================================================== */
 
 /* ================================================================== *
  * Runtime check entry UX improvements                                  *
@@ -1285,7 +1649,7 @@ describe('runtime check entry UX', () => {
 
   it('empty name is rejected instead of finishing the loop', async () => {
     const prompt = mockPrompt([
-      false,            // recommended: decline fast path
+      'custom',          // recommended: decline fast path
       '', '', '', '',   // project
       true,             // use default checks
       'standard',       // profile
@@ -1298,8 +1662,8 @@ describe('runtime check entry UX', () => {
       // Checks exist → exit outer loop
       'manual', '',     // controller
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -1311,7 +1675,7 @@ describe('runtime check entry UX', () => {
 
   it('empty command is rejected instead of finishing the loop', async () => {
     const prompt = mockPrompt([
-      false,            // recommended: decline fast path
+      'custom',          // recommended: decline fast path
       '', '', '', '',   // project
       true,             // use default checks
       'standard',       // profile
@@ -1322,8 +1686,8 @@ describe('runtime check entry UX', () => {
       false,            // Add another? → no
       'manual', '',     // controller
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -1335,7 +1699,7 @@ describe('runtime check entry UX', () => {
 
   it('duplicate name is rejected and re-prompted', async () => {
     const prompt = mockPrompt([
-      false,            // recommended: decline fast path
+      'custom',          // recommended: decline fast path
       '', '', '', '',   // project
       true,             // use default checks
       'standard',       // profile
@@ -1349,8 +1713,8 @@ describe('runtime check entry UX', () => {
       false,            // add another? → no
       'manual', '',     // controller
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -1362,7 +1726,7 @@ describe('runtime check entry UX', () => {
 
   it('duplicate command is rejected and re-prompted', async () => {
     const prompt = mockPrompt([
-      false,            // recommended: decline fast path
+      'custom',          // recommended: decline fast path
       '', '', '', '',   // project
       true,             // use default checks
       'standard',       // profile
@@ -1376,8 +1740,8 @@ describe('runtime check entry UX', () => {
       false,            // add another? → no
       'manual', '',     // controller
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -1388,7 +1752,7 @@ describe('runtime check entry UX', () => {
 
   it('"add another?" stops the loop when false', async () => {
     const prompt = mockPrompt([
-      false,            // recommended: decline fast path
+      'custom',          // recommended: decline fast path
       '', '', '', '',   // project
       true,             // use default checks
       'standard',       // profile
@@ -1398,8 +1762,8 @@ describe('runtime check entry UX', () => {
       false,            // add another? → no
       'manual', '',     // controller
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });
@@ -1411,7 +1775,7 @@ describe('runtime check entry UX', () => {
 
   it('multiple runtime checks can be added', async () => {
     const prompt = mockPrompt([
-      false,            // recommended: decline fast path
+      'custom',          // recommended: decline fast path
       '', '', '', '',   // project
       true,             // use default checks
       'standard',       // profile
@@ -1427,8 +1791,8 @@ describe('runtime check entry UX', () => {
       false,            // add another? → no
       'manual', '',     // controller
       'manual',         // planner
-      true,             // implementer
-      true,             // auditor
+      'claude',         // implementer
+      'codex',          // auditor
       'acceptEdits', 'interactive',
     ]);
     const config = await buildConfig({ existingConfig: {}, prompt, discovered });

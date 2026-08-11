@@ -14,26 +14,29 @@
 export const LOGICAL_ROLES = Object.freeze(['planner', 'implementer', 'auditor']);
 
 /**
- * Value for the planner role when no agent is launched.
+ * Value for a role when no agent is launched.
  *
- * The user supplies a pre-approved implementation task — planning may have
- * been done by a human, ChatGPT, another tool, or an external process.
- * ALCLI does not launch a planning agent in this configuration.
+ * The work for that role is done outside ALCLI — by a human, a different
+ * tool, or an external process.  ALCLI does not launch an agent for the
+ * role when this value is set.
+ *
+ * Valid for planner, implementer, and auditor.
  */
-export const MANUAL_PLANNER = 'manual';
+export const MANUAL_EXTERNAL = 'manual';
 
 /**
  * Which logical roles each supported provider can fill.
  *
- * "claude" supports planner and implementer — it is the default workhorse.
- * "codex" supports auditor only — it is purpose-built for read-only review.
+ * Every known provider supports every role at the configuration level.
+ * The setup experience allows any assignment; the agent-router enforces
+ * which combinations have working run functions at runtime.
  *
  * Adding a new provider means adding it here and supplying a run function in
  * the agent-router module.
  */
 export const PROVIDER_CAPABILITIES = Object.freeze({
-  claude: Object.freeze(['planner', 'implementer']),
-  codex: Object.freeze(['auditor']),
+  claude: Object.freeze(['planner', 'implementer', 'auditor']),
+  codex: Object.freeze(['planner', 'implementer', 'auditor']),
 });
 
 /**
@@ -84,15 +87,11 @@ export function resolveProvider(role, mapping) {
     );
   }
 
-  // Manual / External Planner is not a real provider — it signals that
-  // ALCLI does not launch a planning agent.  It is only valid for planner.
-  if (provider === MANUAL_PLANNER) {
-    if (role !== 'planner') {
-      throw new Error(
-        `"${MANUAL_PLANNER}" is only valid for the planner role, not "${role}".`,
-      );
-    }
-    return { provider: MANUAL_PLANNER };
+  // Manual / External is not a real provider — it signals that
+  // ALCLI does not launch an agent for this role.  It is valid for
+  // planner, implementer, and auditor.
+  if (provider === MANUAL_EXTERNAL) {
+    return { provider: MANUAL_EXTERNAL };
   }
 
   const capabilities = PROVIDER_CAPABILITIES[provider];

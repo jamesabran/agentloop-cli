@@ -319,3 +319,51 @@ describe('terminal Claude recovery', () => {
     expect(recovered.recoveryRequired).toBe(false);
   });
 });
+
+describe('manual implementation handoff state', () => {
+  const A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+  it('implementHeadBefore is included in emptyState', () => {
+    const state = emptyState();
+    expect(state).toHaveProperty('implementHeadBefore');
+    expect(state.implementHeadBefore).toBeNull();
+  });
+
+  it('implementHeadBefore survives save and reload', () => {
+    const file = tempFile();
+    const state = {
+      ...emptyState(),
+      task: 'test-manual',
+      branch: 'agent/task-test',
+      implementHeadBefore: A,
+    };
+    saveState(state, file);
+    const loaded = loadState(file);
+    expect(loaded.implementHeadBefore).toBe(A);
+  });
+
+  it('implementHeadBefore is null after fresh start', () => {
+    const state = emptyState();
+    expect(state.implementHeadBefore).toBeNull();
+  });
+
+  it('manualImplementationPending is false after fresh start', () => {
+    const state = emptyState();
+    expect(state.manualImplementationPending).toBe(false);
+  });
+
+  it('manualImplementationPending survives save and reload', () => {
+    const file = tempFile();
+    const state = {
+      ...emptyState(),
+      task: 'test-manual',
+      branch: 'agent/task-test',
+      implementHeadBefore: null,
+      manualImplementationPending: true,
+    };
+    saveState(state, file);
+    const loaded = loadState(file);
+    expect(loaded.manualImplementationPending).toBe(true);
+    expect(loaded.implementHeadBefore).toBeNull();
+  });
+});
