@@ -205,3 +205,40 @@ Planner architecture, new workflow stages, Setup/Home UI, provider
 refactors, roadmap items. No new config surface was introduced — `claude
 .relayMode` and hard-deny/allowlist config are unchanged in shape; only
 their *behavior* at the ask-tier boundary changed to close the bypass.
+
+## Auditor audit — 2026-08-13
+
+**Revision audited:** `a968e9c0d0880f76f4a02b1d64a4e64d59325e78` (`fix: apply risk-based auto permission policy`)
+
+### Outcome: APPROVED
+
+The committed implementation satisfies the Auto Mode risk-based permission policy. `classifyDeletion` makes a narrow, deliberately bounded decision for plain Bash `rm` calls using only the existing tool input and repository root; it is embedded in the generated PreToolUse hook and mirrored in the existing controller watcher as defense in depth.
+
+### Behavior and safety review
+
+- Routine repo-local non-recursive, non-wildcard `rm` receives an explicit hook-side `allow` before request-file IPC, so it has zero interactive relay invocation. Existing static allowed tools retain their existing zero-relay route through Claude's `--allowedTools` grant.
+- The canonical hook path resolves hard-deny and deletion `deny` before IPC; only `ask` (and non-`rm` requests that retain their existing default) writes into the nonce-protected relay. The controller repeats hard-deny and deletion checks only as a defense-in-depth response if a request somehow reaches it.
+- The watcher preserves interactive prompting for ask-tier requests. In unattended `auto` mode it now sends a denial response for ask-tier work, rather than blindly approving it; this is fail-closed and is not a `bypassPermissions`-equivalent path.
+- Classifier coverage and implementation agree on the required boundaries: project-local plain targets allow; recursive flags, wildcards, shell metacharacters/command chains, missing targets, and targets outside the repository ask; `/`, home targets, project-root targets, `.git`, and Windows drive roots deny. It uses Node `path.resolve`/`path.relative` for the platform path comparison, plus explicit Windows-root detection.
+- Existing hard-deny and static allowlist structures are retained. External or otherwise unclassified mutations fall through to the established ask path (or an existing hard deny such as `WebFetch`); no approval override was broadened.
+
+### Scope and implementation review
+
+No policy DSL, generic rules engine, command-parser framework, provider abstraction, configuration surface, or unrelated permission-system refactor was introduced. The duplicated small classifier in the generated hook is necessary because the existing hook is a self-contained generated script; the controller-side recheck follows the pre-existing hard-deny defense-in-depth pattern. No new use of `bypassPermissions` was introduced.
+
+### Evidence reviewed
+
+- Commit diff for `permission-relay.mjs`, `claude-agent.mjs`, and their focused regression tests.
+- `permission-relay.test.mjs` coverage for allow/ask/deny classification, cross-platform drive-root handling, project-root and outside-project behavior, `$HOME`, and generated hook syntax/embedding.
+- Existing configuration and relay flow, including the fixed allowed-tools and hard-deny boundaries, interactive prompt behavior, and nonce-correlated IPC.
+
+No additional project commands were run during this audit: the project rules reserve typecheck, lint, test, and build execution for the controller, and the committed handoff records those checks passing for this exact change.
+
+AGENTLOOP_AGENT_STATUS
+ROLE: AUDITOR
+STATUS: APPROVED
+TASK: auto-mode-risk-based-permission-policy
+HEAD: a968e9c0d0880f76f4a02b1d64a4e64d59325e78
+BLOCKERS: 0
+NEXT: CONTROLLER
+END_STATUS
