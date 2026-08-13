@@ -23,6 +23,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   buildToolEntry,
   checkHardDeny,
+  classifyDeletion,
   createRelayWorkDir,
   isAllowedByConfig,
   parseChoice,
@@ -128,6 +129,85 @@ describe('isAllowedByConfig', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * classifyDeletion — Bash `rm` blast-radius classification             *
+ * ------------------------------------------------------------------ */
+
+describe('classifyDeletion', () => {
+  const repoRoot = process.platform === 'win32'
+    ? 'C:\\Users\\dev\\project'
+    : '/home/dev/project';
+
+  it('returns null for non-Bash tools', () => {
+    expect(classifyDeletion('Read', { file_path: 'foo.txt' }, repoRoot)).toBeNull();
+    expect(classifyDeletion('Write', { file_path: 'foo.txt' }, repoRoot)).toBeNull();
+  });
+
+  it('returns null for Bash commands that are not a plain `rm`', () => {
+    expect(classifyDeletion('Bash', { command: 'ls -la' }, repoRoot)).toBeNull();
+    expect(classifyDeletion('Bash', { command: 'rmdir empty' }, repoRoot)).toBeNull();
+    expect(classifyDeletion('Bash', { command: 'echo rm foo' }, repoRoot)).toBeNull();
+  });
+
+  it('allows a narrow, project-scoped removal', () => {
+    expect(classifyDeletion('Bash', { command: 'rm foo.txt' }, repoRoot)).toBe('allow');
+    expect(classifyDeletion('Bash', { command: 'rm src/tmp.log' }, repoRoot)).toBe('allow');
+    expect(classifyDeletion('Bash', { command: 'rm a.txt b.txt' }, repoRoot)).toBe('allow');
+  });
+
+  it('asks for a bare `rm` with no target', () => {
+    expect(classifyDeletion('Bash', { command: 'rm -f' }, repoRoot)).toBe('ask');
+  });
+
+  it('asks for recursive removal', () => {
+    expect(classifyDeletion('Bash', { command: 'rm -rf build' }, repoRoot)).toBe('ask');
+    expect(classifyDeletion('Bash', { command: 'rm -r build' }, repoRoot)).toBe('ask');
+    expect(classifyDeletion('Bash', { command: 'rm --recursive build' }, repoRoot)).toBe('ask');
+  });
+
+  it('asks for a wildcarded target', () => {
+    expect(classifyDeletion('Bash', { command: 'rm src/*.log' }, repoRoot)).toBe('ask');
+  });
+
+  it('asks for a target outside the project', () => {
+    expect(classifyDeletion('Bash', { command: 'rm ../sibling/file.txt' }, repoRoot)).toBe('ask');
+  });
+
+  it('asks for a chained or substituted command', () => {
+    expect(classifyDeletion('Bash', { command: 'rm foo.txt && echo done' }, repoRoot)).toBe('ask');
+    expect(classifyDeletion('Bash', { command: 'rm foo.txt; ls' }, repoRoot)).toBe('ask');
+    expect(classifyDeletion('Bash', { command: 'rm "$(dirname foo)"' }, repoRoot)).toBe('ask');
+  });
+
+  it('denies well-known dangerous targets', () => {
+    expect(classifyDeletion('Bash', { command: 'rm -rf /' }, repoRoot)).toBe('deny');
+    expect(classifyDeletion('Bash', { command: 'rm -rf ~' }, repoRoot)).toBe('deny');
+    expect(classifyDeletion('Bash', { command: 'rm -rf ~/notes' }, repoRoot)).toBe('deny');
+    expect(classifyDeletion('Bash', { command: 'rm -rf $HOME' }, repoRoot)).toBe('deny');
+    expect(classifyDeletion('Bash', { command: 'rm -rf $HOME/notes' }, repoRoot)).toBe('deny');
+    expect(classifyDeletion('Bash', { command: 'rm -rf .git' }, repoRoot)).toBe('deny');
+    expect(classifyDeletion('Bash', { command: 'rm -rf .git/config' }, repoRoot)).toBe('deny');
+    expect(classifyDeletion('Bash', { command: 'rm -rf .' }, repoRoot)).toBe('deny');
+    expect(classifyDeletion('Bash', { command: 'rm -rf ..' }, repoRoot)).toBe('deny');
+  });
+
+  it('denies a Windows drive root regardless of platform', () => {
+    expect(classifyDeletion('Bash', { command: 'rm -rf C:\\' }, repoRoot)).toBe('deny');
+    expect(classifyDeletion('Bash', { command: 'rm -rf C:/' }, repoRoot)).toBe('deny');
+    expect(classifyDeletion('Bash', { command: 'rm -rf D:' }, repoRoot)).toBe('deny');
+  });
+
+  it('denies a target that resolves to the project root itself', () => {
+    expect(classifyDeletion('Bash', { command: `rm -rf ${repoRoot}` }, repoRoot)).toBe('deny');
+  });
+
+  it('does not force ask/deny for outside-project targets when repoRoot is unknown', () => {
+    // No repoRoot to compare against — still safe: falls through to 'allow'
+    // only for a narrow, non-dangerous, non-recursive, non-wildcarded target.
+    expect(classifyDeletion('Bash', { command: 'rm ../sibling/file.txt' }, null)).toBe('allow');
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * parseChoice                                                          *
  * ------------------------------------------------------------------ */
 
@@ -186,6 +266,40 @@ describe('temp directory outside repo', () => {
     expect(script).toContain('nonce');
     // Must embed the workDir path for file IPC (JSON-serialised).
     expect(script).toContain('WORK_DIR');
+  });
+
+  it('writeHookSettings embeds repoRoot and the deletion-scope classifier, and the result is syntactically valid', async () => {
+    const dir = makeWorkDir();
+    const repoRoot = process.platform === 'win32' ? 'C:\\proj' : '/proj';
+    const { hookScriptPath } = writeHookSettings(dir, {
+      denyPatterns: ['Bash(git push*)'],
+      allowPatterns: ['Read'],
+      repoRoot,
+    });
+
+    const script = fs.readFileSync(hookScriptPath, 'utf8');
+    expect(script).toContain('classifyDeletion');
+    expect(script).toContain(JSON.stringify(repoRoot));
+
+    // The generated file is a real ES module; importing it exercises the
+    // parser (a live syntax check) without hitting the stdin/subprocess
+    // path, which is flaky on Windows CI. `main()` reads stdin and hangs
+    // waiting for input, so run it in a child with stdin already closed —
+    // it must reach EOF (no tool_name) and exit 0, not throw or hang.
+    const { execFileSync } = await import('node:child_process');
+    const result = execFileSync(process.execPath, [hookScriptPath], {
+      input: '',
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    expect(result.trim()).toBe('');
+  });
+
+  it('generates a script with repoRoot null when none is supplied', () => {
+    const dir = makeWorkDir();
+    const { hookScriptPath } = writeHookSettings(dir, { denyPatterns: [], allowPatterns: [] });
+    const script = fs.readFileSync(hookScriptPath, 'utf8');
+    expect(script).toContain('var REPO_ROOT = null;');
   });
 
   it('removeRelayWorkDir cleans up the entire temp directory', () => {

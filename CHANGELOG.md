@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/) —
 though it is pre-1.0, so minor versions may still include breaking changes.
 
+## [Unreleased]
+
+### Changed
+
+- **Risk-based permission classification replaces auto-relay blanket
+  approval.** The PreToolUse hook and the controller's relay watcher now
+  resolve every request to `allow` / `ask` / `deny` before it can execute,
+  instead of the previous binary hard-deny-or-relay check. A Bash `rm` is
+  classified by blast radius (`classifyDeletion` in `permission-relay.mjs`):
+  a narrow, project-scoped removal is approved without reaching the relay at
+  all; a target such as `/`, `~`, a Windows drive root, or `.git` is denied
+  before any file IPC; anything recursive, wildcarded, chained, or outside
+  the project falls through to the existing relay as a genuine ask-tier
+  request. `claude.relayMode: "auto"` no longer auto-approves every
+  non-hard-denied request — with no user available to prompt, an ask-tier
+  request is now denied rather than approved without review, closing what
+  was effectively an unrestricted bypass for unattended runs. Hard-deny
+  rules, the static allowlist, and `interactive` relay mode are unchanged.
+
 ## [0.3.0] - 2026-08-11
 
 ### Added

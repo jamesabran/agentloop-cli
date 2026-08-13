@@ -15,6 +15,15 @@
  * configured so that permission requests for tools outside the static
  * allowlist are relayed to the user via `.agent/permission-request.json`
  * and `.agent/permission-response.json` file IPC.
+ *
+ * Every request resolves to allow/ask/deny before it can execute: hard-deny
+ * patterns and the static allowlist are checked first (unchanged), then a
+ * narrow, project-scoped `rm` is classified by blast radius — see
+ * `classifyDeletion` in permission-relay.mjs — so routine deletions execute
+ * without ever reaching the relay, while a dangerous target is denied before
+ * any file IPC. Anything left over is genuine ask-tier: the relay prompts an
+ * interactive user, or — with no user available in unattended `auto` relay
+ * mode — is denied rather than blind-approved.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -32,6 +41,7 @@ import {
 import {
   buildToolEntry,
   checkHardDeny,
+  classifyDeletion,
   cleanRelayFiles,
   createRelayWorkDir,
   pollForRequest,
@@ -250,6 +260,12 @@ export function classifyClaudeOutcome({ outcome, result, text, session }) {
  * to the controller's terminal.  The hook is only set up when TTY is
  * available and `AGENTLOOP_DISABLE_PERMISSION_RELAY` is not set.
  *
+ * Requests outside the static allowlist are not all treated as ask-tier: a
+ * narrow, project-scoped `rm` is allowed automatically, a dangerous one is
+ * denied automatically, and only genuinely uncertain requests reach the
+ * relay. In `auto` relay mode there is no user to prompt, so an ask-tier
+ * request is denied rather than approved without review.
+ *
  * @param {{
  *   prompt: string,
  *   sessionId?: string|null,
@@ -297,6 +313,7 @@ export async function runClaude({ prompt, sessionId = null, resume = false, perm
     const { settingsPath } = writeHookSettings(relayWorkDir, {
       denyPatterns: [...CLAUDE_HARD_DENY_PATTERNS],
       allowPatterns: allowedList,
+      repoRoot: REPO_ROOT,
     });
 
     args.push('--settings', settingsPath);
@@ -327,6 +344,9 @@ export async function runClaude({ prompt, sessionId = null, resume = false, perm
           const toolUseId = typeof request.tool_use_id === 'string' ? request.tool_use_id : 'unknown';
 
           // Belt-and-braces hard-deny re-check — enforced in every mode.
+          // (The hook already applies this; a request only reaches this
+          // relay at all when the hook did not resolve it, so this is
+          // defense-in-depth, not the primary gate.)
           const hardCheck = checkHardDeny(toolName, toolInput, CLAUDE_HARD_DENY_PATTERNS);
           if (hardCheck.denied) {
             writeResponse(wd, toolUseId, {
@@ -338,10 +358,37 @@ export async function runClaude({ prompt, sessionId = null, resume = false, perm
             continue;
           }
 
-          // Auto mode: approve after hard-deny check, no user prompt.
-          if (relayAuto) {
+          // Belt-and-braces deletion-scope re-check — mirrors the hook's own
+          // gate so a routine or dangerous `rm` is decided the same way even
+          // if it somehow reaches the relay.
+          const deletionDecision = classifyDeletion(toolName, toolInput, REPO_ROOT);
+          if (deletionDecision === 'deny') {
+            writeResponse(wd, toolUseId, {
+              approved: false,
+              nonce,
+              reason: 'Blocked by ALCLI policy: dangerous deletion target.',
+            });
+            onLog?.('[claude-agent] denied dangerous deletion: ' + (buildToolEntry(toolName, toolInput) ?? toolName));
+            continue;
+          }
+          if (deletionDecision === 'allow') {
             writeResponse(wd, toolUseId, { approved: true, nonce });
-            onLog?.('[claude-agent] auto-approved: ' + (buildToolEntry(toolName, toolInput) ?? toolName));
+            onLog?.('[claude-agent] auto-approved (routine): ' + (buildToolEntry(toolName, toolInput) ?? toolName));
+            continue;
+          }
+
+          // Everything else reaching this point is a genuine ask-tier
+          // request: broad/ambiguous, external, or otherwise uncertain.
+          // Auto mode has no user to ask — it fails closed rather than
+          // blind-approving, which would be an unrestricted bypass in all
+          // but name. Interactive mode still relays to the terminal.
+          if (relayAuto) {
+            writeResponse(wd, toolUseId, {
+              approved: false,
+              nonce,
+              reason: 'Requires manual approval; unattended auto mode has no user to prompt.',
+            });
+            onLog?.('[claude-agent] ask-tier request denied in unattended auto mode: ' + (buildToolEntry(toolName, toolInput) ?? toolName));
             continue;
           }
 

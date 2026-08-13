@@ -140,10 +140,10 @@ async function claudeSettingsHandler(existing, prompt) {
     ? existingClaude.relayMode
     : 'interactive';
   const relayMode = await prompt.select(
-    'ALCLI relay mode (permission requests outside the allowlist):',
+    'ALCLI relay mode (genuinely uncertain permission requests, after ALCLI\'s own allow/ask/deny check):',
     [
       { value: 'interactive', label: 'Interactive — relay to terminal for user approval (safe default)' },
-      { value: 'auto', label: 'Auto — auto-approve after hard-deny checks (unattended operation)' },
+      { value: 'auto', label: 'Auto — no user to prompt, so uncertain requests are denied (unattended operation)' },
     ],
     currentRelay,
   );

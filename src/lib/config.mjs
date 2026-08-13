@@ -397,13 +397,19 @@ export const CLAUDE_PERMISSION_MODE =
   process.env.AGENTLOOP_CLAUDE_PERMISSION_MODE ?? CLAUDE_CONFIG.permissionMode ?? 'acceptEdits';
 
 /**
- * ALCLI Claude relay mode — controls whether tool permission requests that
- * fall outside the static allowlist are relayed to the terminal user
- * ("interactive") or auto-approved after hard-deny checks ("auto").
+ * ALCLI Claude relay mode — controls what happens to a genuinely uncertain
+ * ("ask-tier") permission request once ALCLI's own allow/ask/deny
+ * classification has already let routine requests through and blocked
+ * dangerous ones. `"interactive"` relays ask-tier requests to the terminal
+ * user; `"auto"` has no user to prompt, so an ask-tier request is denied
+ * rather than approved without review.
  *
- * Hard-deny rules are always enforced regardless of mode — the relay hook
- * runs in both modes so that non-negotiable blocks (git push, gh, npm, node,
- * npx, chmod, chown, WebFetch, BypassPermissions) can never be approved.
+ * Hard-deny rules and ALCLI's routine/dangerous classification (see
+ * `classifyDeletion` in permission-relay.mjs) are always enforced regardless
+ * of mode — the relay hook runs in both modes so that non-negotiable blocks
+ * (git push, gh, npm, node, npx, chmod, chown, WebFetch, BypassPermissions)
+ * can never be approved, and so routine, project-scoped work (such as a
+ * narrow `rm`) executes without reaching the relay at all, in either mode.
  *
  * Set via `claude.relayMode` in agentloop.config.json or the
  * `AGENTLOOP_CLAUDE_RELAY_MODE` environment variable. An unrecognised value

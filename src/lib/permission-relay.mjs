@@ -5,14 +5,22 @@
  * `permissionDecision: "allow" | "deny"`.  This module provides both sides:
  *
  *  **Hook side** — runs as a Claude Code PreToolUse hook command.  Reads the
- *    tool-call JSON from stdin, checks against ALCLI hard-deny rules and the
- *    static `--allowedTools` list, and either exits silently (tools already
- *    allowed) or writes a nonce-protected request file to a temp directory
- *    outside the repository.
+ *    tool-call JSON from stdin and resolves it to allow/ask/deny before
+ *    anything reaches the relay: ALCLI hard-deny rules and the static
+ *    `--allowedTools` list are checked first (exits silently when a tool is
+ *    already allowed — Claude's own `--allowedTools` grant covers it), then
+ *    a Bash `rm` is classified by blast radius (see {@link classifyDeletion})
+ *    so a narrow, project-scoped removal is approved directly and a
+ *    dangerous target is denied directly. Only a genuinely uncertain request
+ *    writes a nonce-protected request file to a temp directory outside the
+ *    repository.
  *
- *  **Controller side** — polls the temp directory while Claude runs, checks
- *    hard-deny rules (belt-and-braces), prompts the interactive user, and
- *    writes a nonce-correlated decision back.
+ *  **Controller side** — polls the temp directory while Claude runs,
+ *    re-applies the same hard-deny and deletion-scope checks
+ *    (belt-and-braces), prompts the interactive user for what remains, and
+ *    writes a nonce-correlated decision back. With no user available (the
+ *    unattended `auto` relay mode), a request that reaches this point is
+ *    denied rather than approved without review.
  *
  * ## Safety boundaries
  *
@@ -33,8 +41,12 @@
  *    permission scopes because the PreToolUse hook input does not carry a
  *    Claude-supplied permission rule.
  *
- * Non-interactive runs never auto-approve — the relay is skipped entirely
- * when stdin is not a TTY.
+ * Non-interactive runs never auto-approve an ask-tier request — the relay
+ * hook is skipped entirely when stdin is not a TTY and the relay mode is not
+ * explicitly `auto`; and within `auto` mode, an ask-tier request has no user
+ * to prompt and is denied. Only requests ALCLI itself classifies as routine
+ * (a narrow, project-scoped `rm`, or a tool already on the static allowlist)
+ * execute without a human in the loop.
  *
  * The relay is only enabled for the standard `claude` binary.  When
  * `AGENTLOOP_CLAUDE_BIN` points to `claude-ds` or another tool, the hook
@@ -117,6 +129,110 @@ export function isAllowedByConfig(toolName, toolInput, allowedPatterns) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Deletion-scope classification (Bash `rm` only)                       *
+ *                                                                      *
+ * The static allowlist above is an exact-match list, so it can never   *
+ * cover `rm` — a safe removal and a catastrophic one share the same    *
+ * tool name and differ only in target and flags. This classifies a     *
+ * plain `rm` invocation by blast radius, using only the command string *
+ * and the project root already known to the runtime permission path —  *
+ * no shell parsing, no chained-command inference: anything with        *
+ * pipes/substitutions/chaining, or that isn't a bare `rm`, is left for *
+ * the normal ask-tier relay.                                           *
+ * ------------------------------------------------------------------ */
+
+const _SHELL_METACHARACTERS = /[|;&`$<>]/;
+const _WILDCARD_CHARS = /[*?[\]]/;
+const _WINDOWS_DRIVE_ROOT = /^[A-Za-z]:[\\/]?$/;
+
+function _rmInvocation(command) {
+  const trimmed = String(command ?? '').trim();
+  if (!/^rm\s+/.test(trimmed)) return null;
+
+  // `$HOME` is a known destructive target, not an ambiguous substitution.
+  // Recognise it before the general shell-metacharacter guard below so it
+  // reaches the hard-deny tier rather than the relay.
+  const rawTokens = trimmed.split(/\s+/).slice(1);
+  if (rawTokens.some((token) => token === '$HOME' || token.startsWith('$HOME/') || token.startsWith('$HOME\\'))) {
+    return 'dangerous';
+  }
+  if (_SHELL_METACHARACTERS.test(trimmed)) return 'ambiguous';
+
+  const tokens = trimmed.split(/\s+/).slice(1);
+  const flags = [];
+  const targets = [];
+  for (const token of tokens) {
+    if (token.length > 1 && token.startsWith('-')) flags.push(token);
+    else targets.push(token);
+  }
+  return { flags, targets };
+}
+
+function _isRecursiveRmFlag(flag) {
+  if (flag === '--recursive') return true;
+  if (/^-[A-Za-z]+$/.test(flag)) return /[rR]/.test(flag);
+  return false;
+}
+
+function _isDangerousRmTarget(target) {
+  const t = target.trim();
+  if (t === '' || t === '/' || t === '.' || t === '..' || t === '*' || t === '~') return true;
+  if (t.startsWith('~')) return true;
+  if (t === '$HOME' || t.startsWith('$HOME')) return true;
+  if (_WINDOWS_DRIVE_ROOT.test(t)) return true;
+  const normalised = t.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (
+    normalised === '.git' ||
+    normalised.startsWith('.git/') ||
+    normalised.endsWith('/.git') ||
+    normalised.includes('/.git/')
+  ) return true;
+  return false;
+}
+
+function _isOutsideProject(target, repoRoot) {
+  if (!repoRoot) return false;
+  const resolved = path.resolve(repoRoot, target);
+  const rel = path.relative(repoRoot, resolved);
+  if (rel === '') return true; // targets the project root itself
+  return rel.startsWith('..') || path.isAbsolute(rel);
+}
+
+/**
+ * Classify a Bash `rm` invocation by blast radius.
+ *
+ * @returns {'allow'|'ask'|'deny'|null} `null` when this is not a plain `rm`
+ *   command — the caller should fall through to its normal ask-tier default.
+ */
+export function classifyDeletion(toolName, toolInput, repoRoot) {
+  if (toolName !== 'Bash') return null;
+  const command = typeof toolInput?.command === 'string' ? toolInput.command : null;
+  if (command === null) return null;
+
+  const parsed = _rmInvocation(command);
+  if (parsed === null) return null;
+  if (parsed === 'dangerous') return 'deny';
+  if (parsed === 'ambiguous') return 'ask';
+
+  const { flags, targets } = parsed;
+  if (targets.length === 0) return 'ask';
+
+  for (const target of targets) {
+    if (_isDangerousRmTarget(target)) return 'deny';
+    if (repoRoot && path.resolve(repoRoot, target) === path.resolve(repoRoot)) return 'deny';
+  }
+
+  if (flags.some(_isRecursiveRmFlag)) return 'ask';
+
+  for (const target of targets) {
+    if (_WILDCARD_CHARS.test(target)) return 'ask';
+    if (_isOutsideProject(target, repoRoot)) return 'ask';
+  }
+
+  return 'allow';
+}
+
+/* ------------------------------------------------------------------ *
  * File-naming helpers (tool_use_id-scoped)                             *
  * ------------------------------------------------------------------ */
 
@@ -173,7 +289,7 @@ function _writeDecision({ decision, reason } = {}) {
   process.exit(0);
 }
 
-export async function runHook({ workDir, denyPatterns, allowPatterns }) {
+export async function runHook({ workDir, denyPatterns, allowPatterns, repoRoot }) {
   const input = await _readHookInput();
   if (!input || !input.tool_name) { process.exit(0); }
 
@@ -193,6 +309,17 @@ export async function runHook({ workDir, denyPatterns, allowPatterns }) {
   // 2. Static allowlist — exit silently, normal flow auto-approves.
   if (isAllowedByConfig(toolName, toolInput, allowPatterns)) {
     _writeDecision();
+  }
+
+  // 2b. Deletion-scope classification — narrow, project-scoped `rm` is
+  // approved directly; recursive/wildcard/ambiguous falls through to the
+  // relay (step 3); a dangerous target is denied before any file IPC.
+  const deletionDecision = classifyDeletion(toolName, toolInput, repoRoot);
+  if (deletionDecision === 'deny') {
+    _writeDecision({ decision: 'deny', reason: 'Blocked by ALCLI policy: dangerous deletion target.' });
+  }
+  if (deletionDecision === 'allow') {
+    _writeDecision({ decision: 'allow', reason: 'Narrow, project-scoped removal.' });
   }
 
   // 3. Relay to controller via nonce-protected file IPC in temp directory.
@@ -266,14 +393,14 @@ export function createRelayWorkDir() {
  * Write the hook settings file and helper script into `workDir`.
  *
  * @param {string} workDir
- * @param {{ denyPatterns?: string[], allowPatterns?: string[] }} config
+ * @param {{ denyPatterns?: string[], allowPatterns?: string[], repoRoot?: string|null }} config
  * @returns {{ settingsPath: string, hookScriptPath: string }}
  */
-export function writeHookSettings(workDir, { denyPatterns = [], allowPatterns = [] } = {}) {
+export function writeHookSettings(workDir, { denyPatterns = [], allowPatterns = [], repoRoot = null } = {}) {
   const settingsPath = path.join(workDir, 'hook-settings.json');
   const hookScriptPath = path.join(workDir, 'permission-hook.mjs');
 
-  const script = _generateHookScript({ workDir, denyPatterns, allowPatterns });
+  const script = _generateHookScript({ workDir, denyPatterns, allowPatterns, repoRoot });
   fs.writeFileSync(hookScriptPath, script, 'utf8');
 
   const settings = {
@@ -438,6 +565,7 @@ import path from 'node:path';
 var WORK_DIR = __WORK_DIR__;
 var DENY_PATTERNS = __DENY_PATTERNS__;
 var ALLOW_PATTERNS = __ALLOW_PATTERNS__;
+var REPO_ROOT = __REPO_ROOT__;
 
 /* ----- inlined utilities ----- */
 
@@ -501,6 +629,143 @@ function isAllowedByConfig(toolName, toolInput, allowedPatterns) {
     if (patternMatches(entry, allowedPatterns[i])) return true;
   }
   return false;
+}
+
+/* ----- deletion-scope classification (Bash \`rm\` only) ----- */
+
+var TAB_CHAR = String.fromCharCode(9);
+var BACKSLASH_CHAR = String.fromCharCode(92);
+var BACKTICK_CHAR = String.fromCharCode(96);
+var SHELL_META_CHARS = '|;&$<>' + BACKTICK_CHAR;
+var WILDCARD_CHARS = '*?[]';
+
+function _hasAnyChar(s, chars) {
+  for (var i = 0; i < s.length; i++) {
+    if (chars.indexOf(s.charAt(i)) !== -1) return true;
+  }
+  return false;
+}
+
+function _replaceAll(s, find, repl) {
+  return s.split(find).join(repl);
+}
+
+function _splitWhitespace(s) {
+  var tokens = [];
+  var current = '';
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charAt(i);
+    if (c === ' ' || c === TAB_CHAR) {
+      if (current !== '') { tokens.push(current); current = ''; }
+    } else {
+      current += c;
+    }
+  }
+  if (current !== '') tokens.push(current);
+  return tokens;
+}
+
+function _startsWithRmWord(s) {
+  if (s === 'rm') return true;
+  if (s.length < 3 || s.slice(0, 2) !== 'rm') return false;
+  var c = s.charAt(2);
+  return c === ' ' || c === TAB_CHAR;
+}
+
+function _hasHomeTargetToken(s) {
+  var tokens = _splitWhitespace(s).slice(1);
+  for (var i = 0; i < tokens.length; i++) {
+    var token = tokens[i];
+    if (
+      token === '$HOME' ||
+      token.slice(0, 6) === '$HOME/' ||
+      token.slice(0, 6) === '$HOME' + BACKSLASH_CHAR
+    ) return true;
+  }
+  return false;
+}
+
+function _isRecursiveRmFlag(flag) {
+  if (flag === '--recursive') return true;
+  if (flag.charAt(0) !== '-' || flag.charAt(1) === '-') return false;
+  for (var i = 1; i < flag.length; i++) {
+    var c = flag.charAt(i);
+    if (c === 'r' || c === 'R') return true;
+  }
+  return false;
+}
+
+function _isWindowsDriveRoot(t) {
+  if (t.length < 2 || t.length > 3) return false;
+  var c0 = t.charAt(0);
+  var isLetter = (c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z');
+  if (!isLetter || t.charAt(1) !== ':') return false;
+  if (t.length === 2) return true;
+  var c2 = t.charAt(2);
+  return c2 === BACKSLASH_CHAR || c2 === '/';
+}
+
+function _isDangerousRmTarget(target) {
+  if (target === '' || target === '/' || target === '.' || target === '..' || target === '*' || target === '~') return true;
+  if (target.charAt(0) === '~') return true;
+  if (target.slice(0, 5) === '$HOME') return true;
+  if (_isWindowsDriveRoot(target)) return true;
+  var normalised = _replaceAll(target, BACKSLASH_CHAR, '/');
+  while (normalised.length > 1 && normalised.charAt(normalised.length - 1) === '/') {
+    normalised = normalised.slice(0, -1);
+  }
+  if (
+    normalised === '.git' ||
+    normalised.slice(0, 5) === '.git/' ||
+    normalised.slice(-5) === '/.git' ||
+    normalised.indexOf('/.git/') !== -1
+  ) return true;
+  return false;
+}
+
+function _isOutsideProject(target, repoRoot) {
+  if (!repoRoot) return false;
+  var resolved = path.resolve(repoRoot, target);
+  var rel = path.relative(repoRoot, resolved);
+  if (rel === '') return true;
+  return rel.slice(0, 2) === '..' || path.isAbsolute(rel);
+}
+
+function classifyDeletion(toolName, toolInput, repoRoot) {
+  if (toolName !== 'Bash') return null;
+  var command = toolInput && typeof toolInput.command === 'string' ? toolInput.command : null;
+  if (command === null) return null;
+
+  var trimmed = command.trim();
+  if (!_startsWithRmWord(trimmed)) return null;
+  if (_hasHomeTargetToken(trimmed)) return 'deny';
+  if (_hasAnyChar(trimmed, SHELL_META_CHARS)) return 'ask';
+
+  var tokens = _splitWhitespace(trimmed).slice(1);
+  var flags = [];
+  var targets = [];
+  for (var i = 0; i < tokens.length; i++) {
+    var tok = tokens[i];
+    if (tok.length > 1 && tok.charAt(0) === '-') flags.push(tok);
+    else targets.push(tok);
+  }
+  if (targets.length === 0) return 'ask';
+
+  for (var j = 0; j < targets.length; j++) {
+    if (_isDangerousRmTarget(targets[j])) return 'deny';
+    if (repoRoot && path.resolve(repoRoot, targets[j]) === path.resolve(repoRoot)) return 'deny';
+  }
+
+  for (var k = 0; k < flags.length; k++) {
+    if (_isRecursiveRmFlag(flags[k])) return 'ask';
+  }
+
+  for (var m = 0; m < targets.length; m++) {
+    if (_hasAnyChar(targets[m], WILDCARD_CHARS)) return 'ask';
+    if (_isOutsideProject(targets[m], repoRoot)) return 'ask';
+  }
+
+  return 'allow';
 }
 
 function _safeId(id) {
@@ -567,6 +832,17 @@ async function main() {
     _writeDecision();
   }
 
+  // 2b. Deletion-scope classification: narrow, project-scoped \`rm\` is
+  // approved directly; a dangerous target is denied before any file IPC;
+  // anything recursive/wildcarded/ambiguous falls through to the relay.
+  var deletionDecision = classifyDeletion(toolName, toolInput, REPO_ROOT);
+  if (deletionDecision === 'deny') {
+    _writeDecision({ decision: 'deny', reason: 'Blocked by ALCLI policy: dangerous deletion target.' });
+  }
+  if (deletionDecision === 'allow') {
+    _writeDecision({ decision: 'allow', reason: 'Narrow, project-scoped removal.' });
+  }
+
   // 3. Relay via temp directory (outside repo — Claude cannot Write here).
   var reqPath = path.join(WORK_DIR, 'perm-req-' + _safeId(toolUseId) + '.json');
   var resPath = path.join(WORK_DIR, 'perm-res-' + _safeId(toolUseId) + '.json');
@@ -620,9 +896,10 @@ async function main() {
 main();
 `;
 
-function _generateHookScript({ workDir, denyPatterns, allowPatterns }) {
+function _generateHookScript({ workDir, denyPatterns, allowPatterns, repoRoot }) {
   return HOOK_SCRIPT_TEMPLATE
     .replace('__WORK_DIR__', JSON.stringify(workDir))
     .replace('__DENY_PATTERNS__', JSON.stringify(denyPatterns))
-    .replace('__ALLOW_PATTERNS__', JSON.stringify(allowPatterns));
+    .replace('__ALLOW_PATTERNS__', JSON.stringify(allowPatterns))
+    .replace('__REPO_ROOT__', JSON.stringify(repoRoot ?? null));
 }

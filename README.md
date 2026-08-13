@@ -658,18 +658,26 @@ the commit, looping forever on a finding — not an agent trying to escape.
   In interactive terminal runs, a timeout prompts whether to continue the same
   task with a fresh timeout window before reaching the terminal failure path;
   CI and non-interactive runs stop immediately without prompting.
-- **Interactive permission relay.** When Claude requests a tool not covered by
-  the fixed allowlist, a PreToolUse hook intercepts the call and the controller
-  relays the request to the same terminal.  A random nonce protects each
-  request/response pair so stale or pre-placed approval files cannot satisfy a
-  new request.  The hook script, settings, and request/response files are
-  written to an isolated temp directory outside the repository — Claude's
-  Write tool is restricted to the repo root, so it cannot reach or tamper
-  with them.  The temp directory is cleaned up after the Claude process
-  exits.  The relay is only active for
-  the standard `claude` binary; when `AGENTLOOP_CLAUDE_BIN` points to
-  `claude-ds` or another binary, the hook is skipped automatically.  Set
-  `AGENTLOOP_DISABLE_PERMISSION_RELAY=1` to disable the relay entirely.
+- **Risk-based permission relay.** A PreToolUse hook resolves every tool
+  request Claude makes to `allow` / `ask` / `deny` before it can execute.
+  Hard-deny rules and the fixed allowlist are checked first; a Bash `rm` is
+  then classified by blast radius — a narrow, project-scoped removal (a
+  single relative target, no recursive flag, no wildcard, nothing outside the
+  project or targeting `.git`) is approved directly, a dangerous target (`/`,
+  `~`, a Windows drive root, `.git`) is denied directly, and anything
+  recursive, wildcarded, chained, or otherwise ambiguous falls through to the
+  relay. Only that genuinely uncertain remainder reaches the interactive
+  relay, which prompts the same terminal Claude was started from; in `auto`
+  relay mode there is no user to prompt, so it is denied rather than
+  approved without review. A random nonce protects each request/response
+  pair so stale or pre-placed approval files cannot satisfy a new request.
+  The hook script, settings, and request/response files are written to an
+  isolated temp directory outside the repository — Claude's Write tool is
+  restricted to the repo root, so it cannot reach or tamper with them.  The
+  temp directory is cleaned up after the Claude process exits.  The relay is
+  only active for the standard `claude` binary; when `AGENTLOOP_CLAUDE_BIN`
+  points to `claude-ds` or another binary, the hook is skipped automatically.
+  Set `AGENTLOOP_DISABLE_PERMISSION_RELAY=1` to disable the relay entirely.
 - **Deterministic checks run before Codex, and only in the controller.** The
   controller runs the configured checks itself, through `checks.mjs`, against
   Claude's committed HEAD — independently of anything Claude reports. A
