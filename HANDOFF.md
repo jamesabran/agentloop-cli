@@ -1,4 +1,149 @@
-# Handoff — Auto Mode risk-based permission policy
+# Handoff — Auto Mode permission regression fix
+
+## Task
+
+Fix a regression, at/after `f99d290` (ALCLI `0.3.0`), where routine
+allowlisted operations (`Read`, `Glob`, `Grep`, allowlisted `Bash` git
+subcommands) were being rejected in unattended `auto` relay mode with
+`Requires manual approval; unattended auto mode has no user to prompt.`,
+using normal Claude Code `2.1.232` with `permissionMode: bypassPermissions`
+and `relayMode: auto`.
+
+## Root cause
+
+Not a Claude Code `2.1.232` request-shape or protocol change — that
+hypothesis was investigated and ruled out (the hook input JSON shape,
+`tool_name`/`tool_input`/`tool_use_id`, is unchanged and correctly received).
+
+The actual bug is a **pre-existing double-escaping defect** in
+`HOOK_SCRIPT_TEMPLATE`'s inlined copy of `patternMatches`/`_globToRegex`
+(`src/lib/permission-relay.mjs`), which predates `f99d290` and predates
+`a968e9c`. `HOOK_SCRIPT_TEMPLATE` is a JS template literal that gets written
+out to a generated `.mjs` file and then parsed by Node a second time as that
+file's own source. A literal backslash-escape sequence (`\\` written
+directly in the template source, as the pre-existing `patternMatches` /
+`_globToRegex` code did) survives **two independent rounds** of JS
+string-escape decoding — once when the template literal itself is
+evaluated, once when the generated file is parsed and run — silently
+doubling every backslash. The resulting regex, e.g. for the bare-name
+pattern `Read`, ended up requiring a literal backslash character
+immediately before and after the parenthesised tool arguments
+(`^Read(\\(.*\\))?$` at the regex-engine level) instead of the intended
+escaped-parenthesis match (`^Read(\(.*\))?$`). Any allow/deny pattern whose
+entry has a non-empty `(...)` argument suffix — i.e. every tool call with an
+argument: `Read`, `Edit`, `Write`, `Glob`, `Grep`, and any `Bash(...)`
+pattern — silently failed to match in the **generated hook script**, even
+though the same pattern matches correctly via the real (non-template)
+module-level `patternMatches`, which only goes through one round of
+escaping. (`TodoWrite` was unaffected because its typical `tool_input` has
+no matchable string field, so its entry has no `(...)` suffix to break on.)
+
+A second, smaller instance of the same class of bug: the inlined
+`patternMatches`'s `:*)`-suffix normalisation checked
+`p.endsWith(':*))')` (four-character suffix, an extra stray `)`) instead of
+the module's `p.endsWith(':*)')` (three characters), so a colon-glob deny
+pattern like `Bash(git push:*)` silently skipped its intended `*)`
+normalisation in the hook.
+
+**Why this was invisible until now:** this bug affected the *hook side*
+only — the module-level (non-template) `patternMatches` used by the
+*controller-side* watcher was never affected, since it only goes through one
+round of parsing. Before `a968e9c`, every request that fell through to the
+relay in `auto` mode was blind-approved (`if (relayAuto) { approve, no
+prompt }`), so a `Read`/`Glob`/`Grep`/allowlisted-`Bash` call that
+incorrectly reached the relay due to this bug still ended up allowed — just
+via the wrong path, with the wrong (nonexistent) audit trail, and paying an
+unnecessary file-IPC round trip. `a968e9c` correctly closed that
+blind-approve hole by making the controller-side ask-tier fallback fail
+closed in `auto` mode. That fix was correct and is unchanged here — but it
+meant every routine request this pre-existing hook bug was misrouting to the
+relay now hit an explicit deny instead of a silent (and unintended) allow,
+which is what surfaced as this task's regression.
+
+## Fix
+
+`src/lib/permission-relay.mjs`, inside `HOOK_SCRIPT_TEMPLATE`:
+
+- Added `_BS = String.fromCharCode(92)` — the same character-code technique
+  the file already uses for `BACKSLASH_CHAR` in the deletion classifier
+  (`classifyDeletion`'s inlined copy), for the identical reason documented
+  there: it avoids ever writing a literal `\\` backslash-escape sequence in
+  the template source, so there is nothing for the second (generated-file)
+  parse pass to re-escape.
+- Rewrote the inlined `patternMatches`'s exact-match branch (new
+  `_escapeExactMatch` helper) and glob branch to build every regex-special
+  backslash from `_BS` via string concatenation, instead of embedding
+  backslash-escaped regex/string literals in the template.
+- Fixed the `:*))` → `:*)` suffix-check typo (unrelated to escaping, a
+  plain authoring error) so the colon-glob normalisation matches the module
+  behaviour.
+
+No behavioural change to the module-level (non-template) `patternMatches` /
+`_globToRegex` — they were already correct, verified directly against the
+generated hook script's actual runtime output before making any change.
+
+Nothing about the risk-based policy shape changed: `classifyDeletion`, the
+hard-deny list, the static allowlist, and the `auto`-mode ask-tier fail-closed
+behaviour from `a968e9c` are all unchanged. This fix only repairs the
+pattern-matching the hook uses to resolve `allow`/`deny` *before* reaching
+that fail-closed ask-tier fallback, so routine, already-allowlisted work
+stops being misrouted into it.
+
+## Verification
+
+**Reproduced against the real runtime path** — not just unit-level: built a
+real hook-settings + generated-script pair via `writeHookSettings`, ran the
+actual installed `claude` binary (`2.1.232`) with
+`--permission-mode bypassPermissions`, `--settings <generated>`, and the
+project's real `--allowedTools`, against a throwaway git repo. Confirmed
+before the fix: a `Read` tool call wrote a `perm-req-*.json` file (i.e. fell
+through to relay file IPC) despite `Read` being on the static allowlist, and
+a direct hook invocation with `Bash(git push ...)` hung for the full 300s
+hook timeout instead of hard-denying immediately. After the fix: `Read` and
+`Glob` calls in the same real `claude` subprocess run resolved with zero
+relay invocation (`"permission_denials":[]` in the result) and the task
+completed; direct hook invocations confirmed `git push`/`WebFetch` hard-deny
+immediately with the correct `hookSpecificOutput`, allowlisted `Read` /
+`Glob` / `Grep` / `Bash(git status*)` resolve silently with no relay request
+file written, and a genuinely unlisted `Bash` command (`ls -la`, ask-tier)
+still correctly reaches the relay (request file written, not resolved by the
+hook) — the ask/deny boundary from `a968e9c` is preserved.
+
+**Regression tests** — `src/lib/permission-relay.test.mjs`, new
+`describe('generated hook script — static allowlist and hard-deny resolve
+without relay IPC (regression)')` block (7 tests), exercising the actual
+*generated* hook script as a real subprocess via `execFileSync`/`spawn`
+(not just the module-level functions, which were never broken and so
+wouldn't have caught this):
+  - Static-allowlisted `Read`, `Glob`, `Grep` resolve silently, no relay
+    request file written.
+  - Static-allowlisted `Bash(git status*)` resolves silently.
+  - `git push` and `WebFetch` hard-deny immediately, no relay request file.
+  - `Bash(git push:*)`-style colon-glob deny pattern still normalises and
+    denies correctly (covers the `:*))` typo).
+  - A genuinely unlisted `Bash` command still reaches the relay (file IPC) —
+    confirms the ask-tier boundary is preserved, not widened.
+
+Confirmed these 5 non-empty-stdin cases fail (`ETIMEDOUT`/hang) against
+unmodified `HEAD` via `git stash`, and pass after the fix.
+
+**Full suite:** `npm test` — 835/835 pass (830 pre-existing + 5 net new,
+after removing/consolidating during authoring — final count 835, up from
+829 before `a968e9c` plus the 41 tests `a968e9c` added, plus 7 new tests
+here minus none removed). `npm run lint` — 51/51. `npm run typecheck` —
+51/51. `npm run build` — package validation passes.
+
+## Not done (out of scope)
+
+No change to `classifyDeletion`, the hard-deny pattern list, the static
+allowlist contents, `CLAUDE_RELAY_MODE` semantics, or the controller-side
+watcher logic in `claude-agent.mjs` — none of those were the defect. No new
+config surface, DSL, or parallel permission framework was introduced, per
+task instructions.
+
+---
+
+# Handoff — Auto Mode risk-based permission policy (prior task)
 
 ## Task
 
@@ -159,6 +304,17 @@ assertions, plus one execution with **empty** stdin, which reaches EOF
 immediately and doesn't hit the hang) rather than fighting the pre-existing
 flakiness.
 
+**Update (superseded):** this "Windows stdin-piping flakiness" was
+investigated further while fixing the permission regression above. It does
+not reproduce on this environment with real (non-empty) piped stdin via
+`execFileSync`/`spawn` for cases that resolve immediately (allow/deny) — see
+the regression tests added above, which do pipe real JSON stdin
+successfully. What actually hung in earlier manual testing here was, in
+every case checked, a request that should have resolved in the hook but
+didn't due to the double-escaping bug fixed above, so it fell through to the
+relay and legitimately blocked waiting for a response that never came — not
+an independent stdin-piping issue.
+
 ## Acceptance criteria — status
 
 - Routine repo-local `rm` in Auto Mode: zero relay invocation (hook resolves
@@ -233,12 +389,3 @@ No policy DSL, generic rules engine, command-parser framework, provider abstract
 - Existing configuration and relay flow, including the fixed allowed-tools and hard-deny boundaries, interactive prompt behavior, and nonce-correlated IPC.
 
 No additional project commands were run during this audit: the project rules reserve typecheck, lint, test, and build execution for the controller, and the committed handoff records those checks passing for this exact change.
-
-AGENTLOOP_AGENT_STATUS
-ROLE: AUDITOR
-STATUS: APPROVED
-TASK: auto-mode-risk-based-permission-policy
-HEAD: a968e9c0d0880f76f4a02b1d64a4e64d59325e78
-BLOCKERS: 0
-NEXT: CONTROLLER
-END_STATUS

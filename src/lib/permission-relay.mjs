@@ -569,6 +569,18 @@ var REPO_ROOT = __REPO_ROOT__;
 
 /* ----- inlined utilities ----- */
 
+// Regex-escaping helpers below build their backslashes from this character
+// code rather than writing '\\\\' in the template source. This file is a
+// template literal that gets written out to a generated .mjs file and then
+// parsed by Node a second time; a literal backslash-escape sequence survives
+// two independent rounds of JS string-escape decoding (once when this
+// template literal is evaluated, once when the generated file is parsed),
+// silently doubling up and breaking the resulting regex. Building the
+// backslash from a character code sidesteps that trap entirely — see the
+// same technique already used for BACKSLASH_CHAR below in the deletion
+// classifier.
+var _BS = String.fromCharCode(92);
+
 function buildToolEntry(toolName, toolInput) {
   if (!toolName || typeof toolName !== 'string') return null;
   var a = _toolArgs(toolInput);
@@ -592,20 +604,31 @@ function _toolArgs(input) {
   return pa.join(' ');
 }
 
+function _escapeExactMatch(s) {
+  var special = '.*+?^$(){}|[]' + _BS;
+  var out = '';
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charAt(i);
+    out += special.indexOf(c) !== -1 ? _BS + c : c;
+  }
+  return out;
+}
+
 function patternMatches(entry, pattern) {
   var p = pattern;
-  if (p.endsWith(':*))')) p = p.slice(0, -3) + ' *)';
+  if (p.endsWith(':*)')) p = p.slice(0, -3) + ' *)';
   else if (p.endsWith(':*')) p = p.slice(0, -2) + ' *';
   if (p.indexOf('(') === -1 && p.indexOf('*') === -1 && p.indexOf('?') === -1) {
-    var esc = p.replace(/[.*+?^\\$\\{}()|[\\]\\\\\\\\]/g, '\\\\\\\\$&');
-    return new RegExp('^' + esc + '(\\\\\\\\(.*\\\\\\\\))?$').test(entry);
+    var esc = _escapeExactMatch(p);
+    return new RegExp('^' + esc + '(' + _BS + '(.*' + _BS + ')' + ')?$').test(entry);
   }
   var re = '';
+  var globSpecial = '()[]{}:' + _BS + '^$.|+';
   for (var i = 0; i < p.length; i++) {
-    var ch = p[i];
+    var ch = p.charAt(i);
     if (ch === '*') re += '.*';
     else if (ch === '?') re += '.';
-    else if ('()[]{}:\\\\^$.|+'.indexOf(ch) !== -1) re += '\\\\\\\\' + ch;
+    else if (globSpecial.indexOf(ch) !== -1) re += _BS + ch;
     else re += ch;
   }
   return new RegExp('^' + re + '$').test(entry);

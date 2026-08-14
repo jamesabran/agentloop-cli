@@ -312,6 +312,145 @@ describe('temp directory outside repo', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * Regression: the generated hook script's inlined pattern-matching     *
+ * duplicated the module's regex-escaping logic through an extra round  *
+ * of JS string-escape decoding (template literal -> generated file ->  *
+ * re-parsed by Node), which silently doubled every backslash and broke *
+ * matching for any allow/deny pattern whose entry has a `(...)` suffix *
+ * (i.e. every tool call with an argument: Read, Edit, Write, Glob,     *
+ * Grep, and any Bash pattern). Static-allowlisted and hard-denied      *
+ * calls fell through to relay file IPC instead of resolving in the     *
+ * hook. In `auto` relay mode, with no user to prompt, that ask-tier    *
+ * fallback then denied routine, already-allowlisted work.              *
+ * ------------------------------------------------------------------ */
+
+describe('generated hook script — static allowlist and hard-deny resolve without relay IPC (regression)', () => {
+  async function runHookOnce(hookScriptPath, input, { timeout = 2000 } = {}) {
+    const { execFileSync } = await import('node:child_process');
+    return execFileSync(process.execPath, [hookScriptPath], {
+      input: JSON.stringify(input),
+      encoding: 'utf8',
+      timeout,
+    });
+  }
+
+  it('resolves a static-allowlisted Read call silently, writing no relay request file', async () => {
+    const dir = makeWorkDir();
+    const { hookScriptPath } = writeHookSettings(dir, {
+      denyPatterns: [],
+      allowPatterns: ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'TodoWrite'],
+      repoRoot: null,
+    });
+
+    const output = await runHookOnce(hookScriptPath, {
+      tool_name: 'Read',
+      tool_input: { file_path: 'C:\\repo\\file.txt' },
+      tool_use_id: 'toolu_read_1',
+    });
+
+    expect(output.trim()).toBe('');
+    expect(fs.existsSync(path.join(dir, 'perm-req-toolu_read_1.json'))).toBe(false);
+  });
+
+  it('resolves static-allowlisted Glob and Grep calls silently too', async () => {
+    const dir = makeWorkDir();
+    const { hookScriptPath } = writeHookSettings(dir, {
+      denyPatterns: [],
+      allowPatterns: ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'TodoWrite'],
+      repoRoot: null,
+    });
+
+    const globOut = await runHookOnce(hookScriptPath, {
+      tool_name: 'Glob', tool_input: { pattern: '*.mjs' }, tool_use_id: 'toolu_glob_1',
+    });
+    expect(globOut.trim()).toBe('');
+    expect(fs.existsSync(path.join(dir, 'perm-req-toolu_glob_1.json'))).toBe(false);
+
+    const grepOut = await runHookOnce(hookScriptPath, {
+      tool_name: 'Grep', tool_input: { pattern: 'foo' }, tool_use_id: 'toolu_grep_1',
+    });
+    expect(grepOut.trim()).toBe('');
+    expect(fs.existsSync(path.join(dir, 'perm-req-toolu_grep_1.json'))).toBe(false);
+  });
+
+  it('resolves a static-allowlisted Bash git subcommand silently', async () => {
+    const dir = makeWorkDir();
+    const { hookScriptPath } = writeHookSettings(dir, {
+      denyPatterns: [],
+      allowPatterns: ['Bash(git status*)'],
+      repoRoot: null,
+    });
+
+    const output = await runHookOnce(hookScriptPath, {
+      tool_name: 'Bash', tool_input: { command: 'git status' }, tool_use_id: 'toolu_bash_1',
+    });
+    expect(output.trim()).toBe('');
+    expect(fs.existsSync(path.join(dir, 'perm-req-toolu_bash_1.json'))).toBe(false);
+  });
+
+  it('hard-denies git push and WebFetch immediately, before any relay file IPC', async () => {
+    const dir = makeWorkDir();
+    const { hookScriptPath } = writeHookSettings(dir, {
+      denyPatterns: ['Bash(git push*)', 'WebFetch'],
+      allowPatterns: [],
+      repoRoot: null,
+    });
+
+    const pushOut = await runHookOnce(hookScriptPath, {
+      tool_name: 'Bash', tool_input: { command: 'git push origin main' }, tool_use_id: 'toolu_push_1',
+    });
+    expect(JSON.parse(pushOut).hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(fs.existsSync(path.join(dir, 'perm-req-toolu_push_1.json'))).toBe(false);
+
+    const fetchOut = await runHookOnce(hookScriptPath, {
+      tool_name: 'WebFetch', tool_input: { url: 'https://example.com' }, tool_use_id: 'toolu_fetch_1',
+    });
+    expect(JSON.parse(fetchOut).hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(fs.existsSync(path.join(dir, 'perm-req-toolu_fetch_1.json'))).toBe(false);
+  });
+
+  it('normalizes a ":*)" colon-glob deny pattern the same way the module does', async () => {
+    const dir = makeWorkDir();
+    const { hookScriptPath } = writeHookSettings(dir, {
+      denyPatterns: ['Bash(git push:*)'],
+      allowPatterns: [],
+      repoRoot: null,
+    });
+
+    const output = await runHookOnce(hookScriptPath, {
+      tool_name: 'Bash', tool_input: { command: 'git push origin main' }, tool_use_id: 'toolu_colon_1',
+    });
+    expect(JSON.parse(output).hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+
+  it('a genuinely ask-tier Bash command still reaches the relay, preserving the ask boundary', async () => {
+    const dir = makeWorkDir();
+    const { hookScriptPath } = writeHookSettings(dir, {
+      denyPatterns: ['Bash(git push*)'],
+      allowPatterns: ['Bash(git status*)'],
+      repoRoot: null,
+    });
+
+    const { spawn } = await import('node:child_process');
+    const child = spawn(process.execPath, [hookScriptPath], { stdio: ['pipe', 'ignore', 'ignore'] });
+    child.stdin.end(JSON.stringify({
+      tool_name: 'Bash', tool_input: { command: 'ls -la' }, tool_use_id: 'toolu_ask_1',
+    }));
+
+    try {
+      const reqPath = path.join(dir, 'perm-req-toolu_ask_1.json');
+      const deadline = Date.now() + 2000;
+      while (!fs.existsSync(reqPath) && Date.now() < deadline) {
+        await sleep(50);
+      }
+      expect(fs.existsSync(reqPath)).toBe(true);
+    } finally {
+      child.kill();
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ *
  * Nonce-protected responses                                            *
  * ------------------------------------------------------------------ */
 
